@@ -109,6 +109,53 @@ that take an in-line resistor.
 
 ---
 
+## Status indicators
+
+### Onboard LEDs (`led[5:0]`, pins 20→15)
+
+Six active-low onboard LEDs latch **boot-progress milestones** — each is sticky, so once its
+event is seen the LED stays on. A healthy boot lights them up as the Xbox comes alive, and a
+dark one points straight at where things stall:
+
+| LED | Pin | Lights (and stays on) when |
+|---|---|---|
+| `led[5]` | 20 | BIOS preload complete — image resident in SDRAM |
+| `led[4]` | 19 | LPC reset released — Xbox powered, `LRESET#` high seen |
+| `led[3]` | 18 | LPC clock detected — first `LCLK` edge seen |
+| `led[2]` | 17 | LPC START seen — `LAD = 0000` framing observed |
+| `led[1]` | 16 | FPGA drove the `LAD` bus — responded to a cycle |
+| `led[0]` | 15 | first BIOS byte served |
+
+All six lit = full path up: resident → clocked → framed → responding → serving. A gap shows
+the stall point (e.g. `led[3]` dark = no `LCLK`; `led[2]` lit but `led[1]` dark = START seen
+but never answered).
+
+### WS2812 RGB (pin 79)
+
+The single addressable RGB shows live **boot/serve state**; the highest-priority condition
+wins, so it always reflects the most significant thing happening:
+
+| Colour | Meaning |
+|---|---|
+| 🔴 Red, pulsing | LPC reset not released / not seen — Xbox off or held in reset |
+| 🟡 Yellow, pulsing | reset high but **no LPC clock** — powering, no `LCLK` yet |
+| 🟠 Amber, solid | BIOS **preloading** flash → SDRAM |
+| 🔴 Red, solid | flash **erase** (DELETE) in progress |
+| 🟣 Purple, solid | flash **write** (PROGRAM) in progress |
+| 🔵 Cyan, solid | flash **read** (VERIFY) in progress |
+| 🟣 Purple, pulsing | flash **sync** (RELOAD) in progress |
+| 🟢 Green, pulsing | serving a launched **user bank** (not the boot/loader bank) |
+| 🟢 Green, blinking | **active** LPC byte serve |
+| 🔵 Cyan, heartbeat | sustained healthy reads — ongoing boot activity |
+| 🔵 Blue, heartbeat | ready & clocked, no START yet — or known-good idle after activity |
+| 🔵 Dim blue | resident and waiting (idle) |
+
+Quick read: **red / yellow** = no Xbox or no clock · **amber** = preloading · **red / purple
+/ cyan** = a flash op · **green** = serving · **blue** = up and idle. The write/sync purple is
+the project accent (RGB 168, 85, 247).
+
+---
+
 ## Building
 
 Synthesis is done in **Gowin EDA** (IDE or command-line). Target device must be set to
