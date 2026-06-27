@@ -1,0 +1,32 @@
+<?xml version="1" encoding="UTF-8"?>
+<!DOCTYPE gowin-fpga-project>
+<Project>
+    <Template>FPGA</Template>
+    <Version>5</Version>
+    <Device name="GW2AR-18C" pn="GW2AR-LV18QN88C8/I7">gw2ar18c-000</Device>
+    <FileList>
+        <File path="src/dvi_tx/dvi_tx.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_attr_buffer.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_bank_ctrl.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_boot_ctrl.v" type="file.verilog" enable="0"/>
+        <File path="src/eos_char_buffer.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_flash_cmd.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_flash_reader.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_font_rom.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_hdmi_top.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_logo_rom.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_lpc_loader.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_lpc_probe.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_sdram_backend.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_sdram_pll.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_serve_hud.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_serve_selftest.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_text_rendre.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_ws2812.v" type="file.verilog" enable="1"/>
+        <File path="src/gowin_rpll/gowin_rpll.v" type="file.verilog" enable="1"/>
+        <File path="src/sdram.v" type="file.verilog" enable="1"/>
+        <File path="src/testpattern.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_hdmi.cst" type="file.cst" enable="1"/>
+        <File path="src/eos_hdmi.sdc" type="file.sdc" enable="1"/>
+    </FileList>
+</Project>
