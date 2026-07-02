@@ -1,5 +1,11 @@
 # Eos — Firmware (FPGA Gateware)
 
+<div align=center>
+
+<img src="https://github.com/Darkone83/EOS/blob/main/images/EOS.png" width=400><img src="https://github.com/Darkone83/EOS/blob/main/images/Darkone83.png" width=500>
+
+</div>
+
 Clean-room Original Xbox LPC BIOS-loader modchip, built as FPGA gateware for the
 **Sipeed Tang Nano 20K** (Gowin **GW2AR-18C**, QFN88). Eos sits on the Xbox LPC bus,
 serves a selectable BIOS bank from on-board memory, supports **both pre-1.6 and 1.6**
