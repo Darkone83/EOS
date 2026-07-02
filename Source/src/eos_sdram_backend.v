@@ -55,6 +55,16 @@ module eos_sdram_backend #(
     input  wire [23:0] reload_len,
     input  wire        flash_free,
 
+    // ---- SDRAM scratch access (update staging: 0x600000..0x7FFFFF, 2MB) ----
+    input  wire        scr_wr,          // strobe: write scr_wdata -> scratch[scr_waddr]
+    input  wire [20:0] scr_waddr,       // byte offset within scratch (0..0x1FFFFF)
+    input  wire [7:0]  scr_wdata,
+    input  wire        scr_rd,          // strobe: read scratch[scr_raddr]
+    input  wire [20:0] scr_raddr,
+    output reg  [7:0]  scr_rdata,
+    output reg         scr_rvalid,      // 1-cycle pulse when scr_rdata valid
+    output wire        scr_busy,        // 1 while a scratch op is queued/in flight
+
     output reg         preload_done,
     output wire [22:0] dbg_filled_lo,
     output wire [3:0]  dbg_bank,        // live bank_l (served/selected bank)
@@ -160,17 +170,35 @@ module eos_sdram_backend #(
     // FPGA configured, so bank_l holds. Only a true cold power-on (which
     // reconfigures the FPGA) returns it to the boot bank.
     reg [3:0] bank_l = BANK_BOOT;
+    // SLOT latch: selecting 0xD boots the SECOND 2MB image slot. The packed
+    // image bank-switches internally (kernel 0x1 -> XBE 0x2 via 0xEF), and
+    // those selects must stay inside the same slot -- so the slot is sticky
+    // across every subsequent select until slot 0 is chosen explicitly by a
+    // non-0xD select from the LOADER (i.e. after a power-down / boot-bank
+    // revert). Same no-runtime-reset persistence rules as bank_l.
+    reg       slot_l = 1'b0;
     always @(posedge lclk) begin
-        if (ef_wr) bank_l <= ef_data[3:0];
+        if (ef_wr) begin
+            if (ef_data[3:0] == 4'hD) begin
+                slot_l <= 1'b1;              // enter slot 1...
+                bank_l <= 4'h1;              // ...and boot it like bank 0x1
+            end else if (!slot_l || pwrc_l) begin
+                slot_l <= 1'b0;              // loader select after power-down: slot 0
+                bank_l <= ef_data[3:0];      // slot 0: selects behave as always
+            end else begin
+                bank_l <= ef_data[3:0];      // slot 1: image's own 0xEF switches
+            end                              //   (kernel->XBE) stay in-slot
+        end
     end
     // sync bank into sclk domain for the serve path
     // sync bank into the sclk serve domain. Init-only (no runtime reset) so a
     // reset glitch can't momentarily force the boot bank during the post-warm-
     // reset boot-vector read; it simply tracks the persistent bank_l.
     reg [3:0] bank_s0 = BANK_BOOT, bank_s = BANK_BOOT;
+    reg       slot_s0 = 1'b0,     slot_s = 1'b0;
     always @(posedge sclk) begin
-        bank_s0 <= bank_l;
-        bank_s  <= bank_s0;
+        bank_s0 <= bank_l;   slot_s0 <= slot_l;
+        bank_s  <= bank_s0;  slot_s  <= slot_s0;
     end
 
     // ---- Xbox power-down detector (externally-powered fix) ------------------
@@ -212,6 +240,10 @@ module eos_sdram_backend #(
 
     // Effective served bank: boot bank after a power-down until a bank is armed.
     wire [3:0] bank_eff = pwr_cycled ? BANK_BOOT : bank_s;
+    wire       slot_eff = pwr_cycled ? 1'b0      : slot_s;
+    // pwr_cycled (sclk) -> lclk so the next 0xEF write also clears slot_l
+    reg pwrc_l0 = 1'b0, pwrc_l = 1'b0;
+    always @(posedge lclk) begin pwrc_l0 <= pwr_cycled; pwrc_l <= pwrc_l0; end
 
     // Rising-edge one-shot on pwr_cycled: fire a single flash->SDRAM reload of the
     // boot bank so the loader is served FRESH on the next power-up. With external
@@ -224,7 +256,7 @@ module eos_sdram_backend #(
     // OpenXenium virtual translation: force the high bits per bank, pass low LPC
     // bits. virtual = base(bank) | lpc[low]. (physical = 0x200000 + virtual is
     // applied to the FLASH read; SDRAM holds the image 1:1 with virtual.)
-    function [20:0] xlate; input [3:0] b; input [20:0] a; begin
+    function [21:0] xlate; input [3:0] b; input [20:0] a; begin
         case (b)
             4'b0001: xlate = {3'b110, a[17:0]};   // 0x180000  kernel (BOOT)
             4'b0010: xlate = {2'b10,  a[18:0]};   // 0x100000  XeniumOS / XBE
@@ -241,10 +273,10 @@ module eos_sdram_backend #(
     end endfunction
 
     // capture the TRANSLATED virtual address (21-bit) for the serve.
-    reg [20:0] req_addr_s;
+    reg [21:0] req_addr_s;
     always @(posedge sclk or negedge sresetn) begin
-        if (!sresetn) req_addr_s <= 21'd0;
-        else          req_addr_s <= xlate(bank_eff, mem_addr);
+        if (!sresetn) req_addr_s <= 22'd0;
+        else          req_addr_s <= {1'b0, xlate(bank_eff, mem_addr)} | {slot_eff, 21'd0};
     end
 
     reg req_pending;
@@ -292,9 +324,16 @@ module eos_sdram_backend #(
     localparam S_SERVE      = 4'd6;
     localparam S_RL_REQ     = 4'd7;   // reload: request one flash byte
     localparam S_RL_WAIT    = 4'd8;   // reload: wait for capture
-    localparam S_RL_WRITE   = 4'd9;   // reload: write byte to SDRAM
+    localparam S_RL_WRITE   = 4'd9;
+    localparam S_SCR_WR     = 4'd10;
+    localparam S_SCR_RD_REQ = 4'd11;
+    localparam S_SCR_RD_WAIT= 4'd12;   // reload: write byte to SDRAM
 
     reg [3:0] st;
+
+    reg        scr_wr_pend, scr_rd_pend;
+    reg [20:0] scr_waddr_r, scr_raddr_r;
+    reg [7:0]  scr_wdata_r;
 
     // Post-flash reload bookkeeping
     parameter [22:0] SCRATCH_BASE = 23'h60_0000;   // SDRAM serve ceiling (6MB managed)
@@ -316,12 +355,14 @@ module eos_sdram_backend #(
     reg        seen_busy;
     reg        sdram_ready;
 
-    wire [22:0] req23      = {2'b0, req_addr_s};
+    wire [22:0] req23      = {1'b0, req_addr_s};
     wire        req_filled = (req23 >= filled_lo);
 
     assign dbg_filled_lo = filled_lo;
     assign dbg_bank      = bank_l;
     assign dbg_reload    = reload_pending;
+    assign scr_busy      = scr_wr_pend | scr_rd_pend |
+                           (st == S_SCR_WR) | (st == S_SCR_RD_REQ) | (st == S_SCR_RD_WAIT);
 
     always @(posedge sclk or negedge sresetn) begin
         if (!sresetn) begin
@@ -356,6 +397,13 @@ module eos_sdram_backend #(
             sdram_ready   <= 1'b0;
 
             reload_pending <= 1'b0;
+            scr_wr_pend    <= 1'b0;
+            scr_rd_pend    <= 1'b0;
+            scr_rvalid     <= 1'b0;
+            scr_rdata      <= 8'd0;
+            scr_waddr_r    <= 21'd0;
+            scr_raddr_r    <= 21'd0;
+            scr_wdata_r    <= 8'd0;
             rl_fl_base     <= 24'd0;
             rl_sd_base     <= 23'd0;
             rl_len         <= 24'd0;
@@ -365,6 +413,14 @@ module eos_sdram_backend #(
             sd_wr      <= 1'b0;
             sd_refresh <= 1'b0;
             fr_start   <= 1'b0;
+            scr_rvalid <= 1'b0;
+
+            if (scr_wr && !scr_wr_pend && !scr_rd_pend) begin
+                scr_wr_pend <= 1'b1; scr_waddr_r <= scr_waddr; scr_wdata_r <= scr_wdata;
+            end
+            if (scr_rd && !scr_wr_pend && !scr_rd_pend) begin
+                scr_rd_pend <= 1'b1; scr_raddr_r <= scr_raddr;
+            end
 
             // Clear op_lock once controller accepts the operation and goes busy.
             if (sd_busy)
@@ -525,6 +581,10 @@ module eos_sdram_backend #(
                             req_pending <= 1'b0;
                             ret_serve   <= 1'b1;
                             st          <= S_RD;
+                        end else if (scr_wr_pend) begin
+                            st <= S_SCR_WR;
+                        end else if (scr_rd_pend) begin
+                            st <= S_SCR_RD_REQ;
                         end
                     end
                 end
@@ -565,6 +625,37 @@ module eos_sdram_backend #(
                             rl_idx  <= rl_idx + 1'b1;
                             st      <= S_RL_REQ;
                         end
+                    end
+                end
+
+                S_SCR_WR: begin
+                    if (!sd_busy && !op_lock) begin
+                        if (refresh_due) begin
+                            sd_refresh <= 1'b1; op_lock <= 1'b1;
+                        end else begin
+                            sd_addr     <= SCRATCH_BASE + {2'b0, scr_waddr_r};
+                            sd_din      <= scr_wdata_r;
+                            sd_wr       <= 1'b1; op_lock <= 1'b1;
+                            scr_wr_pend <= 1'b0; st <= S_SERVE;
+                        end
+                    end
+                end
+
+                S_SCR_RD_REQ: begin
+                    if (!sd_busy && !op_lock) begin
+                        if (refresh_due) begin
+                            sd_refresh <= 1'b1; op_lock <= 1'b1;
+                        end else begin
+                            sd_addr     <= SCRATCH_BASE + {2'b0, scr_raddr_r};
+                            sd_rd       <= 1'b1; op_lock <= 1'b1;
+                            scr_rd_pend <= 1'b0; st <= S_SCR_RD_WAIT;
+                        end
+                    end
+                end
+
+                S_SCR_RD_WAIT: begin
+                    if (sd_data_ready) begin
+                        scr_rdata  <= sd_dout; scr_rvalid <= 1'b1; st <= S_SERVE;
                     end
                 end
 

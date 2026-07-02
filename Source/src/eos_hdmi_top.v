@@ -11,9 +11,13 @@ module eos_hdmi_top (
     input              rst_btn,
 
     input              lpc_lclk,
-    input              lpc_lframe_n,    // pure input. For 1.6: re-make inout + restore abort driver
+    inout              lpc_lframe_n,    // 1.6: driven low to abort; else released (input)
+    output             lpc_d0,          // low = force LPC boot, Hi-Z = TSOP/stock
     input              lpc_lreset_n,
     inout      [3:0]   lpc_lad,
+    inout              i2c_sda,       // SMBus SDA (open-drain)
+    input              i2c_scl,       // SMBus SCL
+    input              mode16_n,      // 1.6 strap (pin 77): open=pre-1.6, GND=1.6 (active-low)
 
     // ---- boot control: LFRAME# abort (1.6) only. D0 stays externally grounded
     //      until a CONFIRMED user-GPIO pin is chosen (pin 75 was a config pin). ----
@@ -123,6 +127,7 @@ module eos_hdmi_top (
     // -------------------------------------------------------------------------
 
     wire        mem_req;
+    wire        serving_mem_w;   // 1.6 LFRAME abort window (from loader)
     wire        mem_valid;
     wire [20:0] mem_addr;
     wire        ef_wr;
@@ -167,7 +172,8 @@ module eos_hdmi_top (
         .io_rd_addr   (io_rd_addr_l),
         .cmd_rd_data  (cmd_rd_data_l),
 
-        .state        (lst)
+        .state        (lst),
+        .serving_mem  (serving_mem_w)
     );
 
     assign lpc_lad = lad_oe_c ? lad_out_c : 4'bzzzz;
@@ -182,27 +188,35 @@ module eos_hdmi_top (
     // before the Xbox's first boot read. abort_req = mem_req is a STARTING point
     // for the 1.6 trigger; the exact condition + ABORT_CLKS are bench-tuned.
     // -------------------------------------------------------------------------
-    // straps tied internally for the 1.5 test build. To bench 1.6, promote these
-    // back to top-level input pads (mode_16 pull-down, boot_en pull-up) in the .cst.
-    wire        mode_16 = 1'b0;   // 0 = Xbox 1.0-1.5
+    // mode_16 from the pin-77 strap (active-low, internal pull-up):
+    //   open = high = mode16_n 1 -> mode_16 0  (Xbox 1.0-1.5)
+    //   GND  = low  = mode16_n 0 -> mode_16 1  (Xbox 1.6)
+    // boot_en stays tied active; promote to a pad later if a disable is wanted.
+    wire        mode_16 = ~mode16_n;
     wire        boot_en = 1'b1;   // 1 = modchip active
 
-    wire        d0_oe_b, lframe_oe_b;
-    wire        d0_active_b, abort_active_b;
+    wire        lframe_oe_b, abort_active_b;
+    wire        stock_boot;      // IDX_BOOT(0x08) from loader: 1 = release D0 for TSOP
     wire [15:0] abort_count_b;
 
-//    eos_boot_ctrl #(.ABORT_CLKS(4)) u_boot (
-//        .clk          (clk_lpc),
-//        .resetn       (lpc_lreset_n),
-//        .mode_16      (mode_16),
-//        .enable       (boot_en),
-//        .abort_req    (mem_req),
-//        .d0_oe        (d0_oe_b),
-//        .lframe_oe    (lframe_oe_b),
-//        .abort_count  (abort_count_b),
-//        .d0_active    (d0_active_b),
-//        .abort_active (abort_active_b)
-//    );
+    // D0 is externally grounded on this build; report it active on 1.0-1.5.
+    wire        d0_active_b = boot_en & ~mode_16 & ~stock_boot;
+    // D0: always grounded while active; released only for a TSOP/stock boot.
+    assign lpc_d0 = d0_active_b ? 1'b0 : 1'bz;
+
+    // 1.6 LFRAME# abort: hold LFRAME# low for the served mem-read cycle.
+    // On 1.0-1.5 (mode_16=0) lframe_oe_b stays 0 and LFRAME# is released.
+    assign lpc_lframe_n = lframe_oe_b ? 1'b0 : 1'bz;   // open-drain
+
+    eos_boot_ctrl u_boot (
+        .clk          (clk_lpc),
+        .resetn       (lpc_lreset_n),
+        .mode_16      (mode_16),
+        .serving_mem  (serving_mem_w),
+        .lframe_oe    (lframe_oe_b),
+        .abort_count  (abort_count_b),
+        .abort_active (abort_active_b)
+    );
 
 
     // -------------------------------------------------------------------------
@@ -230,6 +244,23 @@ module eos_hdmi_top (
     wire        eng_bus_req;
     reg         bus_grant;        // clk_sd: 1 = engine owns the flash bus
     wire        refresh_req; wire [23:0] refresh_base, refresh_len; // engine -> backend reload
+
+    // ---- updater datapath nets (STAGE / VALIDATE / COMMIT) ----------------
+    wire        stg_scr_wr;    wire [20:0] stg_scr_waddr;  wire [7:0] stg_scr_wdata;
+    wire        be_scr_rd, be_scr_rvalid, be_scr_busy;
+    wire [20:0] be_scr_raddr;  wire [7:0] be_scr_rdata;
+    wire        crc_scr_rd;    wire [20:0] crc_scr_raddr;
+    wire        bank_scr_rd;   wire [20:0] bank_scr_raddr;
+    wire        crc_go, crc_busy, crc_done;  wire [20:0] crc_len;  wire [31:0] crc_result;
+    wire        i2c_commit_go; wire [3:0] i2c_commit_bank;  wire [12:0] i2c_commit_pages;
+    wire        bank_commit_busy, bank_commit_done, bank_commit_err;
+    wire        i2c_scr_clear; wire [3:0] i2c_sel_bank;  wire [1:0] i2c_boot_mode;
+    wire [15:0] i2c_lock_mask;
+
+    // scratch READ port: CRC owns it during VALIDATE, bank_ctrl during COMMIT
+    // (i2c sequences them, never simultaneous).
+    assign be_scr_rd    = crc_busy ? crc_scr_rd    : bank_scr_rd;
+    assign be_scr_raddr = crc_busy ? crc_scr_raddr : bank_scr_raddr;
 
     eos_sdram_backend u_be (
         .lclk          (clk_lpc),
@@ -267,7 +298,15 @@ module eos_hdmi_top (
         .preload_done  (preload_done),
         .dbg_filled_lo (dbg_filled_lo),
         .dbg_bank      (dbg_bank),
-        .dbg_reload    (dbg_reload)
+        .dbg_reload    (dbg_reload),
+        .scr_wr        (stg_scr_wr),      // STAGE writes from flash_cmd
+        .scr_waddr     (stg_scr_waddr),
+        .scr_wdata     (stg_scr_wdata),
+        .scr_rd        (be_scr_rd),       // muxed read (CRC / commit)
+        .scr_raddr     (be_scr_raddr),
+        .scr_rdata     (be_scr_rdata),
+        .scr_rvalid    (be_scr_rvalid),
+        .scr_busy      (be_scr_busy)
     );
 
     // -------------------------------------------------------------------------
@@ -349,7 +388,12 @@ module eos_hdmi_top (
         .eng_done     (eng_done),
         .eng_refused  (eng_refused),
         .eng_last_status (eng_last_status),
-        .eng_reload   (dbg_reload)        // SDRAM reload-in-progress -> STATUS bit3
+        .stock_boot   (stock_boot),
+        .eng_reload   (dbg_reload),       // SDRAM reload-in-progress -> STATUS bit3
+        .scr_wr       (stg_scr_wr),
+        .scr_waddr    (stg_scr_waddr),
+        .scr_wdata    (stg_scr_wdata),
+        .scr_busy     (be_scr_busy)
     );
 
     // --- engine (clk_sd): floor-guarded erase/program/poll ---
@@ -377,7 +421,18 @@ module eos_hdmi_top (
         .flash_cs_n   (eng_flash_cs_n),
         .flash_clk    (eng_flash_clk),
         .flash_mosi   (eng_flash_mosi),
-        .flash_miso   (flash_miso)
+        .flash_miso   (flash_miso),
+        .commit_go    (i2c_commit_go),
+        .commit_bank  (i2c_commit_bank),
+        .commit_pages (i2c_commit_pages),
+        .commit_busy  (bank_commit_busy),
+        .commit_done  (bank_commit_done),
+        .commit_err   (bank_commit_err),
+        .scr_rd       (bank_scr_rd),
+        .scr_raddr    (bank_scr_raddr),
+        .scr_rdata    (be_scr_rdata),
+        .scr_rvalid   (be_scr_rvalid),
+        .scr_busy     (be_scr_busy)
     );
 
     // --- status byte back to loader (clk_sd -> clk_lpc), 2-FF sync ---
@@ -460,6 +515,31 @@ module eos_hdmi_top (
     wire [7:0]  wr_data;
     wire [2:0]  wr_attr;
 
+    // ---- Darkone I2C (SMBus slave) engine --------------------------------
+    wire       i2c_sda_oe, i2c_cmd_stb, i2c_sel;
+    wire [7:0] i2c_cmd, i2c_a0, i2c_a1, i2c_a2, i2c_a3, i2c_rxcnt;
+    assign i2c_sda = i2c_sda_oe ? 1'b0 : 1'bz;   // open-drain: low or release
+
+    eos_i2c u_i2c (
+        .clk      (clk_sd),  .resetn (sd_rstn),
+        .sda_in   (i2c_sda), .scl_in (i2c_scl), .sda_oe (i2c_sda_oe),
+        .status_in({4'b0, abort_active_b, d0_active_b, mode_16, preload_done}),
+        .cmd      (i2c_cmd), .arg0(i2c_a0), .arg1(i2c_a1), .arg2(i2c_a2), .arg3(i2c_a3),
+        .cmd_stb  (i2c_cmd_stb), .rx_count(i2c_rxcnt), .selected(i2c_sel),
+        .crc_go(crc_go), .crc_len(crc_len), .crc_busy(crc_busy), .crc_done(crc_done), .crc_result(crc_result),
+        .commit_go(i2c_commit_go), .commit_bank(i2c_commit_bank), .commit_pages(i2c_commit_pages),
+        .commit_busy(bank_commit_busy), .commit_done(bank_commit_done), .commit_err(bank_commit_err),
+        .scr_clear(i2c_scr_clear), .sel_bank(i2c_sel_bank), .boot_mode(i2c_boot_mode), .lock_mask(i2c_lock_mask)
+    );
+
+    // ---- CRC32 over scratch (drives VALIDATE) ----
+    eos_crc32 u_crc (
+        .clk(clk_sd), .resetn(sd_rstn),
+        .go(crc_go), .len(crc_len), .busy(crc_busy), .done(crc_done), .crc(crc_result),
+        .scr_rd(crc_scr_rd), .scr_raddr(crc_scr_raddr),
+        .scr_rdata(be_scr_rdata), .scr_rvalid(be_scr_rvalid), .scr_busy(be_scr_busy)
+    );
+
     eos_serve_hud u_hud (
         .lclk         (clk_lpc),
         .lreset_n     (lpc_lreset_n),
@@ -482,6 +562,11 @@ module eos_hdmi_top (
         .abort_active (abort_active_b),
         .abort_count  (abort_count_b),
 
+        // I2C engine -> HUD panel
+        .i2c_addr     (8'hDC), .i2c_vmaj(8'd1), .i2c_vmin(8'd0), .i2c_vpat(8'd0),
+        .i2c_cmd      (i2c_cmd), .i2c_a0(i2c_a0), .i2c_a1(i2c_a1),
+        .i2c_rx       (i2c_rxcnt), .i2c_sel(i2c_sel),
+
         .wr_en        (wr_en),
         .wr_addr      (wr_addr),
         .wr_data      (wr_data),
@@ -491,18 +576,9 @@ module eos_hdmi_top (
     wire       vs_t;
     wire       hs_t;
     wire       de_t;
-    wire [7:0] ur;
-    wire [7:0] ug;
-    wire [7:0] ub;
-
-    testpattern u_pat (
+    eos_video_timing u_vtg (
         .I_pxl_clk  (pix_clk),
         .I_rst_n    (hdmi_rst_n),
-        .I_mode     (3'd0),
-
-        .I_single_r (8'd0),
-        .I_single_g (8'd255),
-        .I_single_b (8'd0),
 
         .I_h_total  (12'd1650),
         .I_h_sync   (12'd40),
@@ -519,10 +595,7 @@ module eos_hdmi_top (
 
         .O_de       (de_t),
         .O_hs       (hs_t),
-        .O_vs       (vs_t),
-        .O_data_r   (ur),
-        .O_data_g   (ug),
-        .O_data_b   (ub)
+        .O_vs       (vs_t)
     );
 
     wire       vs_o;

@@ -52,7 +52,22 @@ module eos_bank_ctrl #(
     output reg         flash_cs_n,
     output reg         flash_clk,
     output reg         flash_mosi,
-    input  wire        flash_miso
+    input  wire        flash_miso,
+
+    // ---- i2c-triggered commit engine (scratch -> flash), gated by i2c ----
+    input  wire        commit_go,       // pulse: erase bank + program from scratch + reload
+    input  wire [3:0]  commit_bank,     // armed region; physical target derived via bank_base
+    input  wire [12:0] commit_pages,    // 256B pages to program from scratch offset 0
+    output reg         commit_busy,
+    output reg         commit_done,     // 1-cycle pulse on completion
+    output reg         commit_err,      // 1 = a sub-op was refused
+
+    // ---- SDRAM scratch read (eos_sdram_backend, same clk_sd domain) ----
+    output reg         scr_rd,
+    output reg  [20:0] scr_raddr,
+    input  wire [7:0]  scr_rdata,
+    input  wire        scr_rvalid,
+    input  wire        scr_busy
 );
     // bank_base is now 24-bit so a config bank can live above the 2MB Xenium
     // range (engine-reachable for erase/program/read; NOT served -- the serve
@@ -68,20 +83,51 @@ module eos_bank_ctrl #(
             4'h9: bank_base = 24'h000000; 4'hA: bank_base = 24'h1C0000;
             4'hB: bank_base = 24'h5F0000;            // CONFIG banks-table (phys 0x7F0000)
             4'hC: bank_base = 24'h5E0000;            // CONFIG settings   (phys 0x7E0000)
+            4'hD: bank_base = 24'h200000;            // XbDiag Lite       (phys 0x400000, reserve)
+            4'hE: bank_base = 24'h000000;            // LOADER full image (phys 0x200000, slot 0)
             default: bank_base = 24'h000000;
         endcase
     end endfunction
     function [23:0] bank_size; input [3:0] b; begin
         case (b)
             4'h2,4'h7,4'h8: bank_size = 24'h080000;  // 512K
-            4'h9:           bank_size = 24'h100000;  // 1MB
+            4'h9:          bank_size = 24'h100000;  // 1MB (user)
+            4'hD:          bank_size = 24'h1C0000;  // XbDiag: full-image span (28x64K), 2nd slot
+            4'hE:          bank_size = 24'h1C0000;  // LOADER: full-image span (28x64K), slot 0
             4'hB,4'hC:      bank_size = 24'h010000;  // CONFIG: one 64K block each
             default:        bank_size = 24'h040000;  // 256K
         endcase
     end endfunction
 
-    wire [23:0] sel_phys_base = FLOOR + bank_base(cmd_bank);
-    wire [23:0] sel_size      = bank_size(cmd_bank);
+    // ===== i2c-triggered commit supervisor (scratch -> flash) ==============
+    // Drives the SPI FSM below via muxed command signals so the flash logic is
+    // untouched. commit_bank is the ONLY selector -- the physical range derives
+    // from bank_base (FLOOR-guarded), never passed raw, so i2c stays the gate.
+    // Sequence: ERASE bank -> per page {fill pbuf from scratch, PROGRAM} -> SYNC.
+    // Loader LPC commands are muxed out while commit_active.
+    localparam CS_IDLE=3'd0, CS_ERASE=3'd1, CS_FILL=3'd2, CS_PROG=3'd3,
+               CS_SYNC=3'd4, CS_DONE=3'd5, CS_ERR=3'd6;
+    reg [2:0]  cst;
+    reg        commit_active;
+    reg [3:0]  cbank;
+    reg [12:0] cpages, cpg;
+    reg [8:0]  cfill;
+    reg [1:0]  cstep;
+    reg        sup_cmd_stb, sup_pb_wr;
+    reg [1:0]  sup_cmd_op;
+    reg [11:0] sup_cmd_page;
+    reg [7:0]  sup_pb_addr, sup_pb_din;
+
+    wire        eff_cmd_stb  = commit_active ? sup_cmd_stb  : cmd_stb;
+    wire [1:0]  eff_cmd_op   = commit_active ? sup_cmd_op   : cmd_op;
+    wire [3:0]  eff_cmd_bank = commit_active ? cbank        : cmd_bank;
+    wire [11:0] eff_cmd_page = commit_active ? sup_cmd_page : cmd_page;
+    wire        eff_pb_wr    = commit_active ? sup_pb_wr    : pb_wr;
+    wire [7:0]  eff_pb_addr  = commit_active ? sup_pb_addr  : pb_addr;
+    wire [7:0]  eff_pb_din   = commit_active ? sup_pb_din   : pb_din;
+
+    wire [23:0] sel_phys_base = FLOOR + bank_base(eff_cmd_bank);
+    wire [23:0] sel_size      = bank_size(eff_cmd_bank);
     wire [8:0]  n_blocks      = sel_size[23:16];   // size / 64K
     wire        op_below_floor = (sel_phys_base < FLOOR);
 
@@ -91,7 +137,7 @@ module eos_bank_ctrl #(
     // read-capture happens during a READ op). pb_rdata streams the buffer back.
     reg        rd_we; reg [7:0] rd_waddr, rd_wdata;
     always @(posedge clk) begin
-        if (pb_wr)      pbuf[pb_addr]  <= pb_din;
+        if (eff_pb_wr)  pbuf[eff_pb_addr] <= eff_pb_din;
         else if (rd_we) pbuf[rd_waddr] <= rd_wdata;
     end
     assign pb_rdata = pbuf[pb_raddr];
@@ -146,25 +192,25 @@ module eos_bank_ctrl #(
             case (st)
                 S_IDLE: begin
                     busy<=1'b0; flash_cs_n<=1'b1; bus_req<=1'b0;
-                    if (cmd_stb) begin
+                    if (eff_cmd_stb) begin
                         if (op_below_floor ||
-                            (cmd_op!=OP_ERASE && cmd_op!=OP_PROG && cmd_op!=OP_READ && cmd_op!=OP_SYNC)) st<=S_REFUSE;
+                            (eff_cmd_op!=OP_ERASE && eff_cmd_op!=OP_PROG && eff_cmd_op!=OP_READ && eff_cmd_op!=OP_SYNC)) st<=S_REFUSE;
                         else begin
-                            busy<=1'b1; op_l<=cmd_op; refused<=1'b0;
-                            if (cmd_op==OP_SYNC) begin
+                            busy<=1'b1; op_l<=eff_cmd_op; refused<=1'b0;
+                            if (eff_cmd_op==OP_SYNC) begin
                                 // no flash access -- hand the WHOLE selected bank to the
                                 // backend for one SDRAM reload (the loader calls this once
                                 // after a multi-page WriteImage so the served copy matches
                                 // flash; per-page reloads can't keep up and get dropped).
                                 flashed_base<=sel_phys_base; flashed_len<=sel_size;
                                 st<=S_DONE;
-                            end else if (cmd_op==OP_ERASE) begin
+                            end else if (eff_cmd_op==OP_ERASE) begin
                                 addr_l<=sel_phys_base; blocks_left<=n_blocks;
                                 flashed_base<=sel_phys_base; flashed_len<=sel_size;
                                 st<=S_REQ;
                             end else begin   // PROGRAM or READ: single page address
-                                addr_l<=sel_phys_base + {4'd0,cmd_page,8'd0};
-                                flashed_base<=sel_phys_base + {4'd0,cmd_page,8'd0}; flashed_len<=24'd256;
+                                addr_l<=sel_phys_base + {4'd0,eff_cmd_page,8'd0};
+                                flashed_base<=sel_phys_base + {4'd0,eff_cmd_page,8'd0}; flashed_len<=24'd256;
                                 st<=S_REQ;
                             end
                         end
@@ -239,4 +285,80 @@ module eos_bank_ctrl #(
             endcase
         end
     end
+    // ---- commit supervisor FSM (clk_sd) --------------------------------------
+    always @(posedge clk or negedge cold_rstn) begin
+        if (!cold_rstn) begin
+            cst<=CS_IDLE; commit_active<=1'b0; commit_busy<=1'b0; commit_done<=1'b0;
+            commit_err<=1'b0; cbank<=4'd0; cpages<=13'd0; cpg<=13'd0; cfill<=9'd0;
+            cstep<=2'd0; sup_cmd_stb<=1'b0; sup_cmd_op<=2'd0; sup_cmd_page<=12'd0;
+            sup_pb_wr<=1'b0; sup_pb_addr<=8'd0; sup_pb_din<=8'd0; scr_rd<=1'b0; scr_raddr<=21'd0;
+        end else begin
+            commit_done <= 1'b0;
+            sup_cmd_stb <= 1'b0;
+            sup_pb_wr   <= 1'b0;
+            scr_rd      <= 1'b0;
+            case (cst)
+                CS_IDLE: begin
+                    commit_active<=1'b0; commit_busy<=1'b0;
+                    if (commit_go) begin
+                        cbank<=commit_bank; cpages<=commit_pages; cpg<=13'd0;
+                        commit_active<=1'b1; commit_busy<=1'b1; commit_err<=1'b0;
+                        cstep<=2'd0; cst<=CS_ERASE;
+                    end
+                end
+                CS_ERASE: case (cstep)
+                    2'd0: begin sup_cmd_op<=OP_ERASE; cstep<=2'd1; end
+                    2'd1: begin sup_cmd_stb<=1'b1;    cstep<=2'd2; end
+                    2'd2: if (busy) cstep<=2'd3;
+                    2'd3: if (done) begin
+                              if (refused) cst<=CS_ERR;
+                              else begin cfill<=9'd0; cstep<=2'd0; cst<=CS_FILL; end
+                          end
+                endcase
+                CS_FILL: case (cstep)
+                    2'd0: if (!scr_busy) begin
+                              scr_rd    <= 1'b1;
+                              scr_raddr <= {cpg[11:0], cfill[7:0]};
+                              cstep     <= 2'd1;
+                          end
+                    2'd1: if (scr_rvalid) begin
+                              sup_pb_wr   <= 1'b1;
+                              sup_pb_addr <= cfill[7:0];
+                              sup_pb_din  <= scr_rdata;
+                              cstep       <= 2'd2;
+                          end
+                    2'd2: if (cfill == 9'd255) begin cstep<=2'd0; cst<=CS_PROG; end
+                          else begin cfill<=cfill+1'b1; cstep<=2'd0; end
+                endcase
+                CS_PROG: case (cstep)
+                    2'd0: begin sup_cmd_op<=OP_PROG; sup_cmd_page<=cpg[11:0]; cstep<=2'd1; end
+                    2'd1: begin sup_cmd_stb<=1'b1; cstep<=2'd2; end
+                    2'd2: if (busy) cstep<=2'd3;
+                    2'd3: if (done) begin
+                              if (refused) cst<=CS_ERR;
+                              else begin
+                                  cpg<=cpg+1'b1;
+                                  if ((cpg+1'b1) >= cpages) begin cstep<=2'd0; cst<=CS_SYNC; end
+                                  else begin cfill<=9'd0; cstep<=2'd0; cst<=CS_FILL; end
+                              end
+                          end
+                endcase
+                CS_SYNC: case (cstep)
+                    2'd0: begin sup_cmd_op<=OP_SYNC; cstep<=2'd1; end
+                    2'd1: begin sup_cmd_stb<=1'b1; cstep<=2'd2; end
+                    2'd2: if (busy) cstep<=2'd3;
+                    2'd3: if (done) cst<=CS_DONE;
+                endcase
+                CS_DONE: begin
+                    commit_active<=1'b0; commit_busy<=1'b0; commit_done<=1'b1; cst<=CS_IDLE;
+                end
+                CS_ERR: begin
+                    commit_active<=1'b0; commit_busy<=1'b0; commit_err<=1'b1;
+                    commit_done<=1'b1; cst<=CS_IDLE;
+                end
+                default: cst<=CS_IDLE;
+            endcase
+        end
+    end
+
 endmodule

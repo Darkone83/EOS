@@ -16,6 +16,10 @@
 //   idx 0x06 STATUS   (R) {4'b0, reload, refused, done_sticky, busy}
 //                         bit0 busy, bit1 done(sticky), bit2 refused, bit3 SDRAM reload
 //   idx 0x07 LASTSTAT (R) flash status register from the last poll
+//   idx 0x08 BOOT     (RW) bit0 stock_boot: 1 = release D0 (stock/TSOP boot on
+//                          the NEXT warm reset), 0 = assert D0 (Eos LPC boot).
+//                          In the cold_rstn domain -> survives a warm reset;
+//                          cleared only by cold power / FPGA reconfig.
 //
 // OP/BANK/PAGE are driven CONTINUOUSLY from their holding registers, so they
 // are valid on (and before) the GO strobe -- satisfying eos_bank_ctrl's
@@ -44,6 +48,9 @@ module eos_flash_cmd #(
     //      when the decoded I/O read address == PORT_DATA) ----
     output reg  [7:0]  cmd_rd_data,
 
+    // ---- persistent boot-mode bit (cold_rstn domain: survives warm reset) ----
+    output reg         stock_boot,       // 1 = release D0 for stock/TSOP boot
+
     // ---- engine command interface (to eos_bank_ctrl) ----
     output wire        cmd_stb,
     output wire [1:0]  cmd_op,
@@ -60,10 +67,19 @@ module eos_flash_cmd #(
     input  wire        eng_done,
     input  wire        eng_refused,
     input  wire [7:0]  eng_last_status,
-    input  wire        eng_reload          // SDRAM reload in progress (post-flash)
+    input  wire        eng_reload,         // SDRAM reload in progress (post-flash)
+
+    // ---- SDRAM scratch write (update staging: loader streams image here) ----
+    output reg         scr_wr,             // 1-cycle pulse per staged byte
+    output reg  [20:0] scr_waddr,          // auto-incrementing scratch offset
+    output reg  [7:0]  scr_wdata,
+    input  wire        scr_busy            // backend scratch port busy (poll via STATUS bit4)
 );
     localparam [7:0] IDX_OP=8'd0, IDX_BANK=8'd1, IDX_PAGELO=8'd2, IDX_PAGEHI=8'd3,
-                     IDX_PBUF=8'd4, IDX_GO=8'd5, IDX_STATUS=8'd6, IDX_LASTSTAT=8'd7;
+                     IDX_PBUF=8'd4, IDX_GO=8'd5, IDX_STATUS=8'd6, IDX_LASTSTAT=8'd7,
+                     IDX_BOOT=8'd8,
+                     IDX_SCR_ALO=8'd9, IDX_SCR_AMID=8'd10, IDX_SCR_AHI=8'd11,
+                     IDX_SCR_DATA=8'd12;
 
     reg [7:0]  index;
     reg [1:0]  op_r;
@@ -72,6 +88,7 @@ module eos_flash_cmd #(
     reg [7:0]  pba;            // page-buffer pointer (shared write-fill / read-stream)
     reg        done_sticky;
     reg        go_pulse;
+    reg [20:0] scr_addr;       // scratch write pointer (auto-increments per byte)
 
     // OP/BANK/PAGE continuously reflect the holding registers (always valid).
     assign cmd_op   = op_r;
@@ -88,13 +105,17 @@ module eos_flash_cmd #(
     // combinational read value for the currently-selected index
     always @(*) begin
         case (index)
-            IDX_STATUS:   cmd_rd_data = {4'b0, eng_reload, eng_refused, done_sticky, eng_busy};
+            IDX_STATUS:   cmd_rd_data = {3'b0, scr_busy, eng_reload, eng_refused, done_sticky, eng_busy};
+            IDX_SCR_ALO:  cmd_rd_data = scr_addr[7:0];
+            IDX_SCR_AMID: cmd_rd_data = scr_addr[15:8];
+            IDX_SCR_AHI:  cmd_rd_data = {3'b0, scr_addr[20:16]};
             IDX_LASTSTAT: cmd_rd_data = eng_last_status;
             IDX_OP:       cmd_rd_data = {6'b0, op_r};
             IDX_BANK:     cmd_rd_data = {4'b0, bank_r};
             IDX_PAGELO:   cmd_rd_data = page_r[7:0];
             IDX_PAGEHI:   cmd_rd_data = {4'b0, page_r[11:8]};
             IDX_PBUF:     cmd_rd_data = pb_rdata;   // stream engine page buffer
+            IDX_BOOT:     cmd_rd_data = {7'b0, stock_boot};
             default:      cmd_rd_data = 8'h00;
         endcase
     end
@@ -103,9 +124,12 @@ module eos_flash_cmd #(
         if (!cold_rstn) begin
             index<=8'd0; op_r<=2'd0; bank_r<=4'd0; page_r<=12'd0; pba<=8'd0;
             done_sticky<=1'b0; go_pulse<=1'b0; pb_wr<=1'b0; pb_addr<=8'd0; pb_din<=8'd0;
+            stock_boot<=1'b0;
+            scr_wr<=1'b0; scr_waddr<=21'd0; scr_wdata<=8'd0; scr_addr<=21'd0;
         end else begin
             go_pulse <= 1'b0;
             pb_wr    <= 1'b0;
+            scr_wr   <= 1'b0;
             if (eng_done) done_sticky <= 1'b1;
 
             if (wr_index) begin
@@ -127,6 +151,16 @@ module eos_flash_cmd #(
                         go_pulse    <= 1'b1;       // operands already stable
                         done_sticky <= 1'b0;       // clear stale completion
                     end
+                    IDX_SCR_ALO:  scr_addr[7:0]   <= io_wr_data;
+                    IDX_SCR_AMID: scr_addr[15:8]  <= io_wr_data;
+                    IDX_SCR_AHI:  scr_addr[20:16] <= io_wr_data[4:0];
+                    IDX_SCR_DATA: begin
+                        scr_wr    <= 1'b1;
+                        scr_waddr <= scr_addr;
+                        scr_wdata <= io_wr_data;
+                        scr_addr  <= scr_addr + 1'b1;   // stream: auto-advance
+                    end
+                    IDX_BOOT: stock_boot <= io_wr_data[0];
                     default: ; // STATUS / LASTSTAT are read-only
                 endcase
             end

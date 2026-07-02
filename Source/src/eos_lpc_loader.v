@@ -52,7 +52,11 @@ module eos_lpc_loader #(
     output reg  [15:0] io_rd_addr,
     input  wire [7:0]  cmd_rd_data,
 
-    output reg  [3:0]  state
+    output reg  [3:0]  state,
+    // 1.6 LFRAME abort window: high while serving a memory-read cycle
+    // (cycle-type match -> TAR_EXIT), so the top can hold LFRAME# low
+    // for exactly the served cycle, ModXo-style. mem-read ONLY.
+    output wire        serving_mem
 );
 
     // Keep the original HUD-friendly state numbering.
@@ -75,7 +79,7 @@ module eos_lpc_loader #(
     localparam [1:0] CYC_MEM_WRITE = 2'd3;
 
     // Known-good path used a short sync delay. Keep it.
-    localparam [2:0] MIN_SYNC_WAIT = 3'd3;
+    localparam [2:0] MIN_SYNC_WAIT = 3'd0;
 
     // Avoid unused warnings.
     wire _unused_lclk   = lclk_pin;
@@ -127,6 +131,26 @@ module eos_lpc_loader #(
                     (state == READ_DATA0)    ||
                     (state == READ_DATA1)    ||
                     (state == TAR_EXIT);
+
+    // served memory-read window (excludes I/O 0xEC/0xED and mem-writes)
+    // One-LCLK strobe at the mem-read cycle-type decode (combinational, same edge
+    // the nibble lad_in[3:1]==010 is on the bus). High only while state==CYCTYPE,
+    // so it is inherently a single-cycle pulse -- eos_boot_ctrl turns it into the
+    // spec-legal >=4-clock LPC abort, starting on this same cycle (zero latency).
+    // OpenXenium-matched abort: key off the REGISTERED cycle_type alone. cycle_type
+    // is only reassigned at the next CYCTYPE decode, so it persists across WAIT_START
+    // between consecutive reads -- LFRAME# stays low continuously through a burst of
+    // boot mem-reads and never lifts in the gaps (that gap is where the Xyclops was
+    // re-engaging). Includes MEM_WRITE, as OpenXenium does. The combinational CYCTYPE
+    // term covers the very first read before cycle_type is registered.
+    // Key PURELY off the registered cycle_type, exactly like OpenXenium. cycle_type
+    // is set at the CYCTYPE decode and takes effect at ADDRESS, so the abort begins
+    // one clock AFTER the cycle-type phase -- NOT during it. Asserting LFRAME# during
+    // CYCTYPE (right after START) reads as a new frame-start to the MCPX and aborts
+    // the cycle before the loader can serve it. cycle_type persists across WAIT_START,
+    // so LFRAME# still stays low continuously through a burst of boot reads.
+    assign serving_mem = (cycle_type == CYC_MEM_READ) ||
+                         (cycle_type == CYC_MEM_WRITE);
 
     always @(*) begin
         case (state)

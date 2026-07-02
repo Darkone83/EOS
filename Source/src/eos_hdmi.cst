@@ -24,7 +24,7 @@ IO_PORT "rst_btn" IO_TYPE=LVCMOS33 PULL_MODE=DOWN SINGLE_RESISTOR=ON BANK_VCCIO=
 
 // ---- LPC bus (LCLK input + LAD bidirectional + frame/reset in) ----
 IO_LOC  "lpc_lclk"     73;  IO_PORT "lpc_lclk"     IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
-IO_LOC  "lpc_lframe_n" 74;  IO_PORT "lpc_lframe_n" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+IO_LOC  "lpc_lframe_n" 74;  IO_PORT "lpc_lframe_n" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=12;
 IO_LOC  "lpc_lad[0]"   25;  IO_PORT "lpc_lad[0]"   IO_TYPE=LVCMOS33 PULL_MODE=UP HYSTERESIS=HIGH;
 IO_LOC  "lpc_lad[1]"   26;  IO_PORT "lpc_lad[1]"   IO_TYPE=LVCMOS33 PULL_MODE=UP HYSTERESIS=HIGH;
 IO_LOC  "lpc_lad[2]"   27;  IO_PORT "lpc_lad[2]"   IO_TYPE=LVCMOS33 PULL_MODE=UP HYSTERESIS=HIGH;
@@ -32,9 +32,14 @@ IO_LOC  "lpc_lad[3]"   28;  IO_PORT "lpc_lad[3]"   IO_TYPE=LVCMOS33 PULL_MODE=UP
 IO_LOC  "lpc_lreset_n" 86;  IO_PORT "lpc_lreset_n" IO_TYPE=LVCMOS33 PULL_MODE=UP;
 
 // D0 -- open-drain boot control (low = force LPC boot, Hi-Z = stock/onboard)
-// IO_LOC  "lpc_d0"       75;  IO_PORT "lpc_d0"       IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "lpc_d0"       75;  IO_PORT "lpc_d0"       IO_TYPE=LVCMOS33 PULL_MODE=NONE OPEN_DRAIN=ON;
 
-// ---- D0 to the Xbox D0 point (open-drain: RTL drives 0 or Z). pin 25 ----
+// mode16_n -- selection for 1.6/b xboxes
+IO_LOC  "mode16_n"     77;  IO_PORT "mode16_n"     IO_TYPE=LVCMOS33 PULL_MODE=UP HYSTERESIS=HIGH;
+
+// i2C pins
+IO_LOC  "i2c_sda" 71;  IO_PORT "i2c_sda" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
+IO_LOC  "i2c_scl" 72;  IO_PORT "i2c_scl" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
 
 // ---- onboard LEDs ----
 IO_LOC  "led[0]" 15;  IO_PORT "led[0]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
@@ -44,12 +49,6 @@ IO_LOC  "led[3]" 18;  IO_PORT "led[3]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
 IO_LOC  "led[4]" 19;  IO_PORT "led[4]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
 IO_LOC  "led[5]" 20;  IO_PORT "led[5]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
 
-// ===== Eos -- additions for QSPI flash serve + WS2812 status =====
-// Append these to your existing eos_hdmi.cst (HDMI/LPC pins stay as-is).
-
-// ===== Eos -- additions for QSPI flash serve + WS2812 status =====
-// Append to your existing eos_hdmi.cst. Pin numbers verified against the
-// Tang Nano 20K v1.22 schematic (GW2AR-LV18-QN88).
 
 // ---- WS2812 status LED  (PIN79 = IOT27B/GCLKC_0) ----
 IO_LOC  "ws2812" 79;
