@@ -115,9 +115,14 @@ module eos_i2c #(
         endcase
     end endfunction
 
-    reg [7:0] index = 8'd0;                       // register pointer
-    wire [7:0] rd_cur = readmux(index);           // data at the current index
-    wire [7:0] rd_nxt = readmux(index + 8'd1);    // data at the next index
+    // Command-decode model: the first write byte of a transaction is the
+    // command; a read transaction then returns readmux(command) as ITS single
+    // response byte. No shared/persistent index across transactions -- rcmd is
+    // latched per-transaction and the response is that command's byte. This is
+    // what removes the readback race / version-misread on the contended bus.
+    reg  [7:0] rcmd    = 8'h00;                    // command for THIS transaction
+    reg        have_cmd= 1'b0;                     // command byte captured?
+    wire [7:0] rd_cur  = readmux(rcmd);            // response byte for rcmd
 
     // ---- slave FSM -----------------------------------------------------------
     localparam ST_IDLE = 3'd0,
@@ -130,14 +135,14 @@ module eos_i2c #(
 
     reg [2:0] st     = ST_IDLE;
     reg [2:0] bcnt   = 3'd0;
+    reg [7:0] wsub   = 8'h00;   // write sub-pointer within a block write
     reg [7:0] sh     = 8'd0;
     reg       rw     = 1'b0;
-    reg       idxset = 1'b0;
     reg       acked  = 1'b0;
 
     always @(posedge clk or negedge resetn) begin
         if (!resetn) begin
-            st<=ST_IDLE; bcnt<=0; sh<=0; rw<=0; index<=0; idxset<=0; acked<=0;
+            st<=ST_IDLE; bcnt<=0; sh<=0; rw<=0; rcmd<=8'h00; have_cmd<=1'b0; acked<=0;
             sda_oe<=0; selected<=0; cmd_stb<=0; rx_count<=0;
             cmd<=0; arg0<=0; arg1<=0; arg2<=0; arg3<=0;
         end else begin
@@ -147,7 +152,7 @@ module eos_i2c #(
                 st<=ST_ADDR; bcnt<=0; sh<=0; acked<=0; sda_oe<=0;
             end
             else if (stop_c) begin
-                st<=ST_IDLE; sda_oe<=0; selected<=0; idxset<=0; acked<=0;
+                st<=ST_IDLE; sda_oe<=0; selected<=0; have_cmd<=1'b0; acked<=0;
             end
             else begin
                 case (st)
@@ -162,7 +167,16 @@ module eos_i2c #(
                         if (sh[7:1]==DEV_ADDR) begin
                             sda_oe<=1'b1;
                             selected<=1'b1; rw<=sh[0];
-                            if (!sh[0]) rx_count<=rx_count+8'd1;
+                            // On an addr+WRITE match, the byte that follows is
+                            // ALWAYS this transaction's command/register selector.
+                            // Clear have_cmd HERE (keyed off the cleanly-clocked
+                            // address byte, not a START/STOP edge that the sync
+                            // stage can miss) so the command latch can never stick
+                            // across transactions -- the failure that made every
+                            // register read return the same value (e.g. 1.1.1).
+                            // A read-byte's addr+READ turnaround does NOT clear it,
+                            // so rcmd from the preceding write phase is preserved.
+                            if (!sh[0]) begin rx_count<=rx_count+8'd1; have_cmd<=1'b0; end
                         end else begin
                             sda_oe<=1'b0; st<=ST_IDLE; selected<=1'b0;
                         end
@@ -186,10 +200,22 @@ module eos_i2c #(
 
                 ST_WACK: if (scl_fall) begin
                     if (!acked) begin
-                        sda_oe<=1'b1;
-                        if (!idxset) begin index<=sh; idxset<=1'b1; end
-                        else begin
-                            case (index)
+                        sda_oe<=1'b1;                     // ACK the byte
+                        if (!have_cmd) begin
+                            // FIRST write byte = command/register selector for
+                            // this transaction. Latch it; a following read will
+                            // return readmux(rcmd). For a write transaction, the
+                            // subsequent data bytes land in the arg/cmd file via
+                            // wsub below. have_cmd resets on STOP so nothing is
+                            // carried across transactions.
+                            rcmd     <= sh;
+                            have_cmd <= 1'b1;
+                            wsub     <= sh;              // write sub-pointer starts at cmd code
+                        end else begin
+                            // subsequent write bytes: register file, addressed by
+                            // wsub which auto-advances WITHIN this one transaction
+                            // (block write of CMD + ARGs), then STOP clears it.
+                            case (wsub)
                                 8'h10: begin cmd<=sh; cmd_stb<=1'b1; end
                                 8'h11: arg0<=sh;
                                 8'h12: arg1<=sh;
@@ -197,7 +223,7 @@ module eos_i2c #(
                                 8'h14: arg3<=sh;
                                 default: ;
                             endcase
-                            index<=index+8'd1;
+                            wsub <= wsub + 8'd1;
                         end
                         acked<=1'b1;
                     end else begin
@@ -217,15 +243,18 @@ module eos_i2c #(
 
                 ST_RACK: begin
                     if (scl_rise) begin
-                        if (sda_q) selected<=1'b0;
+                        if (sda_q) selected<=1'b0;         // master NACK = last byte
                     end
                     if (scl_fall) begin
                         if (!acked) acked<=1'b1;
                         else begin
                             acked<=1'b0;
+                            // Single-byte-per-command model. If the master ACKs
+                            // for another byte, return the SAME command's byte
+                            // again (no stale index walk). Normally it NACKs and
+                            // we go idle.
                             if (selected) begin
-                                index<=index+8'd1;
-                                sh<=rd_nxt; sda_oe<=~rd_nxt[7];
+                                sh<=rd_cur; sda_oe<=~rd_cur[7];
                                 st<=ST_RD; bcnt<=0;
                             end else begin
                                 sda_oe<=1'b0; st<=ST_IDLE;

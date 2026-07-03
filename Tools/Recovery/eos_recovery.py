@@ -22,7 +22,10 @@ import os
 import re
 import sys
 import shutil
+import tempfile
 import subprocess
+import urllib.request
+import urllib.error
 
 from PySide6.QtCore import Qt, QThread, Signal, QSettings
 from PySide6.QtGui import QFont, QTextCursor, QIcon
@@ -36,7 +39,16 @@ from PySide6.QtWidgets import (
 APP_NAME     = "Eos Recovery"
 ORG_NAME     = "Darkone Customs"
 BOARD        = "tangnano20k"
-BIOS_OFFSET  = "0x20000"          # default BIOS offset in external flash
+BIOS_OFFSET  = "0x200000"         # default BIOS offset in external flash
+XBDIAG_OFFSET = "0x400000"        # XbDiag Lite lives in bank 0xD (phys 0x400000)
+
+# XbDiag Lite is pulled from the same server the updater uses (no local file):
+#   http://<host>:<port><base>/xbdlite.bin   -- CRC ignored (known-good image).
+XBDIAG_HOST  = "darkone83.myddns.me"
+XBDIAG_PORT  = 8008
+XBDIAG_BASE  = "/EOS"
+XBDIAG_LEAF  = "xbdlite.bin"
+XBDIAG_URL   = "http://%s:%d%s/%s" % (XBDIAG_HOST, XBDIAG_PORT, XBDIAG_BASE, XBDIAG_LEAF)
 ACCENT       = "#A855F7"          # Darkone purple  rgb(168,85,247)
 ACCENT_DIM   = "#7E3FBF"
 OK_GREEN     = "#22C55E"
@@ -98,6 +110,67 @@ class LoaderWorker(QThread):
         proc.stdout.close()
         rc = proc.wait()
         self.finished.emit(rc == 0)
+
+
+# ----------------------------------------------------------------------------
+class DownloadWorker(QThread):
+    """Downloads a file from a URL to a temp path, streaming progress lines."""
+    line     = Signal(str)
+    finished = Signal(bool, str)     # (success, temp_path or "")
+
+    def __init__(self, url):
+        super().__init__()
+        self._url = url
+
+    def run(self):
+        tmp_path = ""
+        try:
+            self.line.emit("Downloading %s" % self._url)
+            req = urllib.request.Request(self._url, headers={"User-Agent": "EosRecovery"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                total = resp.getheader("Content-Length")
+                total = int(total) if total and total.isdigit() else 0
+                fd, tmp_path = tempfile.mkstemp(suffix=".bin", prefix="xbdlite_")
+                got = 0
+                with os.fdopen(fd, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        if total:
+                            self.line.emit("  %d / %d bytes (%d%%)"
+                                           % (got, total, (got * 100) // total))
+                        else:
+                            self.line.emit("  %d bytes" % got)
+            if got == 0:
+                self.line.emit("ERROR: downloaded file is empty.")
+                self._cleanup(tmp_path)
+                self.finished.emit(False, "")
+                return
+            self.line.emit("Downloaded %d bytes." % got)
+            self.finished.emit(True, tmp_path)
+        except urllib.error.HTTPError as e:
+            self.line.emit("ERROR: server returned HTTP %s." % e.code)
+            self._cleanup(tmp_path)
+            self.finished.emit(False, "")
+        except urllib.error.URLError as e:
+            self.line.emit("ERROR: could not reach the server (%s)." % e.reason)
+            self._cleanup(tmp_path)
+            self.finished.emit(False, "")
+        except Exception as e:
+            self.line.emit("ERROR: download failed: %s" % e)
+            self._cleanup(tmp_path)
+            self.finished.emit(False, "")
+
+    @staticmethod
+    def _cleanup(path):
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 # ----------------------------------------------------------------------------
@@ -173,6 +246,16 @@ class EosRecovery(QMainWindow):
             self.biosPath, self.biosBtn, browse_filter="BIOS image (*.bin);;All files (*.*)",
             offset_field=self.biosOff))
 
+        # xbdiag card (pulled from server -- no local file)
+        self.xbdBtn = QPushButton("Download + Flash XbDiag")
+        self.xbdBtn.setObjectName("primary")
+        self.xbdBtn.clicked.connect(self.program_xbdiag)
+        col.addWidget(self._server_card(
+            "XbDiag Lite (external flash)",
+            "Downloads XbDiag Lite from the Darkone server and flashes it to bank "
+            "0xD (0x400000). No file needed \u2014 use this to install or recover XbDiag.",
+            self.xbdBtn))
+
         # banner
         self.banner = QLabel("")
         self.banner.setAlignment(Qt.AlignCenter)
@@ -218,7 +301,18 @@ class EosRecovery(QMainWindow):
         g.setColumnStretch(0, 1)
         return card
 
-    def _apply_style(self):
+    def _server_card(self, title, desc, prog_btn):
+        """A card with no file picker -- the image is pulled from the server."""
+        card = Card()
+        g = QGridLayout(card); g.setContentsMargins(18, 16, 18, 16)
+        g.setHorizontalSpacing(10); g.setVerticalSpacing(10)
+        t = QLabel(title); t.setStyleSheet("font-size:15px;font-weight:700;color:%s;" % TEXT)
+        d = QLabel(desc);  d.setStyleSheet("color:%s;font-size:11px;" % MUTED); d.setWordWrap(True)
+        g.addWidget(t, 0, 0, 1, 3)
+        g.addWidget(d, 1, 0, 1, 3)
+        g.addWidget(prog_btn, 2, 2)
+        g.setColumnStretch(0, 1)
+        return card
         self.setStyleSheet("""
             QMainWindow, QWidget { background:%(bg)s; color:%(text)s; font-family:'Segoe UI',sans-serif; }
             QLineEdit { background:#15151B; border:1px solid #383843; border-radius:8px;
@@ -264,7 +358,7 @@ class EosRecovery(QMainWindow):
             "color:%s;font-size:13px;" % (TEXT if found else MUTED))
 
     def _busy(self, on):
-        for w in (self.bitBtn, self.biosBtn, self.refreshBtn,
+        for w in (self.bitBtn, self.biosBtn, self.xbdBtn, self.refreshBtn,
                   self.bitPath, self.biosPath, self.biosOff):
             w.setEnabled(not on)
 
@@ -319,6 +413,31 @@ class EosRecovery(QMainWindow):
         self._run([self.loader, "-b", BOARD, "--external-flash", "-o", off, path],
                   "BIOS", "Your Eos BIOS is reflashed.")
 
+    def program_xbdiag(self):
+        # No local file: pull xbdlite.bin from the server, then flash to 0x400000.
+        # CRC is intentionally not checked here -- the server image is known-good.
+        if not self.loader:
+            QMessageBox.warning(self, APP_NAME,
+                "openFPGALoader was not found. Place it in this folder and reopen.")
+            return
+        self.banner.setVisible(False)
+        self._busy(True)
+        self._log("\n$ download %s" % XBDIAG_URL)
+        self._dl = DownloadWorker(XBDIAG_URL)
+        self._dl.line.connect(self._log)
+        self._dl.finished.connect(self._xbdiag_downloaded)
+        self._dl.start()
+
+    def _xbdiag_downloaded(self, ok, tmp_path):
+        if not ok:
+            self._busy(False)
+            self._set_banner("\u2717  XbDiag download failed \u2014 check the activity log.", False)
+            return
+        # Flash the freshly-downloaded image, then remove the temp file when done.
+        self._xbd_tmp = tmp_path
+        self._run([self.loader, "-b", BOARD, "--external-flash", "-o", XBDIAG_OFFSET, tmp_path],
+                  "XbDiag", "XbDiag Lite is flashed.")
+
     def _run(self, argv, label, ok_msg):
         self.banner.setVisible(False)
         self._busy(True)
@@ -332,6 +451,15 @@ class EosRecovery(QMainWindow):
 
     def _run_done(self, ok):
         self._busy(False)
+        # Remove the downloaded XbDiag temp image, if this run used one.
+        tmp = getattr(self, "_xbd_tmp", "")
+        if tmp:
+            try:
+                if os.path.isfile(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            self._xbd_tmp = ""
         if ok:
             self._set_banner("\u2713  Done \u2014 %s" % self._ok_msg, True)
         else:

@@ -34,7 +34,7 @@ module eos_bank_ctrl #(
     input  wire        cmd_stb,
     input  wire [1:0]  cmd_op,        // 0=ERASE_BANK 1=PROGRAM_PAGE 2=READ_PAGE
     input  wire [3:0]  cmd_bank,
-    input  wire [11:0] cmd_page,
+    input  wire [12:0] cmd_page,
     input  wire        pb_wr,
     input  wire [7:0]  pb_addr,
     input  wire [7:0]  pb_din,
@@ -115,13 +115,13 @@ module eos_bank_ctrl #(
     reg [1:0]  cstep;
     reg        sup_cmd_stb, sup_pb_wr;
     reg [1:0]  sup_cmd_op;
-    reg [11:0] sup_cmd_page;
+    reg [12:0] sup_cmd_page;
     reg [7:0]  sup_pb_addr, sup_pb_din;
 
     wire        eff_cmd_stb  = commit_active ? sup_cmd_stb  : cmd_stb;
     wire [1:0]  eff_cmd_op   = commit_active ? sup_cmd_op   : cmd_op;
     wire [3:0]  eff_cmd_bank = commit_active ? cbank        : cmd_bank;
-    wire [11:0] eff_cmd_page = commit_active ? sup_cmd_page : cmd_page;
+    wire [12:0] eff_cmd_page = commit_active ? sup_cmd_page : cmd_page;
     wire        eff_pb_wr    = commit_active ? sup_pb_wr    : pb_wr;
     wire [7:0]  eff_pb_addr  = commit_active ? sup_pb_addr  : pb_addr;
     wire [7:0]  eff_pb_din   = commit_active ? sup_pb_din   : pb_din;
@@ -209,8 +209,8 @@ module eos_bank_ctrl #(
                                 flashed_base<=sel_phys_base; flashed_len<=sel_size;
                                 st<=S_REQ;
                             end else begin   // PROGRAM or READ: single page address
-                                addr_l<=sel_phys_base + {4'd0,eff_cmd_page,8'd0};
-                                flashed_base<=sel_phys_base + {4'd0,eff_cmd_page,8'd0}; flashed_len<=24'd256;
+                                addr_l<=sel_phys_base + {3'd0,eff_cmd_page,8'd0};
+                                flashed_base<=sel_phys_base + {3'd0,eff_cmd_page,8'd0}; flashed_len<=24'd256;
                                 st<=S_REQ;
                             end
                         end
@@ -290,7 +290,7 @@ module eos_bank_ctrl #(
         if (!cold_rstn) begin
             cst<=CS_IDLE; commit_active<=1'b0; commit_busy<=1'b0; commit_done<=1'b0;
             commit_err<=1'b0; cbank<=4'd0; cpages<=13'd0; cpg<=13'd0; cfill<=9'd0;
-            cstep<=2'd0; sup_cmd_stb<=1'b0; sup_cmd_op<=2'd0; sup_cmd_page<=12'd0;
+            cstep<=2'd0; sup_cmd_stb<=1'b0; sup_cmd_op<=2'd0; sup_cmd_page<=13'd0;
             sup_pb_wr<=1'b0; sup_pb_addr<=8'd0; sup_pb_din<=8'd0; scr_rd<=1'b0; scr_raddr<=21'd0;
         end else begin
             commit_done <= 1'b0;
@@ -318,7 +318,7 @@ module eos_bank_ctrl #(
                 CS_FILL: case (cstep)
                     2'd0: if (!scr_busy) begin
                               scr_rd    <= 1'b1;
-                              scr_raddr <= {cpg[11:0], cfill[7:0]};
+                              scr_raddr <= {cpg[12:0], cfill[7:0]};
                               cstep     <= 2'd1;
                           end
                     2'd1: if (scr_rvalid) begin
@@ -331,7 +331,7 @@ module eos_bank_ctrl #(
                           else begin cfill<=cfill+1'b1; cstep<=2'd0; end
                 endcase
                 CS_PROG: case (cstep)
-                    2'd0: begin sup_cmd_op<=OP_PROG; sup_cmd_page<=cpg[11:0]; cstep<=2'd1; end
+                    2'd0: begin sup_cmd_op<=OP_PROG; sup_cmd_page<=cpg; cstep<=2'd1; end
                     2'd1: begin sup_cmd_stb<=1'b1; cstep<=2'd2; end
                     2'd2: if (busy) cstep<=2'd3;
                     2'd3: if (done) begin

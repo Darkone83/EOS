@@ -1,10 +1,11 @@
 #pragma once
 // eos_smbus.h -- Xbox-side SMBus master to the Eos control device at 7-bit 0x6E.
 //
-// Drives the nForce SMBus controller directly (mirrors the loader's eos_bank /
-// eos_console primitives) because HalReadSMBusValue / HalWriteSMBusValue do not
-// resolve under RXDK for this project. This is the control plane for the update
-// datapath: ARM -> (stage over LPC) -> SETCRC -> VALIDATE -> COMMIT, plus CLEAR.
+// Uses the Xbox kernel HAL (HalReadSMBusValue / HalWriteSMBusValue) for all
+// SMBus access. The kernel arbitrates the shared bus internally, so reads never
+// collide with the kernel's own SMC / thermal polling -- the direct-controller
+// approach raced the kernel and corrupted version/identity reads. Control plane
+// for the update datapath; the flash datapath is the separate 0xEC/0xED port.
 //
 // Register map matches the FPGA's eos_i2c:
 //   0x00 magic(0xD8)  0x01/02/03 ver maj/min/pat  0x04 boot/serve status

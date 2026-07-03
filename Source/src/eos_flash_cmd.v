@@ -9,7 +9,7 @@
 //   idx 0x00 OP       (W) op[1:0]    0=ERASE_BANK 1=PROGRAM_PAGE
 //   idx 0x01 BANK     (W) bank[3:0]
 //   idx 0x02 PAGE_LO  (W) page[7:0]
-//   idx 0x03 PAGE_HI  (W) page[11:8]
+//   idx 0x03 PAGE_HI  (W) page[12:8]  (5 bits: image is 7168 pages, needs 13-bit)
 //   idx 0x04 PBUF     (W) select resets the byte pointer; each 0xED write
 //                         pushes one byte into the engine page buffer (auto-inc)
 //   idx 0x05 GO       (W) pulse cmd_stb with current OP/BANK/PAGE
@@ -55,7 +55,7 @@ module eos_flash_cmd #(
     output wire        cmd_stb,
     output wire [1:0]  cmd_op,
     output wire [3:0]  cmd_bank,
-    output wire [11:0] cmd_page,
+    output wire [12:0] cmd_page,
     output reg         pb_wr,
     output reg  [7:0]  pb_addr,
     output reg  [7:0]  pb_din,
@@ -84,7 +84,7 @@ module eos_flash_cmd #(
     reg [7:0]  index;
     reg [1:0]  op_r;
     reg [3:0]  bank_r;
-    reg [11:0] page_r;
+    reg [12:0] page_r;
     reg [7:0]  pba;            // page-buffer pointer (shared write-fill / read-stream)
     reg        done_sticky;
     reg        go_pulse;
@@ -113,7 +113,7 @@ module eos_flash_cmd #(
             IDX_OP:       cmd_rd_data = {6'b0, op_r};
             IDX_BANK:     cmd_rd_data = {4'b0, bank_r};
             IDX_PAGELO:   cmd_rd_data = page_r[7:0];
-            IDX_PAGEHI:   cmd_rd_data = {4'b0, page_r[11:8]};
+            IDX_PAGEHI:   cmd_rd_data = {3'b0, page_r[12:8]};
             IDX_PBUF:     cmd_rd_data = pb_rdata;   // stream engine page buffer
             IDX_BOOT:     cmd_rd_data = {7'b0, stock_boot};
             default:      cmd_rd_data = 8'h00;
@@ -122,7 +122,7 @@ module eos_flash_cmd #(
 
     always @(posedge clk or negedge cold_rstn) begin
         if (!cold_rstn) begin
-            index<=8'd0; op_r<=2'd0; bank_r<=4'd0; page_r<=12'd0; pba<=8'd0;
+            index<=8'd0; op_r<=2'd0; bank_r<=4'd0; page_r<=13'd0; pba<=8'd0;
             done_sticky<=1'b0; go_pulse<=1'b0; pb_wr<=1'b0; pb_addr<=8'd0; pb_din<=8'd0;
             stock_boot<=1'b0;
             scr_wr<=1'b0; scr_waddr<=21'd0; scr_wdata<=8'd0; scr_addr<=21'd0;
@@ -140,7 +140,7 @@ module eos_flash_cmd #(
                     IDX_OP:     op_r        <= io_wr_data[1:0];
                     IDX_BANK:   bank_r      <= io_wr_data[3:0];
                     IDX_PAGELO: page_r[7:0] <= io_wr_data;
-                    IDX_PAGEHI: page_r[11:8]<= io_wr_data[3:0];
+                    IDX_PAGEHI: page_r[12:8]<= io_wr_data[4:0];
                     IDX_PBUF: begin
                         pb_wr   <= 1'b1;
                         pb_addr <= pba;

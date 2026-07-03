@@ -16,6 +16,7 @@
 #include "eos_theme.h"
 #include "eos_config.h"
 #include "eos_bank.h"
+#include "eos_flash.h"
 #include "input.h"
 #include "eos_file.h"
 #include "dd_net.h"
@@ -24,7 +25,6 @@
 #include "eos_smbus.h"
 #include "eos_crc.h"
 #include "eos_osk.h"
-#include "eos_flash.h"
 #include "xboxinternals.h"
 
 #define IMG_CAP   (2 * 1024 * 1024)     /* max image: a 2MB Xenium BIOS */
@@ -40,8 +40,9 @@ enum {
     PH_RENAME,          /* OSK rename overlay */
     PH_MGMT_CONFIRM,    /* confirm a bank delete or flash */
     PH_NET_FETCH,       /* blocking download, drawn first */
-    PH_STAGE,           /* Update_Pump: stage -> validate */
-    PH_CONFIRM,         /* confirm the commit */
+    PH_STAGE,           /* Update_Pump: verify image (RAM) -> confirm */
+    PH_CONFIRM,         /* confirm the write */
+    PH_WRITING,         /* renders 'Writing flash...' then does the blocking write */
     PH_RESULT           /* done / failed / no-update message */
 };
 
@@ -75,6 +76,7 @@ static char           s_pickedFile[300];
 /* bank management */
 static int        s_bankSel = 0;
 static int        s_flashTarget = -1;
+static int        s_writePrimed = 0;   /* PH_WRITING: 0=render frame, 1=do write */
 static int        s_renameTarget = -1;
 enum { ACT_NONE = 0, ACT_DELETE, ACT_MGMT_FLASH };
 static int        s_pendAct = ACT_NONE;
@@ -194,14 +196,23 @@ static void Boot(void)
     Config_Load();          /* bank table + settings from the config bank */
     Theme_Init();           /* apply the saved theme (recolours everything) */
     Net_Start();            /* bring the network up; resolves over next frames */
-    /* read Eos firmware version from the chip (SMBus regs 0x01-0x03) */
-    if (Smb_Present()) {
-        BYTE mj = 0, mn = 0, pt = 0; char* vp = s_eosVer;
-        Smb_ReadReg(EOS_REG_VER_MAJ, &mj); Smb_ReadReg(EOS_REG_VER_MIN, &mn); Smb_ReadReg(EOS_REG_VER_PAT, &pt);
-        { const char* pfx = "Eos "; while (*pfx) *vp++ = *pfx++; }
-        if (mj / 10) *vp++ = (char)('0' + mj / 10); *vp++ = (char)('0' + mj % 10); *vp++ = '.';
-        if (mn / 10) *vp++ = (char)('0' + mn / 10); *vp++ = (char)('0' + mn % 10); *vp++ = '.';
-        if (pt / 10) *vp++ = (char)('0' + pt / 10); *vp++ = (char)('0' + pt % 10); *vp = 0;
+    /* read Eos firmware version from the chip (SMBus regs 0x01-0x03).
+       Use Smb_ReadVersion so ALL THREE reads must succeed together -- a
+       partial read (one register lost to bus contention) must NOT format a
+       garbage version. On any failure we leave s_eosVer empty and simply
+       don't show a version, rather than displaying a wrong one. */
+    {
+        BYTE mj = 0, mn = 0, pt = 0;
+        if (Smb_ReadVersion(&mj, &mn, &pt)) {
+            char* vp = s_eosVer;
+            const char* pfx = "Eos "; while (*pfx) *vp++ = *pfx++;
+            if (mj / 10) *vp++ = (char)('0' + mj / 10); *vp++ = (char)('0' + mj % 10); *vp++ = '.';
+            if (mn / 10) *vp++ = (char)('0' + mn / 10); *vp++ = (char)('0' + mn % 10); *vp++ = '.';
+            if (pt / 10) *vp++ = (char)('0' + pt / 10); *vp++ = (char)('0' + pt % 10); *vp = 0;
+        }
+        else {
+            s_eosVer[0] = 0;   /* unknown -> show nothing */
+        }
     }
     Splash_Init();
     File_MountDrives();
@@ -339,7 +350,8 @@ static void DoMgmtFlash(int idx)
     got = LoadLocal(s_pickedFile);
     if (got < 0) { SetMgmtStatus("Read failed / too big for bank"); return; }
     if (got == 0) { SetMgmtStatus("Empty file"); return; }
-    rc = Flash_WriteImage(Bank_Ef(idx), s_img, got);
+    rc = Flash_WriteImageVerified(Bank_Ef(idx), s_img, got);
+    if (rc == EOS_FLASH_VERIFY) { SetMgmtStatus("Verify FAILED - reflash"); return; }
     if (rc != EOS_FLASH_OK) { SetMgmtStatus("Flash FAILED"); return; }
     sc = sizeCodeForLen(got); Bank_SetOccupied(idx, 1, sc);
     {
@@ -437,8 +449,23 @@ static void Ph_Stage(WORD b)
 
 static void Ph_Confirm(WORD b)
 {
-    if (Pressed(b, s_prev, BTN_A)) { Update_Confirm(&s_job); GotoPhase(PH_STAGE); }
+    if (Pressed(b, s_prev, BTN_A)) { Update_Confirm(&s_job); s_writePrimed = 0; GotoPhase(PH_WRITING); }
     if (Pressed(b, s_prev, BTN_B)) { Update_Cancel(&s_job); s_resultMsg = "Cancelled."; GotoPhase(PH_RESULT); }
+}
+
+static void Ph_Writing(WORD b)
+{
+    int st;
+    (void)b;
+    /* First visit: let this frame render the 'Writing flash...' screen before
+       we enter the multi-second blocking flash write on the next frame. */
+    if (!s_writePrimed) { s_writePrimed = 1; return; }
+    st = Update_Pump(&s_job);   /* UPD_COMMITTING -> blocking verified write */
+    if (st == UPD_DONE) {
+        if (s_job.region == EOS_RGN_XBDIAG) StampXbDiag();
+        s_resultMsg = s_job.msg; GotoPhase(PH_RESULT); return;
+    }
+    if (st == UPD_FAILED) { s_resultMsg = s_job.msg; GotoPhase(PH_RESULT); return; }
 }
 
 static void Ph_Result(WORD b)
@@ -537,6 +564,11 @@ static void DrawPhase(void)
         Font_DrawCentered(0, g_scrW, 220, Update_ConfirmText(&s_job), EOS_WHITE);
         Font_DrawCentered(0, g_scrW, 300, "A Yes, write flash      B Cancel", EOS_PURPLE);
         break;
+    case PH_WRITING:
+        Ui_TitleBar("Updating");
+        Font_DrawCentered(0, g_scrW, 240, "Writing flash - do NOT power off...", EOS_WHITE);
+        Font_DrawCentered(0, g_scrW, 300, "Verifying every page (this takes ~1 min)", EOS_PURPLE);
+        break;
 
     case PH_RESULT:
         Ui_TitleBar("Result");
@@ -573,6 +605,7 @@ void __cdecl main(void)
         case PH_MGMT_CONFIRM: Ph_MgmtConfirm(b); break;
         case PH_STAGE:       Ph_Stage(b);     break;
         case PH_CONFIRM:     Ph_Confirm(b);   break;
+        case PH_WRITING:     Ph_Writing(b);   break;
         case PH_RESULT:      Ph_Result(b);    break;
         case PH_NET_FETCH:   /* handled after draw */ break;
         }

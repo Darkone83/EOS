@@ -134,7 +134,7 @@ int Flash_ProgramPage(int bankEf, int page, const unsigned char* data256)
     regw(IDX_OP, (unsigned char)OP_PROGRAM);
     regw(IDX_BANK, (unsigned char)(bankEf & 0x0F));
     regw(IDX_PAGELO, (unsigned char)(page & 0xFF));
-    regw(IDX_PAGEHI, (unsigned char)((page >> 8) & 0x0F));
+    regw(IDX_PAGEHI, (unsigned char)((page >> 8) & 0x1F));   /* 5 bits: 13-bit page */
     regw(IDX_GO, 1);
     return waitDone();
 }
@@ -146,7 +146,7 @@ int Flash_ReadPage(int bankEf, int page, unsigned char* out256)
     regw(IDX_OP, (unsigned char)OP_READ);
     regw(IDX_BANK, (unsigned char)(bankEf & 0x0F));
     regw(IDX_PAGELO, (unsigned char)(page & 0xFF));
-    regw(IDX_PAGEHI, (unsigned char)((page >> 8) & 0x0F));
+    regw(IDX_PAGEHI, (unsigned char)((page >> 8) & 0x1F));   /* 5 bits: 13-bit page */
     regw(IDX_GO, 1);
     rc = waitDone();
     if (rc != EOS_FLASH_OK) return rc;
@@ -191,6 +191,52 @@ int Flash_WriteImage(int bankEf, const unsigned char* data, int len)
 
     // Programs write flash but no longer self-refresh SDRAM (per-page reloads
     // were dropped back-to-back). One full-bank SYNC makes the served copy match.
+    return Flash_Sync(bankEf);
+}
+
+static int s_lastFailPage = -1;
+
+int Flash_LastFailPage(void) { return s_lastFailPage; }
+
+int Flash_WriteImageVerified(int bankEf, const unsigned char* data, int len)
+{
+    int           rc, pages, page, off, i, attempt, mismatch;
+    unsigned char pg[256];
+    unsigned char rb[256];
+
+    s_lastFailPage = -1;
+
+    rc = Flash_EraseBank(bankEf);
+    if (rc != EOS_FLASH_OK) return rc;
+
+    pages = (len + 255) / 256;
+    for (page = 0; page < pages; ++page) {
+        off = page * 256;
+        for (i = 0; i < 256; ++i)
+            pg[i] = (off + i < len) ? data[off + i] : 0xFF;   /* pad tail 0xFF */
+
+        /* program + verify, retrying THIS page only on mismatch or read error */
+        for (attempt = 0; attempt < EOS_FLASH_PAGE_RETRY; ++attempt) {
+            rc = Flash_ProgramPage(bankEf, page, pg);
+            if (rc != EOS_FLASH_OK) continue;         /* program glitch -> retry */
+
+            rc = Flash_ReadPage(bankEf, page, rb);
+            if (rc != EOS_FLASH_OK) continue;         /* read glitch -> retry */
+
+            mismatch = 0;
+            for (i = 0; i < 256; ++i) {
+                if (rb[i] != pg[i]) { mismatch = 1; break; }
+            }
+            if (!mismatch) break;                     /* page verified OK */
+        }
+
+        if (attempt >= EOS_FLASH_PAGE_RETRY) {
+            s_lastFailPage = page;
+            return EOS_FLASH_VERIFY;                   /* gave up on this page */
+        }
+    }
+
+    /* whole image verified byte-for-byte; make the served SDRAM copy match */
     return Flash_Sync(bankEf);
 }
 

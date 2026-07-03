@@ -232,6 +232,7 @@ module eos_hdmi_top (
     wire        sd_dr;
     wire        sd_busy;
     wire        preload_done;
+    wire        slot1_ready;      // XbDiag slot-1 window resident (clk_sd)
     wire [22:0] dbg_filled_lo;
     wire [3:0]  dbg_bank;          // live served/selected bank (lclk)
     wire        dbg_reload;        // reload in progress (clk_sd)
@@ -296,6 +297,7 @@ module eos_hdmi_top (
         .flash_free    (~bus_grant),
 
         .preload_done  (preload_done),
+        .slot1_ready   (slot1_ready),
         .dbg_filled_lo (dbg_filled_lo),
         .dbg_bank      (dbg_bank),
         .dbg_reload    (dbg_reload),
@@ -361,7 +363,7 @@ module eos_hdmi_top (
 
     // --- bridge (clk_sd): 0xEC/0xED index/data -> engine command interface ---
     wire [7:0]  bridge_cmd_rd_data;
-    wire        cmd_stb; wire [1:0] cmd_op; wire [3:0] cmd_bank; wire [11:0] cmd_page;
+    wire        cmd_stb; wire [1:0] cmd_op; wire [3:0] cmd_bank; wire [12:0] cmd_page;
     wire        pb_wr; wire [7:0] pb_addr; wire [7:0] pb_din;
     wire [7:0]  pb_raddr, pb_rdata;
     wire        eng_busy, eng_done, eng_refused; wire [7:0] eng_last_status;
@@ -523,7 +525,7 @@ module eos_hdmi_top (
     eos_i2c u_i2c (
         .clk      (clk_sd),  .resetn (sd_rstn),
         .sda_in   (i2c_sda), .scl_in (i2c_scl), .sda_oe (i2c_sda_oe),
-        .status_in({4'b0, abort_active_b, d0_active_b, mode_16, preload_done}),
+        .status_in({3'b0, slot1_ready, abort_active_b, d0_active_b, mode_16, preload_done}),
         .cmd      (i2c_cmd), .arg0(i2c_a0), .arg1(i2c_a1), .arg2(i2c_a2), .arg3(i2c_a3),
         .cmd_stb  (i2c_cmd_stb), .rx_count(i2c_rxcnt), .selected(i2c_sel),
         .crc_go(crc_go), .crc_len(crc_len), .crc_busy(crc_busy), .crc_done(crc_done), .crc_result(crc_result),

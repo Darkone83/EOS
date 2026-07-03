@@ -1,115 +1,77 @@
 // eos_smbus.cpp -- see eos_smbus.h.
-// Direct nForce SMBus master, mirroring the loader's eos_bank/eos_console
-// primitives (HalRead/WriteSMBusValue don't resolve under RXDK here).
+// SMBus access via the Xbox kernel HAL (HalReadSMBusValue / HalWriteSMBusValue,
+// EXPORTNUM 45/46). The kernel ARBITRATES the shared SMBus internally, so these
+// never collide with the kernel's own SMC / thermal polling -- unlike driving
+// the nForce controller directly, which raced the kernel and returned bytes
+// corrupted by interleaved transactions (version misreads as 3.1.0 / 0xFF that
+// changed every scan). This is the same proven path XbDiag uses.
 //
-// nForce SMBus register block base 0xC000:
-//   0xC000 status (W1C)   0xC002 control/protocol   0xC004 address (7-bit<<1|RW)
-//   0xC006 data           0xC008 command
-//   status: bit3 busy, bit4 complete, 0x24 = error/abort
-//   protocol 0x0A = byte-data transaction + start
+// ADDRESS CONVENTION: the HAL takes an 8-bit SOFTWARE-SHIFTED address (7-bit
+// hardware address << 1). Eos is 7-bit 0x6E -> 8-bit 0xDC. Register/command
+// byte and data byte map straight to the HAL's Command and Value.
 #include <xtl.h>
 #include "eos_smbus.h"
-#include "xboxinternals.h"     /* KeStallExecutionProcessor */
+#include "xboxinternals.h"     /* HalRead/WriteSMBusValue, KeStallExecutionProcessor */
 
-#define SMB_STATUS   0xC000
-#define SMB_CONTROL  0xC002
-#define SMB_ADDRESS  0xC004
-#define SMB_DATA     0xC006
-#define SMB_COMMAND  0xC008
-#define SMB_PROTO_BYTE 0x0A
+/* 7-bit EOS_SMB_ADDR (0x6E) -> 8-bit HAL address (0xDC). */
+#define EOS_SMB_ADDR8   ((unsigned char)(EOS_SMB_ADDR << 1))
 
-/* ---- port I/O (mirror of the loader) -------------------------------------- */
-static void io_out8(unsigned short port, unsigned char val)
-{
-    __asm
-    {
-        mov dx, port
-        mov al, val
-        out dx, al
-    }
-}
+#define SMB_RETRIES 8
 
-static unsigned char io_in8(unsigned short port)
-{
-    unsigned char v;
-    __asm
-    {
-        mov dx, port
-        in  al, dx
-        mov v, al
-    }
-    return v;
-}
-
-/* ---- raw nForce byte write ------------------------------------------------ */
+/* ---- kernel-HAL byte primitives ------------------------------------------
+   HalReadSMBusValue/HalWriteSMBusValue return 0 (STATUS_SUCCESS) on success and
+   are retried internally by the kernel on arbitration loss, so a single call is
+   already collision-safe. We keep a light outer retry for a persistently busy
+   bus (e.g. a stuck controller on softmod hardware). */
 static BOOL smbus_write_byte_once(unsigned char addr7, unsigned char cmd, unsigned char val)
 {
-    volatile int  t;
-    unsigned char st;
-
-    for (t = 0; t < 100000; ++t) { if (!(io_in8(SMB_STATUS) & 0x08)) break; }
-
-    io_out8(SMB_STATUS, io_in8(SMB_STATUS));                 /* clear status (W1C) */
-    io_out8(SMB_ADDRESS, (unsigned char)(addr7 << 1));       /* write (RW=0) */
-    io_out8(SMB_COMMAND, cmd);
-    io_out8(SMB_DATA, val);
-    io_out8(SMB_CONTROL, SMB_PROTO_BYTE);                    /* byte-data + start */
-
-    for (t = 0; t < 100000; ++t) {
-        st = io_in8(SMB_STATUS);
-        if (st & 0x10) return TRUE;                          /* complete */
-        if (st & 0x24) return FALSE;                         /* error/abort */
-    }
-    return FALSE;                                            /* timeout */
+    (void)addr7;   /* fixed device; addr8 derived from EOS_SMB_ADDR */
+    return (HalWriteSMBusValue(EOS_SMB_ADDR8, cmd, FALSE, (DWORD)val) == 0) ? TRUE : FALSE;
 }
 
-/* ---- raw nForce byte read (RW=1) ------------------------------------------ */
 static BOOL smbus_read_byte_once(unsigned char addr7, unsigned char cmd, unsigned char* val)
 {
-    volatile int  t;
-    unsigned char st;
-
-    for (t = 0; t < 100000; ++t) { if (!(io_in8(SMB_STATUS) & 0x08)) break; }
-
-    io_out8(SMB_STATUS, io_in8(SMB_STATUS));                 /* clear status (W1C) */
-    io_out8(SMB_ADDRESS, (unsigned char)((addr7 << 1) | 1)); /* read (RW=1) */
-    io_out8(SMB_COMMAND, cmd);
-    io_out8(SMB_CONTROL, SMB_PROTO_BYTE);                    /* byte-data + start */
-
-    for (t = 0; t < 100000; ++t) {
-        st = io_in8(SMB_STATUS);
-        if (st & 0x10) { *val = io_in8(SMB_DATA); return TRUE; }   /* complete */
-        if (st & 0x24) return FALSE;                               /* error/abort */
-    }
-    return FALSE;                                                  /* timeout */
+    DWORD v = 0;
+    (void)addr7;
+    if (HalReadSMBusValue(EOS_SMB_ADDR8, cmd, FALSE, &v) != 0) return FALSE;
+    if (val) *val = (unsigned char)(v & 0xFF);
+    return TRUE;
 }
-
-/* ---- retry wrappers -------------------------------------------------------
-   The Xbox SMBus is shared (SMC, sensors, EEPROM...). A long VALIDATE polls
-   status ~hundreds of times; an occasional transaction abort from bus
-   contention is normal and must NOT fail the operation. Retry a few times
-   with a short settle before giving up, so only a persistently dead bus
-   returns failure. */
-#define SMB_RETRIES 8
 
 static BOOL smbus_write_byte(unsigned char addr7, unsigned char cmd, unsigned char val)
 {
     int a;
     for (a = 0; a < SMB_RETRIES; ++a) {
         if (smbus_write_byte_once(addr7, cmd, val)) return TRUE;
-        KeStallExecutionProcessor(150);          /* let the shared bus settle */
+        KeStallExecutionProcessor(150);
     }
     return FALSE;
 }
+
+/* Read cadence: the Eos FPGA slave is a soft core on a sample clock and needs a
+   brief settle between transactions to fully return to idle (clear have_cmd on
+   STOP) before the next START. Back-to-back HAL reads outrun it and it stops
+   responding, so we pace every read with a short pre-settle -- not just the
+   on-failure backoff. */
+#define SMB_READ_SETTLE 250   /* us before each read transaction */
 
 static BOOL smbus_read_byte(unsigned char addr7, unsigned char cmd, unsigned char* val)
 {
     int a;
     for (a = 0; a < SMB_RETRIES; ++a) {
+        KeStallExecutionProcessor(SMB_READ_SETTLE);   /* let the slave settle first */
         if (smbus_read_byte_once(addr7, cmd, val)) return TRUE;
-        KeStallExecutionProcessor(150);
+        KeStallExecutionProcessor(300);               /* failed: longer backoff */
     }
     return FALSE;
+}
+
+/* Stable-register read. With the kernel HAL arbitrating, a normal retried read
+   is already collision-free -- no bus-quiet polling needed. Kept as a distinct
+   name so the identity/version paths are explicit. */
+static BOOL smbus_read_byte_polite(unsigned char addr7, unsigned char cmd, unsigned char* val)
+{
+    return smbus_read_byte(addr7, cmd, val);
 }
 
 /* ---- verified register write ---------------------------------------------
@@ -141,23 +103,33 @@ static BOOL smb_strobe_cmd(unsigned char cmd)
 }
 
 /* ---- register access ------------------------------------------------------ */
+/* Smb_ReadReg: plain read for LIVE registers (status has a changing BUSY bit,
+   so a two-in-a-row vote would misbehave mid-op). Static identity registers
+   (magic, version) use Smb_ReadRegStable below instead. */
 BOOL Smb_ReadReg(BYTE reg, BYTE* val) { return smbus_read_byte(EOS_SMB_ADDR, reg, val); }
+
+/* Smb_ReadRegStable: consensus read for registers whose value does NOT change
+   (magic, version). Filters shared-bus collision corruption that a plain read
+   cannot detect. */
+static BOOL Smb_ReadRegStable(BYTE reg, BYTE* val) { return smbus_read_byte_polite(EOS_SMB_ADDR, reg, val); }
 BOOL Smb_WriteReg(BYTE reg, BYTE val) { return smbus_write_byte(EOS_SMB_ADDR, reg, val); }
 
 /* ---- presence / identity -------------------------------------------------- */
 BOOL Smb_Present(void)
 {
     BYTE v;
-    if (!Smb_ReadReg(EOS_REG_MAGIC, &v)) return FALSE;
+    if (!Smb_ReadRegStable(EOS_REG_MAGIC, &v)) return FALSE;
     return (v == EOS_MAGIC);
 }
 
 BOOL Smb_ReadVersion(BYTE* maj, BYTE* min, BYTE* pat)
 {
     BYTE a, b, c;
-    if (!Smb_ReadReg(EOS_REG_VER_MAJ, &a)) return FALSE;
-    if (!Smb_ReadReg(EOS_REG_VER_MIN, &b)) return FALSE;
-    if (!Smb_ReadReg(EOS_REG_VER_PAT, &c)) return FALSE;
+    /* Reads are paced (SMB_READ_SETTLE) and kernel-arbitrated, so a single clean
+       read of each byte is reliable. All three must succeed together. */
+    if (!Smb_ReadRegStable(EOS_REG_VER_MAJ, &a)) return FALSE;
+    if (!Smb_ReadRegStable(EOS_REG_VER_MIN, &b)) return FALSE;
+    if (!Smb_ReadRegStable(EOS_REG_VER_PAT, &c)) return FALSE;
     if (maj) *maj = a;
     if (min) *min = b;
     if (pat) *pat = c;

@@ -19,6 +19,7 @@
 #define EOS_FLASH_OK        0
 #define EOS_FLASH_REFUSED  -1   // engine rejected the op (bad op/bank, below floor)
 #define EOS_FLASH_TIMEOUT  -2   // engine never reported done (bus/FPGA fault)
+#define EOS_FLASH_VERIFY   -3   // a page read back wrong after all retries
 
 // bankEf: the bank's 0xEF value; only the low nibble (bank number) is used.
 int Flash_EraseBank(int bankEf);
@@ -33,6 +34,16 @@ int Flash_ReadPage(int bankEf, int page, unsigned char* out256);
 // then SYNC so the served SDRAM copy matches flash. len may be any size up to
 // the bank's capacity. Returns 0 on success.
 int Flash_WriteImage(int bankEf, const unsigned char* data, int len);
+
+// Erase + program + VERIFY each page (read back and compare), retrying a bad
+// page up to EOS_FLASH_PAGE_RETRY times before failing with EOS_FLASH_VERIFY.
+// This is the reliable path for the on-Xbox updater: the whole image is held in
+// host RAM and pushed page-at-a-time through the direct 0xEC/0xED flash engine
+// (never the SDRAM scratch stream). On EOS_FLASH_VERIFY, Flash_LastFailPage()
+// returns the page index that would not verify. Returns 0 on success.
+#define EOS_FLASH_PAGE_RETRY 3
+int Flash_WriteImageVerified(int bankEf, const unsigned char* data, int len);
+int Flash_LastFailPage(void);   // page index of the last EOS_FLASH_VERIFY, else -1
 
 // Reload a bank's flash contents into the served SDRAM copy. WriteImage calls
 // this for you; exposed for a standalone "refresh after flashing" action.

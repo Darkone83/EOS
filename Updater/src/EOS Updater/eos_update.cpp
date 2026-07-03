@@ -9,16 +9,47 @@
 #define EOS_IMAGE_LEN  0x1C0000
 #include "eos_smbus.h"
 #include "eos_stage.h"
+#include "eos_flash.h"
 #include "eos_crc.h"
 #include "eos_bank.h"
 
 #define XBDIAG_EF  0x0D          /* XbDiag lives in bank 0xD */
+#define LOADER_EF  0x0E          /* loader full-image commit bank (base 0, phys 0x200000) */
+
+   /* Map an update region to the bankEf the direct flash engine writes. The FPGA
+      translates bankEf -> phys via bank_base(): BANK banks are base 0 (256K), the
+      loader is bank 0xE (base 0, full image -> phys 0x200000), XbDiag is bank 0xD
+      (base 0x200000 -> phys 0x400000). Same targets the SDRAM commit used. */
+      /* small no-CRT helpers to format the failing page into the status line */
+static char s_msgbuf[64];
+static int  msg_append(char* b, int p, const char* s)
+{
+    int i = 0; while (s[i] && p < 63) b[p++] = s[i++]; b[p] = 0; return p;
+}
+static int  msg_append_int(char* b, int p, int v)
+{
+    char tmp[12]; int n = 0;
+    if (v < 0) v = 0;
+    do { tmp[n++] = (char)('0' + (v % 10)); v /= 10; } while (v && n < 11);
+    while (n > 0 && p < 63) b[p++] = tmp[--n];
+    b[p] = 0; return p;
+}
+
+static int region_bank_ef(const UpdateJob* j)
+{
+    switch (j->region) {
+    case EOS_RGN_LOADER: return LOADER_EF;
+    case EOS_RGN_XBDIAG: return XBDIAG_EF;
+    case EOS_RGN_BANK:   return (int)(j->bank & 0x0F);
+    default:             return -1;
+    }
+}
 
 #define STAGE_CHUNK   16384      /* bytes streamed per Pump (UI stays responsive) */
 #define VAL_TIMEOUT   8000       /* ms to wait for VALIDATE (CRC over up to 2MB) */
 #define COMMIT_TIMEOUT 30000     /* ms to wait for COMMIT (erase + program) */
 
-   /* ---- versioning ----------------------------------------------------------- */
+/* ---- versioning ----------------------------------------------------------- */
 int Ver_Compare(EosVer a, EosVer b)
 {
     if (a.maj != b.maj) return (a.maj < b.maj) ? -1 : 1;
@@ -176,10 +207,10 @@ static BOOL begin_common(UpdateJob* j, BYTE region, BYTE bank,
     j->confirmed = 0;
     j->msg = "Staging image...";
 
+    /* Tolerant presence probe up front so a busy-bus fluke doesn't abort. The
+       actual write is a direct chunked+verified flash push (see Update_Pump),
+       NOT the SDRAM scratch/ARM/commit pipeline -- so no ARM here. */
     if (!Smb_Present()) { j->state = UPD_FAILED; j->msg = "Eos not detected on SMBus."; return FALSE; }
-    /* ARM the region (latches region + length, clears staged_valid) */
-    if (!Smb_Arm(region, (DWORD)len, bank)) { j->state = UPD_FAILED; j->msg = "ARM failed."; return FALSE; }
-    if (!Smb_WaitFlag(EOS_ST_ARMED, 500)) { j->state = UPD_FAILED; j->msg = "ARM not confirmed."; return FALSE; }
     return TRUE;
 }
 
@@ -205,44 +236,43 @@ int Update_Pump(UpdateJob* j)
     if (!j) return UPD_FAILED;
 
     switch (j->state) {
+        /* STAGING: the image is already in host RAM (j->image). Optionally verify
+           its CRC against the .ver here as an identity check, then go straight to
+           the confirm gate. No SDRAM scratch, no ARM. */
     case UPD_STAGING: {
-        int remaining = j->len - j->staged;
-        int chunk = (remaining > STAGE_CHUNK) ? STAGE_CHUNK : remaining;
-        if (j->staged == 0) Stage_Begin(0);
-        if (!Stage_Write(j->image + j->staged, chunk)) {
-            j->state = UPD_FAILED; j->msg = "Staging to scratch failed."; break;
+        if (j->crc != 0) {
+            DWORD calc = Crc_Buffer(j->image, j->len);
+            if (calc != j->crc) {
+                j->state = UPD_FAILED; j->msg = "CRC mismatch - download bad."; break;
+            }
         }
-        j->staged += chunk;
-        if (j->staged >= j->len) {
-            if (!Smb_SetCrc(j->region, j->crc)) { j->state = UPD_FAILED; j->msg = "SETCRC failed."; break; }
-            if (!Smb_WaitFlag(EOS_ST_CRCSET, 500)) { j->state = UPD_FAILED; j->msg = "SETCRC not confirmed."; break; }
-            if (!Smb_Validate(j->region)) { j->state = UPD_FAILED; j->msg = "VALIDATE failed."; break; }
-            j->state = UPD_VALIDATING; j->msg = "Validating (CRC)...";
-        }
+        j->staged = j->len;                 /* progress bar shows complete */
+        j->state = UPD_CONFIRM;
+        j->msg = "Verified. Confirm to flash.";
         break;
     }
-    case UPD_VALIDATING: {
-        BYTE st = Smb_WaitOp(EOS_ST_VALID, VAL_TIMEOUT);
-        j->last_status = st;
-        if (st == 0xFF) { j->state = UPD_FAILED; j->msg = "SMBus error during validate."; }
-        else if (st & EOS_ST_VALID) { j->state = UPD_CONFIRM; j->msg = "Validated. Confirm to flash."; }
-        else if (st & EOS_ST_ERR) { j->state = UPD_FAILED; j->msg = "CRC mismatch - download bad."; }
-        else { j->state = UPD_FAILED; j->msg = "Validate did not complete."; }
+    case UPD_VALIDATING:                    /* retained for enum compat; unused */
+        j->state = UPD_CONFIRM;
         break;
-    }
     case UPD_CONFIRM:
-        if (j->confirmed) {
-            if (!Smb_Commit(j->region)) { j->state = UPD_FAILED; j->msg = "COMMIT strobe failed."; break; }
-            j->state = UPD_COMMITTING; j->msg = "Writing flash...";
-        }
+        if (j->confirmed) { j->state = UPD_COMMITTING; j->msg = "Writing flash..."; }
         break;
+        /* COMMITTING: the real write. Direct, chunked, per-page verified flash push
+           via the 0xEC/0xED engine -- the same reliable path manual flash uses. */
     case UPD_COMMITTING: {
-        BYTE st = Smb_WaitOp(EOS_ST_COMMITOK, COMMIT_TIMEOUT);
-        j->last_status = st;
-        if (st == 0xFF) { j->state = UPD_FAILED; j->msg = "SMBus error during commit."; }
-        else if (st & EOS_ST_COMMITOK) { j->state = UPD_DONE;   j->msg = "Done. Flash updated."; }
-        else if (st & EOS_ST_ERR) { j->state = UPD_FAILED; j->msg = "Commit refused/failed."; }
-        else { j->state = UPD_FAILED; j->msg = "Commit did not complete."; }
+        int ef = region_bank_ef(j);
+        int rc;
+        if (ef < 0) { j->state = UPD_FAILED; j->msg = "Bad target region."; break; }
+        rc = Flash_WriteImageVerified(ef, j->image, j->len);
+        if (rc == EOS_FLASH_OK) { j->state = UPD_DONE; j->msg = "Done. Flash updated."; }
+        else if (rc == EOS_FLASH_VERIFY) {
+            int p = 0;
+            p = msg_append(s_msgbuf, p, "Verify failed at page ");
+            p = msg_append_int(s_msgbuf, p, Flash_LastFailPage());
+            j->state = UPD_FAILED; j->msg = s_msgbuf;
+        }
+        else if (rc == EOS_FLASH_REFUSED) { j->state = UPD_FAILED; j->msg = "Flash refused (bad target)."; }
+        else { j->state = UPD_FAILED; j->msg = "Flash timeout (bus/FPGA)."; }
         break;
     }
     case UPD_IDLE:

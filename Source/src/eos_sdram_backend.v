@@ -17,6 +17,10 @@ module eos_sdram_backend #(
     parameter [22:0]  BIOS_BASE = 23'h00_0000,
     parameter [23:0]  FLASH_OFF = 24'h20_0000,
     parameter integer LENGTH    = 1835008,       // 0x1C0000: skip empty top; kernel/boot region fills first
+    parameter [23:0]  SLOT1_FL  = 24'h50_0000,   // XbDiag window flash base (slot1 0x400000 + img 0x100000)
+    parameter [22:0]  SLOT1_SD  = 23'h30_0000,   // XbDiag window SDRAM base (slot1 0x200000 + img 0x100000)
+    parameter integer SLOT1_LEN = 24'h0C_0000,   // 768K: XBE+kernel contiguous window
+    parameter [23:0]  SLOT1_SIG = 24'h50_000B,   // flash addr of 'XBEH' magic in slot1
     parameter integer CHUNK     = 256
 )(
     input  wire        lclk,
@@ -66,6 +70,7 @@ module eos_sdram_backend #(
     output wire        scr_busy,        // 1 while a scratch op is queued/in flight
 
     output reg         preload_done,
+    output reg         slot1_ready,     // XbDiag slot-1 window resident in SDRAM
     output wire [22:0] dbg_filled_lo,
     output wire [3:0]  dbg_bank,        // live bank_l (served/selected bank)
     output wire        dbg_reload       // reload (flash->SDRAM) in progress
@@ -328,6 +333,9 @@ module eos_sdram_backend #(
     localparam S_SCR_WR     = 4'd10;
     localparam S_SCR_RD_REQ = 4'd11;
     localparam S_SCR_RD_WAIT= 4'd12;   // reload: write byte to SDRAM
+    localparam S_S1_PROBE   = 4'd13;   // slot1: request one 'XBEH' magic byte
+    localparam S_S1_PWAIT   = 4'd14;   // slot1: check captured magic byte
+    localparam S_S1_FILL    = 4'd15;   // slot1: run the 768K window reload
 
     reg [3:0] st;
 
@@ -342,6 +350,16 @@ module eos_sdram_backend #(
     reg [22:0]  rl_sd_base;     // SDRAM base = flash base - FLASH_OFF
     reg [23:0]  rl_len;
     reg [23:0]  rl_idx;
+    // XbDiag slot-1 presence probe + gated second-region preload
+    reg [1:0]   sig_i;         // which of the 4 'XBEH' bytes we're checking
+    reg         sig_ok;        // all 4 magic bytes matched so far
+    reg         slot1_done;    // second-region preload finished (latched)
+    reg         s1_filling;    // the active reload is the slot-1 window fill
+    // does the just-captured probe byte match its expected 'XBEH' position?
+    wire        byte_ok = (sig_i == 2'd0) ? (wbyte == 8'h58) :
+                          (sig_i == 2'd1) ? (wbyte == 8'h42) :
+                          (sig_i == 2'd2) ? (wbyte == 8'h45) :
+                                            (wbyte == 8'h48);
 
     reg [22:0] chunk_base;
     reg [22:0] filled_lo;
@@ -408,6 +426,11 @@ module eos_sdram_backend #(
             rl_sd_base     <= 23'd0;
             rl_len         <= 24'd0;
             rl_idx         <= 24'd0;
+            slot1_ready    <= 1'b0;
+            slot1_done     <= 1'b0;
+            sig_i          <= 2'd0;
+            sig_ok         <= 1'b1;
+            s1_filling     <= 1'b0;
         end else begin
             sd_rd      <= 1'b0;
             sd_wr      <= 1'b0;
@@ -568,6 +591,14 @@ module eos_sdram_backend #(
                         if (refresh_due) begin
                             sd_refresh <= 1'b1;
                             op_lock    <= 1'b1;
+                        end else if (preload_done && !slot1_done && flash_free
+                                     && !reload_pending) begin
+                            // One-shot after slot-0 preload: probe flash slot 1 for
+                            // the 'XBEH' magic; if present, page the 768K XbDiag
+                            // window into SDRAM so it launches like a resident bank.
+                            sig_i  <= 2'd0;
+                            sig_ok <= 1'b1;
+                            st     <= S_S1_PROBE;
                         end else if (reload_pending && flash_free) begin
                             // freshly-flashed region: re-read flash -> SDRAM in
                             // place so it serves without a cold boot. Only once
@@ -596,7 +627,12 @@ module eos_sdram_backend #(
                 S_RL_REQ: begin
                     if (rl_idx >= rl_len ||
                         (rl_sd_base + rl_idx[22:0]) >= SCRATCH_BASE) begin
-                        reload_pending <= 1'b0;
+                        if (s1_filling) begin
+                            slot1_ready <= 1'b1;   // XbDiag window now resident
+                            s1_filling  <= 1'b0;
+                        end else begin
+                            reload_pending <= 1'b0;
+                        end
                         st             <= S_SERVE;
                     end else if (!fr_busy && !wpend) begin
                         fr_addr  <= rl_fl_base + rl_idx;
@@ -626,6 +662,59 @@ module eos_sdram_backend #(
                             st      <= S_RL_REQ;
                         end
                     end
+                end
+
+                // -------------------------------------------------------------
+                // Slot-1 (XbDiag) presence probe: read the 4 'XBEH' magic bytes
+                // at SLOT1_SIG. If all match, page in the 768K window; else leave
+                // slot 1 cold. Latches slot1_done either way so it runs once.
+                // -------------------------------------------------------------
+                S_S1_PROBE: begin
+                    if (!fr_busy && !wpend) begin
+                        fr_addr  <= SLOT1_SIG + {22'd0, sig_i};
+                        fr_len   <= 9'd1;
+                        fr_start <= 1'b1;
+                        st       <= S_S1_PWAIT;
+                    end
+                end
+
+                S_S1_PWAIT: begin
+                    if (wpend) begin
+                        wpend <= 1'b0;
+                        // 'XBEH' = 0x58 0x42 0x45 0x48. byte_ok = does THIS byte
+                        // match the expected magic char for its position?
+                        if (!byte_ok) sig_ok <= 1'b0;   // sticky-clear on any miss
+                        if (sig_i == 2'd3) begin
+                            slot1_done <= 1'b1;          // probe complete (runs once)
+                            // final decision uses sig_ok AND this byte's match, so
+                            // the 4th byte is included without an NBA race.
+                            if (sig_ok && byte_ok) begin
+                                rl_fl_base <= SLOT1_FL;  // magic present -> page window
+                                rl_sd_base <= SLOT1_SD;
+                                rl_len     <= SLOT1_LEN;
+                                rl_idx     <= 24'd0;
+                                st         <= S_S1_FILL;
+                            end else begin
+                                st <= S_SERVE;           // no XbDiag -> stay cold
+                            end
+                        end else begin
+                            sig_i <= sig_i + 1'b1;
+                            st    <= S_S1_PROBE;
+                        end
+                    end
+                end
+
+                // Fill the slot-1 window by reusing the reload byte loop. We drive
+                // rl_* and bounce through S_RL_REQ; when it finishes (rl_idx>=len)
+                // it returns to S_SERVE with reload_pending clear -- but we came in
+                // via S_S1_FILL so we latch slot1_ready on entry to the loop and let
+                // the standard reload path carry it to completion.
+                S_S1_FILL: begin
+                    // hand off to the shared reload loop; s1_filling tells the
+                    // loop's exit (in S_RL_REQ) to raise slot1_ready when it drains.
+                    slot1_ready <= 1'b0;   // not ready until the loop drains
+                    s1_filling  <= 1'b1;
+                    st          <= S_RL_REQ;
                 end
 
                 S_SCR_WR: begin
