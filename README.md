@@ -1,4 +1,4 @@
-# Eos — Firmware (FPGA Gateware)
+# Eos — Firmware
 
 <div align=center>
 
@@ -264,16 +264,16 @@ The packed `eos.bin` (the full 2 MB BIOS, produced by the loader's `eos_pack.py`
 to the SPI flash at the gateware's serve base:
 
 ```bash
-openFPGALoader -b tangnano20k --external-flash -o 0x200000 eos.bin
+openFPGALoader -b tangnano20k --external-flash -o 0x2000000 eos.bin
 ```
 
-> ⚠️ **CONFIRM THE OFFSET.** The gateware serves from `FLASH_OFF = 0x200000`
+> ⚠️ **CONFIRM THE OFFSET.** The gateware serves from `FLASH_OFF = 0x2000000`
 > (`eos_sdram_backend.v`), so the BIOS must be written there. Some of the working tooling
-> shows `-o 0x20000` (one fewer zero) — that would land the BIOS *inside* the ~570 KB
-> bitstream and is almost certainly a typo. Verify `0x200000` against your board before
+> shows `-o 0x200000` (one fewer zero) — that would land the BIOS *inside* the ~570 KB
+> bitstream and is almost certainly a typo. Verify `0x2000000` against your board before
 > publishing, and make the Recovery app default match.
 
-The image's internal layout maps to banks (physical flash = `0x200000` + offset-in-image):
+The image's internal layout maps to banks (physical flash = `0x2000000` + offset-in-image):
 
 | Offset in image | Contents | Bank (`0xEF`) |
 |---|---|---|
