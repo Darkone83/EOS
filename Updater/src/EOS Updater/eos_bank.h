@@ -24,6 +24,7 @@ void          Bank_ResetToFactory(void);  // reset live table to factory default
 int           Bank_Count(void);
 const char* Bank_Name(int idx);
 unsigned char Bank_Ef(int idx);            // 0xEF value for this bank (low nibble = bank)
+int           Bank_IndexForEf(unsigned char ef);  /* reverse: table index for EF, -1 if none */
 void          Bank_SetName(int idx, const char* name);  // rename (persisted via Config_Save)
 
 // Occupancy + size (drives populated-only launch list vs all-banks management).

@@ -72,6 +72,12 @@ BOOL Update_BeginLoader(UpdateJob* j, const unsigned char* img, int len, DWORD c
 BOOL Update_BeginBios(UpdateJob* j, int bankEf, const unsigned char* img, int len);
 BOOL Update_BeginXbDiag(UpdateJob* j, const unsigned char* img, int len, DWORD crc);
 
+/* Flash a large (512K/1MB) BIOS into the ext region with descriptor auto-place.
+   Used by both the job pump and the direct bank-management flash path. Returns
+   EOS_FLASH_OK, or EOS_FLASH_VERIFY (no free slot) / EOS_FLASH_REFUSED
+   (descriptor write failed) / EOS_FLASH_TIMEOUT (ext-region flash failed). */
+int  Update_ExtBankFlash(const unsigned char* image, int len);
+
 /* Advance one step; returns the new state. Idempotent once terminal. */
 int  Update_Pump(UpdateJob* j);
 

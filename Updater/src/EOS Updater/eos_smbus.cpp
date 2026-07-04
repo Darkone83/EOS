@@ -233,6 +233,14 @@ BOOL Smb_Clear(void)
     return Smb_Command(EOS_CMD_CLEAR);
 }
 
+/* Set the FPGA LED mode: 0 = normal status colors, 1 = rainbow cycle. The
+   updater turns rainbow ON at entry and OFF at exit -- a bit of fun while the
+   app runs. arg0 carries the mode; cmd 0x38 latches it (LEDMODE). */
+BOOL Smb_SetLedMode(BYTE mode)
+{
+    return Smb_CommandArgs(EOS_CMD_LEDMODE, (BYTE)(mode & 0x03), 0, 0, 0);
+}
+
 /* ---- wait for an async op (VALIDATE / COMMIT) ----------------------------- */
 BYTE Smb_WaitDone(int timeout_ms)
 {

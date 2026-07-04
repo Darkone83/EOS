@@ -90,3 +90,20 @@ int File_ReadInto(const char* path, unsigned char* buf, int cap)
     CloseHandle(h);
     return (int)sz;
 }
+
+/* Write `len` bytes from `buf` to `path`, creating/overwriting it. Returns the
+   number of bytes written, or -1 on error. Used for local bank-image backups. */
+int File_WriteFrom(const char* path, const unsigned char* buf, int len)
+{
+    HANDLE h;
+    DWORD  put = 0;
+    if (!path || !buf || len < 0) return -1;
+    h = CreateFileA(path, GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    if (len && (!WriteFile(h, buf, (DWORD)len, &put, NULL) || put != (DWORD)len)) {
+        CloseHandle(h); return -1;
+    }
+    CloseHandle(h);
+    return (int)put;
+}

@@ -16,6 +16,7 @@
     <ClCompile Include="eos_bank.cpp" />
     <ClCompile Include="eos_config.cpp" />
     <ClCompile Include="eos_crc.cpp" />
+    <ClCompile Include="eos_descriptor.cpp" />
     <ClCompile Include="eos_file.cpp" />
     <ClCompile Include="eos_flash.cpp" />
     <ClCompile Include="eos_font.cpp" />
@@ -43,6 +44,7 @@
     <ClInclude Include="eos_bank.h" />
     <ClInclude Include="eos_config.h" />
     <ClInclude Include="eos_crc.h" />
+    <ClInclude Include="eos_descriptor.h" />
     <ClInclude Include="eos_file.h" />
     <ClInclude Include="eos_flash.h" />
     <ClInclude Include="eos_font.h" />

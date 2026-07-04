@@ -23,7 +23,12 @@ module eos_bank_ctrl #(
     parameter [7:0]   CMD_PP   = 8'h02,
     parameter [7:0]   CMD_BE   = 8'hD8,
     parameter [7:0]   CMD_RDSR = 8'h05,
-    parameter [7:0]   CMD_READ = 8'h03
+    parameter [7:0]   CMD_READ = 8'h03,
+    // ---- dynamic bank geometry (Pass 1: FPGA read-only) ----
+    // Offsets are relative to FLOOR (same space as bank_base). Blank NOR reads
+    // 0xFF so a fresh chip fails the MAGIC check -> legacy static geometry.
+    parameter [23:0]  DESC_OFF   = 24'h4C0000,   // descriptor block  (phys 0x6C0000)
+    parameter [23:0]  NEWRGN_OFF = 24'h3C0000    // oversized-bank region (phys 0x5C0000)
 )(
     input  wire        clk,
     input  wire        cold_rstn,
@@ -35,6 +40,8 @@ module eos_bank_ctrl #(
     input  wire [1:0]  cmd_op,        // 0=ERASE_BANK 1=PROGRAM_PAGE 2=READ_PAGE
     input  wire [3:0]  cmd_bank,
     input  wire [12:0] cmd_page,
+    input  wire        desc_reload,   // pulse (i2c domain): re-read the descriptor block
+    input  wire        blk_erase,     // 1 = ERASE only one 64K block at cmd_page's block
     input  wire        pb_wr,
     input  wire [7:0]  pb_addr,
     input  wire [7:0]  pb_din,
@@ -47,6 +54,14 @@ module eos_bank_ctrl #(
     output reg         refresh_req,
     output reg  [23:0] refresh_base,
     output reg  [23:0] refresh_len,
+
+    // Per-user-slot descriptor export for the SERVE path (eos_sdram_backend).
+    // Index [3:0] maps to EF nibbles 0x3..0x6 (bit i = user slot i+1). This lets
+    // the backend redirect a normal bank launch (EF 0x3..0x6) to the ext-region
+    // SDRAM copy when that slot is an oversized ANCHOR -- no special launch EF.
+    output wire [3:0]  ext_anchor,     // 1 = this slot is an oversized anchor
+    output wire [7:0]  ext_szc,        // 2 bits per slot: size code (512K/1MB)
+    output wire [95:0] ext_base,       // 24 bits per slot: phys base rel FLOOR
     output reg         bus_req,
     input  wire        bus_gnt,
     output reg         flash_cs_n,
@@ -85,6 +100,8 @@ module eos_bank_ctrl #(
             4'hC: bank_base = 24'h5E0000;            // CONFIG settings   (phys 0x7E0000)
             4'hD: bank_base = 24'h200000;            // XbDiag Lite       (phys 0x400000, reserve)
             4'hE: bank_base = 24'h000000;            // LOADER full image (phys 0x200000, slot 0)
+            4'h0: bank_base = 24'h3C0000;            // NEW REGION oversized banks (phys 0x5C0000)
+            4'hF: bank_base = 24'h4C0000;            // DESCRIPTOR block (phys 0x6C0000)
             default: bank_base = 24'h000000;
         endcase
     end endfunction
@@ -95,6 +112,8 @@ module eos_bank_ctrl #(
             4'hD:          bank_size = 24'h1C0000;  // XbDiag: full-image span (28x64K), 2nd slot
             4'hE:          bank_size = 24'h1C0000;  // LOADER: full-image span (28x64K), slot 0
             4'hB,4'hC:      bank_size = 24'h010000;  // CONFIG: one 64K block each
+            4'h0:          bank_size = 24'h100000;  // NEW REGION: 1MB oversized area
+            4'hF:          bank_size = 24'h010000;  // DESCRIPTOR: one 64K block
             default:        bank_size = 24'h040000;  // 256K
         endcase
     end endfunction
@@ -126,8 +145,66 @@ module eos_bank_ctrl #(
     wire [7:0]  eff_pb_addr  = commit_active ? sup_pb_addr  : pb_addr;
     wire [7:0]  eff_pb_din   = commit_active ? sup_pb_din   : pb_din;
 
-    wire [23:0] sel_phys_base = FLOOR + bank_base(eff_cmd_bank);
-    wire [23:0] sel_size      = bank_size(eff_cmd_bank);
+    // ===== dynamic bank descriptor (Pass 1: read-only) =====================
+    // Loaded once at boot from the descriptor block. When invalid (blank flash),
+    // descriptor_valid=0 and ALL geometry falls back to the static tables below,
+    // so behavior is byte-identical to the legacy design. Only user slots 1..4
+    // are governed by the descriptor; loader/xbdiag/config always use statics.
+    //
+    // Per-slot entry (from flash, 8 bytes each):
+    //   [0] state     0=free 1=native256 2=oversized-anchor 3=shadowed
+    //   [1] size_code 0=256K 1=512K 2=1M
+    //   [4..6] phys_base (24-bit, relative to FLOOR, little-endian)
+    localparam DS_FREE=2'd0, DS_NATIVE=2'd1, DS_ANCHOR=2'd2, DS_SHADOW=2'd3;
+
+    reg        descriptor_valid;
+    reg [1:0]  slot_state [1:4];
+    reg [1:0]  slot_szc   [1:4];
+    reg [23:0] slot_base  [1:4];   // relative to FLOOR
+
+    // Export the parsed slots for the serve path. slot_state[1..4] correspond to
+    // EF nibbles 0x3..0x6 (descriptor slots 0..3). Only valid when descriptor_valid.
+    assign ext_anchor[0] = descriptor_valid && (slot_state[1] == DS_ANCHOR);
+    assign ext_anchor[1] = descriptor_valid && (slot_state[2] == DS_ANCHOR);
+    assign ext_anchor[2] = descriptor_valid && (slot_state[3] == DS_ANCHOR);
+    assign ext_anchor[3] = descriptor_valid && (slot_state[4] == DS_ANCHOR);
+    assign ext_szc  = {slot_szc[4],  slot_szc[3],  slot_szc[2],  slot_szc[1]};
+    assign ext_base = {slot_base[4], slot_base[3], slot_base[2], slot_base[1]};
+
+    // size_code -> byte length
+    function [23:0] szc_len; input [1:0] c; begin
+        case (c)
+            2'd0: szc_len = 24'h040000;   // 256K
+            2'd1: szc_len = 24'h080000;   // 512K
+            2'd2: szc_len = 24'h100000;   // 1M
+            default: szc_len = 24'h040000;
+        endcase
+    end endfunction
+
+    // Is this a user slot (1..4) the descriptor is allowed to govern?
+    wire eff_is_user_slot = (eff_cmd_bank >= 4'd1) && (eff_cmd_bank <= 4'd4);
+    wire [2:0] eff_slot_ix = eff_cmd_bank[2:0];   // 1..4
+
+    // Descriptor-resolved geometry for the selected user slot (valid only when
+    // descriptor_valid && eff_is_user_slot). Occupied = native or anchor.
+    wire       eff_slot_occupied = eff_is_user_slot &&
+                   ((slot_state[eff_slot_ix] == DS_NATIVE) ||
+                    (slot_state[eff_slot_ix] == DS_ANCHOR));
+    wire [23:0] dyn_base = FLOOR + slot_base[eff_slot_ix];
+    wire [23:0] dyn_size = (slot_state[eff_slot_ix] == DS_NATIVE)
+                             ? 24'h040000
+                             : szc_len(slot_szc[eff_slot_ix]);
+
+    // Use the descriptor ONLY when it is valid, the bank is a user slot, and that
+    // slot is actually occupied. Everything else -> legacy static tables. This
+    // guarantees: blank descriptor -> pure legacy; non-user banks -> pure legacy;
+    // selecting a free/shadowed slot -> legacy (harmless; the host gates real ops).
+    wire use_dynamic = descriptor_valid && eff_is_user_slot && eff_slot_occupied;
+
+    wire [23:0] sel_phys_base = use_dynamic ? dyn_base
+                                            : (FLOOR + bank_base(eff_cmd_bank));
+    wire [23:0] sel_size      = use_dynamic ? dyn_size
+                                            : bank_size(eff_cmd_bank);
     wire [8:0]  n_blocks      = sel_size[23:16];   // size / 64K
     wire        op_below_floor = (sel_phys_base < FLOOR);
 
@@ -174,21 +251,47 @@ module eos_bank_ctrl #(
                S_POLL0=5'd10,S_POLL1=5'd11,S_POLLC=5'd12,S_NEXT=5'd13,
                S_DONE=5'd14,S_REFUSE=5'd15,S_KICK=5'd16,
                S_RCMD=5'd17,S_RA2=5'd18,S_RA1=5'd19,S_RA0=5'd20,
-               S_RDATA=5'd21,S_RCAP=5'd22,S_RCSUP=5'd23;
+               S_RDATA=5'd21,S_RCAP=5'd22,S_RCSUP=5'd23,
+               // ---- boot-time descriptor load (Pass 1) ----
+               S_DBOOT=5'd24,   // wait for bus grant, start read
+               S_DCMD=5'd25,S_DA2=5'd26,S_DA1=5'd27,S_DA0=5'd28,
+               S_DRD=5'd29,S_DCAP=5'd30,S_DFIN=5'd31;
 
     reg [4:0]  st, ret; reg [1:0] op_l;
     reg [23:0] addr_l; reg [8:0] blocks_left; reg [8:0] pbyte;
     reg [23:0] flashed_base, flashed_len;
     reg [8:0]  rd_idx;     // read-back byte counter (0..256)
 
+    // descriptor-load working state
+    localparam DESC_BYTES = 7'd64;         // read 64 bytes of the descriptor block
+    reg [6:0]  db_idx;                     // 0..63
+    reg [7:0]  db_buf [0:63];              // raw descriptor bytes
+    reg        desc_loaded;                // 1 once the boot load has completed
+
+    // desc_reload arrives from the i2c clock domain; synchronize and edge-detect it
+    // into a sticky reload_pending that the idle FSM consumes by re-running S_DBOOT.
+    reg [2:0]  drl_sync;
+    reg        reload_pending;
+    always @(posedge clk or negedge cold_rstn) begin
+        if (!cold_rstn) begin drl_sync<=3'd0; end
+        else            drl_sync<={drl_sync[1:0], desc_reload};
+    end
+    wire drl_edge = (drl_sync[2:1]==2'b01);   // rising edge in this domain
+
     always @(posedge clk or negedge cold_rstn) begin
         if (!cold_rstn) begin
-            st<=S_IDLE; busy<=0; done<=0; refused<=0; last_status<=8'hFF;
+            st<=S_DBOOT; busy<=0; done<=0; refused<=0; last_status<=8'hFF;
             flash_cs_n<=1; bus_req<=0; shift_go<=0; refresh_req<=0; refresh_base<=0; refresh_len<=0;
             addr_l<=0; blocks_left<=0; pbyte<=0; op_l<=0; flashed_base<=0; flashed_len<=0; ret<=S_IDLE;
             rd_we<=0; rd_waddr<=0; rd_wdata<=0; rd_idx<=0;
+            db_idx<=0; desc_loaded<=0; descriptor_valid<=0; reload_pending<=0;
         end else begin
             done<=1'b0; refresh_req<=1'b0; shift_go<=1'b0; rd_we<=1'b0;
+            // Latch a descriptor re-read request from the i2c domain. Consumed only
+            // when the flash engine is idle (below), so it never interrupts a live
+            // erase/program/read; the host issues DESCRELOAD after it has finished
+            // writing the descriptor block.
+            if (drl_edge) reload_pending<=1'b1;
             case (st)
                 S_IDLE: begin
                     busy<=1'b0; flash_cs_n<=1'b1; bus_req<=1'b0;
@@ -205,8 +308,17 @@ module eos_bank_ctrl #(
                                 flashed_base<=sel_phys_base; flashed_len<=sel_size;
                                 st<=S_DONE;
                             end else if (eff_cmd_op==OP_ERASE) begin
-                                addr_l<=sel_phys_base; blocks_left<=n_blocks;
-                                flashed_base<=sel_phys_base; flashed_len<=sel_size;
+                                if (blk_erase) begin
+                                    // single 64K block: base + (page's block)*64K.
+                                    // cmd_page is a 256B page index; block = page>>8.
+                                    addr_l<=sel_phys_base + ({eff_cmd_page[12:8],16'd0});
+                                    blocks_left<=9'd1;
+                                    flashed_base<=sel_phys_base + ({eff_cmd_page[12:8],16'd0});
+                                    flashed_len<=24'h010000;
+                                end else begin
+                                    addr_l<=sel_phys_base; blocks_left<=n_blocks;
+                                    flashed_base<=sel_phys_base; flashed_len<=sel_size;
+                                end
                                 st<=S_REQ;
                             end else begin   // PROGRAM or READ: single page address
                                 addr_l<=sel_phys_base + {3'd0,eff_cmd_page,8'd0};
@@ -214,6 +326,16 @@ module eos_bank_ctrl #(
                                 st<=S_REQ;
                             end
                         end
+                    end else if (reload_pending) begin
+                        // Idle and a descriptor re-read was requested: clear the flag
+                        // and re-run the boot loader path to refresh geometry from the
+                        // freshly-written descriptor block (no reboot needed).
+                        // Set busy so the host can poll STATUS and wait for the reload
+                        // to finish before issuing the next flash op (no bus race).
+                        busy<=1'b1;
+                        reload_pending<=1'b0;
+                        db_idx<=7'd0;
+                        st<=S_DBOOT;
                     end
                 end
                 S_REQ:  begin bus_req<=1'b1; if (bus_gnt) st<=(op_l==OP_READ)?S_RCMD:S_WREN; end
@@ -280,6 +402,57 @@ module eos_bank_ctrl #(
                     rd_idx<=rd_idx+1'b1; st<=S_RDATA;
                 end
                 S_RCSUP: begin flash_cs_n<=1'b1; st<=S_DONE; end
+
+                // ================= boot-time descriptor load =================
+                // Runs ONCE out of reset, before any command is served. Borrows
+                // the flash bus (same bus_req/bus_gnt as commands) after preload,
+                // reads DESC_BYTES from the descriptor block into db_buf, then
+                // validates MAGIC+VERSION. On any mismatch (blank flash reads
+                // 0xFF) descriptor_valid stays 0 -> pure legacy geometry.
+                S_DBOOT: begin
+                    bus_req<=1'b1;
+                    if (bus_gnt) begin
+                        db_idx<=7'd0;
+                        st<=S_DCMD;
+                    end
+                end
+                S_DCMD: begin flash_cs_n<=1'b0; tx_byte<=CMD_READ; ret<=S_DA2; st<=S_KICK; end
+                S_DA2:  begin tx_byte<=(FLOOR+DESC_OFF)>>16;      ret<=S_DA1; st<=S_KICK; end
+                S_DA1:  begin tx_byte<=(FLOOR+DESC_OFF)>>8;       ret<=S_DA0; st<=S_KICK; end
+                S_DA0:  begin tx_byte<=(FLOOR+DESC_OFF)&24'hFF;   ret<=S_DRD; st<=S_KICK; end
+                S_DRD:  begin
+                    if (db_idx==DESC_BYTES) begin flash_cs_n<=1'b1; st<=S_DFIN; end
+                    else begin tx_byte<=8'h00; ret<=S_DCAP; st<=S_KICK; end
+                end
+                S_DCAP: begin
+                    db_buf[db_idx[5:0]]<=rx_byte;
+                    db_idx<=db_idx+1'b1;
+                    st<=S_DRD;
+                end
+                S_DFIN: begin
+                    bus_req<=1'b0; desc_loaded<=1'b1;
+                    // Validate: MAGIC 'E','O','S','B' at 0..3, VERSION==1 at 4.
+                    if (db_buf[0]==8'h45 && db_buf[1]==8'h4F &&
+                        db_buf[2]==8'h53 && db_buf[3]==8'h42 && db_buf[4]==8'h01) begin
+                        // Latch the 4 slot entries (8 bytes each from offset 0x08).
+                        // entry: [0]=state [1]=size_code [4..6]=phys_base LE.
+                        // Full bytes are masked to the needed width on read below to
+                        // keep the extraction synthesis-friendly (no part-select of a
+                        // memory word inline).
+                        slot_state[1]<=db_buf[6'h08][1:0];  slot_szc[1]<=db_buf[6'h09][1:0];
+                        slot_base[1] <={db_buf[6'h0E],db_buf[6'h0D],db_buf[6'h0C]};
+                        slot_state[2]<=db_buf[6'h10][1:0];  slot_szc[2]<=db_buf[6'h11][1:0];
+                        slot_base[2] <={db_buf[6'h16],db_buf[6'h15],db_buf[6'h14]};
+                        slot_state[3]<=db_buf[6'h18][1:0];  slot_szc[3]<=db_buf[6'h19][1:0];
+                        slot_base[3] <={db_buf[6'h1E],db_buf[6'h1D],db_buf[6'h1C]};
+                        slot_state[4]<=db_buf[6'h20][1:0];  slot_szc[4]<=db_buf[6'h21][1:0];
+                        slot_base[4] <={db_buf[6'h26],db_buf[6'h25],db_buf[6'h24]};
+                        descriptor_valid<=1'b1;
+                    end else begin
+                        descriptor_valid<=1'b0;   // blank/invalid -> legacy
+                    end
+                    st<=S_IDLE;
+                end
 
                 default: st<=S_IDLE;
             endcase

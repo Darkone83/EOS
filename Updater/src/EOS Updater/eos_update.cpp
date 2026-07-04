@@ -12,6 +12,7 @@
 #include "eos_flash.h"
 #include "eos_crc.h"
 #include "eos_bank.h"
+#include "eos_descriptor.h"
 
 #define XBDIAG_EF  0x0D          /* XbDiag lives in bank 0xD */
 #define LOADER_EF  0x0E          /* loader full-image commit bank (base 0, phys 0x200000) */
@@ -231,6 +232,88 @@ BOOL Update_BeginXbDiag(UpdateJob* j, const unsigned char* img, int len, DWORD c
 }
 
 /* ---- state machine -------------------------------------------------------- */
+/* Bank table index -> descriptor slot (0..3), or -1 if not a user bank. User
+   banks have EF 0x3..0x6 -> slot 0..3. (Mirrors the loader's descSlotForBank.) */
+static int ext_slot_for_index(int idx)
+{
+    unsigned char ef;
+    if (idx < 0) return -1;
+    ef = Bank_Ef(idx);
+    if (ef >= 0x3 && ef <= 0x6) return (int)(ef - 0x3);
+    return -1;
+}
+
+/* Commit a large (512K/1MB) BANK image into the ext region with descriptor
+   auto-placement -- the same model the loader uses. The user's selected bank is
+   only a hint; the image lands in the first free, correctly-aligned slot run.
+   Returns EOS_FLASH_OK, or EOS_FLASH_VERIFY (no room) / EOS_FLASH_REFUSED
+   (descriptor write failed) / EOS_FLASH_TIMEOUT (ext-region flash failed). */
+int Update_ExtBankFlash(const unsigned char* image, int len)
+{
+    EosLayout lay;
+    int  szc = (len > 0x80000) ? EOS_SZC_1MB : EOS_SZC_512K;
+    int  need = Desc_SlotsFor(szc);
+    int  slot = -1, cand, anchorTbl, i;
+    unsigned int nrbase;
+    int  startPage, rc;
+
+    if (!Desc_Load(&lay) || !lay.valid) Desc_InitEmpty(&lay);
+
+    /* auto-place: 1MB needs all four slots free; 512K takes the first free even
+       pair (0-1 or 2-3), matching the two physical new-region halves. */
+    if (szc == EOS_SZC_1MB) {
+        int allFree = 1;
+        for (i = 0; i < EOS_DESC_SLOTS; ++i)
+            if (lay.slot[i].state != EOS_SLOT_FREE) { allFree = 0; break; }
+        if (allFree) slot = 0;
+    }
+    else {
+        for (cand = 0; cand <= 2; cand += 2)
+            if (lay.slot[cand].state == EOS_SLOT_FREE &&
+                lay.slot[cand + 1].state == EOS_SLOT_FREE) {
+                slot = cand; break;
+            }
+    }
+    if (slot < 0) return EOS_FLASH_VERIFY;   /* no room -> mapped to a clear msg */
+
+    /* new-region offset: slots 0/1 -> +0, slots 2/3 -> +512K; 1MB -> +0 */
+    nrbase = (szc == EOS_SZC_1MB) ? EOS_NEWRGN_BASE
+        : (slot >= 2) ? (EOS_NEWRGN_BASE + EOS_NEWRGN_HALF)
+        : EOS_NEWRGN_BASE;
+    startPage = (int)((nrbase - EOS_NEWRGN_BASE) / 256);
+
+    rc = Flash_WriteImageAtNoSync(EOS_BANK_NEWREGION, startPage, image, len);
+    if (rc != EOS_FLASH_OK) return EOS_FLASH_TIMEOUT;
+
+    /* page it into SDRAM so the bank is launchable without a cold boot */
+    Flash_SyncNewRegion();
+
+    /* descriptor: anchor + shadows */
+    lay.slot[slot].state = EOS_SLOT_ANCHOR;
+    lay.slot[slot].sizeCode = (unsigned char)szc;
+    lay.slot[slot].physBase = nrbase;
+    for (i = 1; i < need; ++i) {
+        lay.slot[slot + i].state = EOS_SLOT_SHADOW;
+        lay.slot[slot + i].sizeCode = EOS_SZC_256K;
+        lay.slot[slot + i].physBase = 0;
+    }
+    if (Desc_Save(&lay) != EOS_FLASH_OK) return EOS_FLASH_REFUSED;
+
+    /* mark the ACTUAL anchor bank occupied (the auto-chosen slot, not the
+       bank the user selected). anchor bank EF = 0x3 + slot. */
+    anchorTbl = Bank_IndexForEf((unsigned char)(0x3 + slot));
+    if (anchorTbl >= 0)
+        Bank_SetOccupied(anchorTbl, 1, (szc == EOS_SZC_1MB) ? EOS_BANK_SIZE_1MB : EOS_BANK_SIZE_512K);
+
+    return EOS_FLASH_OK;
+}
+
+/* Job-pump wrapper: the committing state calls this with the staged image. */
+static int commit_ext_bank(UpdateJob* j)
+{
+    return Update_ExtBankFlash(j->image, j->len);
+}
+
 int Update_Pump(UpdateJob* j)
 {
     if (!j) return UPD_FAILED;
@@ -263,8 +346,35 @@ int Update_Pump(UpdateJob* j)
         int ef = region_bank_ef(j);
         int rc;
         if (ef < 0) { j->state = UPD_FAILED; j->msg = "Bad target region."; break; }
+
+        /* Large BANK image (512K/1MB) -> ext region + descriptor auto-place, the
+           same model the loader uses. Anything <=256K (or a non-BANK region) takes
+           the normal direct verified write. */
+        if (j->region == EOS_RGN_BANK && j->len > 0x40000) {
+            rc = commit_ext_bank(j);
+            if (rc == EOS_FLASH_OK) { j->state = UPD_DONE; j->msg = "Done. Large bank flashed."; }
+            else if (rc == EOS_FLASH_VERIFY) { j->state = UPD_FAILED; j->msg = "No free slot for this size."; }
+            else if (rc == EOS_FLASH_REFUSED) { j->state = UPD_FAILED; j->msg = "Descriptor write failed."; }
+            else { j->state = UPD_FAILED; j->msg = "Ext-region flash failed."; }
+            break;
+        }
+
         rc = Flash_WriteImageVerified(ef, j->image, j->len);
-        if (rc == EOS_FLASH_OK) { j->state = UPD_DONE; j->msg = "Done. Flash updated."; }
+        if (rc == EOS_FLASH_OK) {
+            /* record a native 256K in the descriptor so a later large-bank
+               auto-place will not overwrite this slot. */
+            int di = Bank_IndexForEf((BYTE)ef);
+            int dslot = ext_slot_for_index(di);
+            if (dslot >= 0) {
+                EosLayout lay;
+                if (!Desc_Load(&lay) || !lay.valid) Desc_InitEmpty(&lay);
+                lay.slot[dslot].state = EOS_SLOT_NATIVE;
+                lay.slot[dslot].sizeCode = EOS_SZC_256K;
+                lay.slot[dslot].physBase = 0;
+                Desc_Save(&lay);
+            }
+            j->state = UPD_DONE; j->msg = "Done. Flash updated.";
+        }
         else if (rc == EOS_FLASH_VERIFY) {
             int p = 0;
             p = msg_append(s_msgbuf, p, "Verify failed at page ");

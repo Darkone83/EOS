@@ -2,5 +2,5 @@
   <Configurations>
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="EOS Updater/EOS Updater.vcxproj" />
+  <Project Path="EOS Updater/EOS Updater.vcxproj" Id="4a4e30bf-d4aa-4f99-ada6-df497b9df1e2" />
 </Solution>

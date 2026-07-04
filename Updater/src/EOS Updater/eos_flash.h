@@ -22,6 +22,11 @@
 #define EOS_FLASH_VERIFY   -3   // a page read back wrong after all retries
 
 // bankEf: the bank's 0xEF value; only the low nibble (bank number) is used.
+/* Progress callback: called once per programmed page during image writes,
+   with (pagesDone, pagesTotal). Lets the UI paint a progress bar. */
+typedef void (*FlashProgressCb)(int done, int total);
+void Flash_SetProgressCb(FlashProgressCb cb);
+
 int Flash_EraseBank(int bankEf);
 int Flash_ProgramPage(int bankEf, int page, const unsigned char* data256);
 
@@ -48,6 +53,14 @@ int Flash_LastFailPage(void);   // page index of the last EOS_FLASH_VERIFY, else
 // Reload a bank's flash contents into the served SDRAM copy. WriteImage calls
 // this for you; exposed for a standalone "refresh after flashing" action.
 int Flash_Sync(int bankEf);
+
+/* ---- ext-bank (512K/1MB via new region + descriptor) ---- */
+int  Flash_SyncNewRegion(void);        /* sync bank 0x0 -> SDRAM (post large-flash) */
+int  Flash_NewRegionReady(void);       /* STATUS bit5: ext region resident in SDRAM */
+int  Flash_EraseBlock(int bankEf, int block);   /* erase one 64K block within a bank */
+int  Flash_WriteImageAtNoSync(int bankEf, int startPage, const unsigned char* data, int len);
+int  Flash_WriteImageNoSync(int bankEf, const unsigned char* data, int len);
+void Flash_ReloadDescriptor(void);     /* FPGA re-reads bank 0xF descriptor */
 
 // Raw register reads (diagnostics / progress UI).
 unsigned char Flash_RawStatus(void);    // {.., refused, done, busy}

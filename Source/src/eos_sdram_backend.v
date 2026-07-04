@@ -16,10 +16,13 @@ module eos_sdram_backend #(
     parameter integer FREQ      = 64_800_000,
     parameter [22:0]  BIOS_BASE = 23'h00_0000,
     parameter [23:0]  FLASH_OFF = 24'h20_0000,
-    parameter integer LENGTH    = 1835008,       // 0x1C0000: skip empty top; kernel/boot region fills first
+    parameter integer LENGTH    = 1835008,       // 0x1C0000: fast boot region (kernel/boot fills first)
     parameter [23:0]  SLOT1_FL  = 24'h50_0000,   // XbDiag window flash base (slot1 0x400000 + img 0x100000)
     parameter [22:0]  SLOT1_SD  = 23'h30_0000,   // XbDiag window SDRAM base (slot1 0x200000 + img 0x100000)
     parameter integer SLOT1_LEN = 24'h0C_0000,   // 768K: XBE+kernel contiguous window
+    parameter [23:0]  NRGN_FL   = 24'h5C_0000,   // NEW REGION flash base (oversized banks)
+    parameter [22:0]  NRGN_SD   = 23'h3C_0000,   // EXT region SDRAM base = flash 0x5C0000 in the contiguous mirror (0x5C0000-FLASH_OFF)
+    parameter integer NRGN_LEN  = 24'h10_0000,   // 1MB new region
     parameter [23:0]  SLOT1_SIG = 24'h50_000B,   // flash addr of 'XBEH' magic in slot1
     parameter integer CHUNK     = 256
 )(
@@ -28,6 +31,14 @@ module eos_sdram_backend #(
 
     input  wire        mem_req,
     input  wire [20:0] mem_addr,        // raw Xbox LPC address (pre-translate)
+
+    // Per-user-slot ext-anchor info from bank_ctrl (descriptor). Index maps to EF
+    // nibbles 0x3..0x6. When a launched user bank is an oversized anchor, the serve
+    // path redirects to the ext-region SDRAM copy instead of the normal 256K slot.
+    input  wire [3:0]  ext_anchor,      // bit i: EF (0x3+i) is an oversized anchor
+    input  wire [7:0]  ext_szc,         // 2b/slot: size code (1=512K, 2=1MB)
+    input  wire [95:0] ext_base,        // 24b/slot: phys base rel FLOOR
+
     input  wire        ef_wr,           // 0xEF write strobe (bank select)
     input  wire [7:0]  ef_data,         // 0xEF value (low nibble = bank)
     output reg         mem_valid,
@@ -73,7 +84,8 @@ module eos_sdram_backend #(
     output reg         slot1_ready,     // XbDiag slot-1 window resident in SDRAM
     output wire [22:0] dbg_filled_lo,
     output wire [3:0]  dbg_bank,        // live bank_l (served/selected bank)
-    output wire        dbg_reload       // reload (flash->SDRAM) in progress
+    output wire        dbg_reload,      // reload (flash->SDRAM) in progress
+    output wire        dbg_newrgn_ready // ext-region resident in SDRAM
 );
 
     // -------------------------------------------------------------------------
@@ -277,11 +289,36 @@ module eos_sdram_backend #(
         endcase
     end endfunction
 
-    // capture the TRANSLATED virtual address (21-bit) for the serve.
-    reg [21:0] req_addr_s;
+    // capture the TRANSLATED virtual address for the serve.
+    // 23-bit so oversized banks (0x7/0x8/0x9) can reach the new-region SDRAM home
+    // at NRGN_SD (0x400000), which is above the 22-bit {slot,xlate} serve space.
+    // Ext-anchor redirect: a user bank (EF 0x3..0x6) that the descriptor marks as
+    // an oversized ANCHOR is served from the resident ext-region SDRAM copy
+    // (NRGN_SD) instead of its normal 256K slot. The loader launches these banks
+    // NORMALLY (plain 0xEF nibble) -- the redirect lives entirely here.
+    //   ext index i = bank_eff - 3 (EF 0x3->0 .. 0x6->3)
+    wire        eff_is_user  = (bank_eff >= 4'h3) && (bank_eff <= 4'h6);
+    wire [1:0]  eff_ix       = bank_eff[3:0] - 4'd3;   // 0x3->0,0x4->1,0x5->2,0x6->3
+    wire        eff_anchor   = eff_is_user && ext_anchor[eff_ix];
+    wire [1:0]  eff_szc      = ext_szc [eff_ix*2 +: 2];
+    wire [23:0] eff_base     = ext_base[eff_ix*24 +: 24];   // rel FLOOR
+    // ext-region SDRAM base for this anchor: NRGN_SD + (base - EOS_NEWRGN_BASE).
+    // EOS_NEWRGN_BASE = 0x3C0000 rel FLOOR. half0 base 0x3C0000 -> +0;
+    // half1 base 0x4C0000 -> +0x80000; 1MB base 0x3C0000 -> +0.
+    localparam [23:0] NEWRGN_REL = 24'h3C0000;
+    wire [23:0] ext_off      = eff_base - NEWRGN_REL;         // 0 or 0x80000
+    wire [22:0] ext_sd_base  = NRGN_SD + ext_off[22:0];
+
+    reg [22:0] req_addr_s;
     always @(posedge sclk or negedge sresetn) begin
-        if (!sresetn) req_addr_s <= 22'd0;
-        else          req_addr_s <= {1'b0, xlate(bank_eff, mem_addr)} | {slot_eff, 21'd0};
+        if (!sresetn) req_addr_s <= 23'd0;
+        else if (eff_anchor) begin
+            // 512K uses a 19-bit offset (wraps within 512K); 1MB uses 20-bit.
+            if (eff_szc == 2'd2) req_addr_s <= ext_sd_base + {3'b0, mem_addr[19:0]}; // 1MB
+            else                 req_addr_s <= ext_sd_base + {4'b0, mem_addr[18:0]}; // 512K
+        end else begin
+            req_addr_s <= {1'b0, xlate(bank_eff, mem_addr)} | {slot_eff, 21'd0};
+        end
     end
 
     reg req_pending;
@@ -337,7 +374,7 @@ module eos_sdram_backend #(
     localparam S_S1_PWAIT   = 4'd14;   // slot1: check captured magic byte
     localparam S_S1_FILL    = 4'd15;   // slot1: run the 768K window reload
 
-    reg [3:0] st;
+    reg [4:0] st;
 
     reg        scr_wr_pend, scr_rd_pend;
     reg [20:0] scr_waddr_r, scr_raddr_r;
@@ -355,6 +392,9 @@ module eos_sdram_backend #(
     reg         sig_ok;        // all 4 magic bytes matched so far
     reg         slot1_done;    // second-region preload finished (latched)
     reg         s1_filling;    // the active reload is the slot-1 window fill
+    reg         newrgn_done;   // new-region preload STARTED (runs once)
+    reg         newrgn_ready;  // new-region data RESIDENT in SDRAM (fill done)
+    reg         nr_filling;    // the active reload is the new-region fill
     // does the just-captured probe byte match its expected 'XBEH' position?
     wire        byte_ok = (sig_i == 2'd0) ? (wbyte == 8'h58) :
                           (sig_i == 2'd1) ? (wbyte == 8'h42) :
@@ -373,12 +413,20 @@ module eos_sdram_backend #(
     reg        seen_busy;
     reg        sdram_ready;
 
-    wire [22:0] req23      = {1'b0, req_addr_s};
-    wire        req_filled = (req23 >= filled_lo);
+    wire [22:0] req23      = req_addr_s;
+    // Main-region requests are gated on preload progress (filled_lo). New-region
+    // requests (>= NRGN_SD) are instead gated on the new-region fill completing
+    // (newrgn_done), since they live above the main preload window.
+    // The EXT region is a second-phase fill (after the fast boot region), landing
+    // at NRGN_SD (0x3C0000). Ext reads gate on newrgn_ready; everything else on
+    // the main preload progress (filled_lo).
+    wire        in_newrgn  = (req23 >= NRGN_SD) && (req23 < (NRGN_SD + NRGN_LEN[22:0]));
+    wire        req_filled = in_newrgn ? newrgn_ready : (req23 >= filled_lo);
 
     assign dbg_filled_lo = filled_lo;
     assign dbg_bank      = bank_l;
     assign dbg_reload    = reload_pending;
+    assign dbg_newrgn_ready = newrgn_ready;
     assign scr_busy      = scr_wr_pend | scr_rd_pend |
                            (st == S_SCR_WR) | (st == S_SCR_RD_REQ) | (st == S_SCR_RD_WAIT);
 
@@ -428,6 +476,9 @@ module eos_sdram_backend #(
             rl_idx         <= 24'd0;
             slot1_ready    <= 1'b0;
             slot1_done     <= 1'b0;
+            newrgn_done    <= 1'b0;
+            newrgn_ready   <= 1'b0;
+            nr_filling     <= 1'b0;
             sig_i          <= 2'd0;
             sig_ok         <= 1'b1;
             s1_filling     <= 1'b0;
@@ -474,7 +525,15 @@ module eos_sdram_backend #(
                 ((reload_base - FLASH_OFF) < {1'b0, SCRATCH_BASE})) begin
                 reload_pending <= 1'b1;
                 rl_fl_base     <= reload_base;
-                rl_sd_base     <= (reload_base - FLASH_OFF);
+                // The NEW REGION (flash NRGN_FL) is served from SDRAM NRGN_SD, which
+                // is NOT the generic flash-FLASH_OFF address. Map it explicitly so a
+                // post-flash sync lands where the oversized-bank serve path reads.
+                if (reload_base == NRGN_FL) begin
+                    rl_sd_base <= NRGN_SD;
+                    nr_filling <= 1'b1;           // completion sets newrgn_ready
+                end else begin
+                    rl_sd_base <= (reload_base - FLASH_OFF);
+                end
                 rl_len         <= reload_len;
             end else if (pwr_reload && !reload_pending) begin
                 // Power-down detected: re-assert the boot bank flash -> SDRAM so
@@ -599,19 +658,35 @@ module eos_sdram_backend #(
                             sig_i  <= 2'd0;
                             sig_ok <= 1'b1;
                             st     <= S_S1_PROBE;
+                        end else if (preload_done && slot1_done && !newrgn_done
+                                     && flash_free && !reload_pending) begin
+                            // Second phase after the fast boot preload + XbDiag:
+                            // page the 1MB ext region (flash NRGN_FL) into SDRAM
+                            // at NRGN_SD (0x3C0000) so oversized banks are resident.
+                            newrgn_done <= 1'b1;
+                            rl_fl_base  <= NRGN_FL;
+                            rl_sd_base  <= NRGN_SD;
+                            rl_len      <= NRGN_LEN;
+                            rl_idx      <= 24'd0;
+                            nr_filling  <= 1'b1;
+                            st          <= S_RL_REQ;
                         end else if (reload_pending && flash_free) begin
                             // freshly-flashed region: re-read flash -> SDRAM in
                             // place so it serves without a cold boot. Only once
                             // the engine has released the flash bus.
                             rl_idx <= 24'd0;
                             st     <= S_RL_REQ;
-                        end else if (req_pending) begin
+                        end else if (req_pending && req_filled) begin
                             sd_addr     <= BIOS_BASE + req23;
                             sd_rd       <= 1'b1;
                             op_lock     <= 1'b1;
                             req_pending <= 1'b0;
                             ret_serve   <= 1'b1;
                             st          <= S_RD;
+                        // if req_pending && !req_filled: a new-region read arrived
+                        // before its SDRAM fill finished. Do nothing -- hold the
+                        // pending request in S_SERVE; the fill runs from this loop
+                        // and once newrgn_ready is set the branch above serves it.
                         end else if (scr_wr_pend) begin
                             st <= S_SCR_WR;
                         end else if (scr_rd_pend) begin
@@ -630,6 +705,10 @@ module eos_sdram_backend #(
                         if (s1_filling) begin
                             slot1_ready <= 1'b1;   // XbDiag window now resident
                             s1_filling  <= 1'b0;
+                        end else if (nr_filling) begin
+                            nr_filling     <= 1'b0;   // new region now resident
+                            newrgn_ready   <= 1'b1;
+                            reload_pending <= 1'b0;   // also clear if this came via a sync
                         end else begin
                             reload_pending <= 1'b0;
                         end
@@ -717,6 +796,11 @@ module eos_sdram_backend #(
                     st          <= S_RL_REQ;
                 end
 
+                // -------------------------------------------------------------
+                // NEW REGION preload: probe the first byte; if the region is not
+                // blank (0xFF), page the 1MB new region into SDRAM so oversized
+                // banks (0xEF 0x7/0x8/0x9) serve from a resident copy. Runs once.
+                // -------------------------------------------------------------
                 S_SCR_WR: begin
                     if (!sd_busy && !op_lock) begin
                         if (refresh_due) begin

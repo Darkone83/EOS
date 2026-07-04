@@ -73,6 +73,15 @@ const char* Bank_Name(int idx)
     return s_banks[idx].name;
 }
 
+/* Table index whose bank EF matches `ef`, or -1 if none. Reverse of Bank_Ef. */
+int Bank_IndexForEf(unsigned char ef)
+{
+    int i;
+    ensureInit();
+    for (i = 0; i < s_count; ++i) if (s_banks[i].ef == ef) return i;
+    return -1;
+}
+
 unsigned char Bank_Ef(int idx)
 {
     ensureInit();

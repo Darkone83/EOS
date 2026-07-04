@@ -236,6 +236,10 @@ module eos_hdmi_top (
     wire [22:0] dbg_filled_lo;
     wire [3:0]  dbg_bank;          // live served/selected bank (lclk)
     wire        dbg_reload;        // reload in progress (clk_sd)
+    wire        dbg_newrgn_ready;  // ext-region resident in SDRAM
+    wire [3:0]  ext_anchor;       // per user-slot: oversized anchor (desc)
+    wire [7:0]  ext_szc;          // per user-slot: size code (2b each)
+    wire [95:0] ext_base;         // per user-slot: phys base rel FLOOR (24b each)
 
     // Flash SPI bus, muxed between the backend reader (preload, default owner)
     // and the flash engine (bank erase/program). One driver at a time, selected
@@ -257,6 +261,11 @@ module eos_hdmi_top (
     wire        bank_commit_busy, bank_commit_done, bank_commit_err;
     wire        i2c_scr_clear; wire [3:0] i2c_sel_bank;  wire [1:0] i2c_boot_mode;
     wire [15:0] i2c_lock_mask;
+    wire [1:0]  i2c_led_mode;   // LEDMODE (0x38): 1 = rainbow (updater active)
+    wire        i2c_desc_reload; // DESCRELOAD (0x39, updater SMBus): re-read descriptor
+    wire        ldr_desc_reload; // IDX_DESCRELOAD (0x0D, loader flash port): re-read
+    wire        ldr_blk_erase;   // IDX_ERASEBLK (0x0E): next erase = single 64K block
+    wire        any_desc_reload = i2c_desc_reload | ldr_desc_reload;
 
     // scratch READ port: CRC owns it during VALIDATE, bank_ctrl during COMMIT
     // (i2c sequences them, never simultaneous).
@@ -269,6 +278,9 @@ module eos_hdmi_top (
 
         .mem_req       (mem_req),
         .mem_addr      (mem_addr),
+        .ext_anchor    (ext_anchor),
+        .ext_szc       (ext_szc),
+        .ext_base      (ext_base),
         .ef_wr         (ef_wr),
         .ef_data       (ef_data),
         .mem_valid     (mem_valid),
@@ -301,6 +313,7 @@ module eos_hdmi_top (
         .dbg_filled_lo (dbg_filled_lo),
         .dbg_bank      (dbg_bank),
         .dbg_reload    (dbg_reload),
+        .dbg_newrgn_ready (dbg_newrgn_ready),
         .scr_wr        (stg_scr_wr),      // STAGE writes from flash_cmd
         .scr_waddr     (stg_scr_waddr),
         .scr_wdata     (stg_scr_wdata),
@@ -391,11 +404,14 @@ module eos_hdmi_top (
         .eng_refused  (eng_refused),
         .eng_last_status (eng_last_status),
         .stock_boot   (stock_boot),
+        .desc_reload  (ldr_desc_reload),
+        .blk_erase    (ldr_blk_erase),
         .eng_reload   (dbg_reload),       // SDRAM reload-in-progress -> STATUS bit3
         .scr_wr       (stg_scr_wr),
         .scr_waddr    (stg_scr_waddr),
         .scr_wdata    (stg_scr_wdata),
-        .scr_busy     (be_scr_busy)
+        .scr_busy     (be_scr_busy),
+        .newrgn_ready (dbg_newrgn_ready)
     );
 
     // --- engine (clk_sd): floor-guarded erase/program/poll ---
@@ -418,6 +434,9 @@ module eos_hdmi_top (
         .refresh_req  (refresh_req),     // consumed by backend refresh copy (next pass)
         .refresh_base (refresh_base),
         .refresh_len  (refresh_len),
+        .ext_anchor   (ext_anchor),
+        .ext_szc      (ext_szc),
+        .ext_base     (ext_base),
         .bus_req      (eng_bus_req),
         .bus_gnt      (bus_grant),
         .flash_cs_n   (eng_flash_cs_n),
@@ -425,6 +444,8 @@ module eos_hdmi_top (
         .flash_mosi   (eng_flash_mosi),
         .flash_miso   (flash_miso),
         .commit_go    (i2c_commit_go),
+        .desc_reload  (any_desc_reload),
+        .blk_erase    (ldr_blk_erase),
         .commit_bank  (i2c_commit_bank),
         .commit_pages (i2c_commit_pages),
         .commit_busy  (bank_commit_busy),
@@ -531,7 +552,9 @@ module eos_hdmi_top (
         .crc_go(crc_go), .crc_len(crc_len), .crc_busy(crc_busy), .crc_done(crc_done), .crc_result(crc_result),
         .commit_go(i2c_commit_go), .commit_bank(i2c_commit_bank), .commit_pages(i2c_commit_pages),
         .commit_busy(bank_commit_busy), .commit_done(bank_commit_done), .commit_err(bank_commit_err),
-        .scr_clear(i2c_scr_clear), .sel_bank(i2c_sel_bank), .boot_mode(i2c_boot_mode), .lock_mask(i2c_lock_mask)
+        .scr_clear(i2c_scr_clear), .sel_bank(i2c_sel_bank), .boot_mode(i2c_boot_mode), .lock_mask(i2c_lock_mask),
+        .led_mode(i2c_led_mode),
+        .desc_reload(i2c_desc_reload)
     );
 
     // ---- CRC32 over scratch (drives VALIDATE) ----
@@ -794,6 +817,42 @@ module eos_hdmi_top (
     end
 
     // -------------------------------------------------------------------------
+    // Rainbow hue generator (for LED rainbow mode while the updater is active).
+    // A free-running phase; the top byte is a 0..255 hue swept through a 6-segment
+    // color wheel. hue_phase[23] pace gives a pleasant ~1-2s full cycle at 27MHz.
+    // -------------------------------------------------------------------------
+    reg [31:0] hue_phase = 32'd0;
+    always @(posedge sys_clk) hue_phase <= hue_phase + 32'd1;
+    wire [7:0] hue = hue_phase[31:24];        // 0..255 sweeping hue
+
+    // hue -> RGB (full saturation/value), classic 6-sector wheel. Scaled down to
+    // a gentle brightness so it matches the other LED states (~0x40 peak).
+    function [23:0] HUE_TO_GRB;
+        input [7:0] h;
+        reg [7:0] seg; reg [7:0] t; reg [7:0] r; reg [7:0] g; reg [7:0] b;
+        reg [7:0] up; reg [7:0] dn;
+        begin
+            seg = h[7:5];              // which of 8 sectors (approx 6-sector wheel)
+            t   = {h[4:0], 3'b000};    // position within sector, 0..255
+            up  = t;                   // rising ramp
+            dn  = 8'hFF - t;           // falling ramp
+            case (seg)
+                3'd0: begin r=8'hFF; g=up;    b=8'h00; end
+                3'd1: begin r=dn;    g=8'hFF; b=8'h00; end
+                3'd2: begin r=8'h00; g=8'hFF; b=up;    end
+                3'd3: begin r=8'h00; g=dn;    b=8'hFF; end
+                3'd4: begin r=up;    g=8'h00; b=8'hFF; end
+                3'd5: begin r=8'hFF; g=8'h00; b=dn;    end
+                default: begin r=8'hFF; g=8'h00; b=8'h00; end
+            endcase
+            // scale to gentle brightness (>>2 ~= 0x40 peak) and pack GRB
+            HUE_TO_GRB = { g[7:2], 2'b00, r[7:2], 2'b00, b[7:2], 2'b00 };
+        end
+    endfunction
+
+    wire [23:0] rainbow_grb = HUE_TO_GRB(hue);
+
+    // -------------------------------------------------------------------------
     // Serve activity pulse and sustained boot activity window
     // -------------------------------------------------------------------------
 
@@ -842,7 +901,22 @@ module eos_hdmi_top (
     reg [23:0] color;
 
     always @(posedge sys_clk) begin
-        if (!seen_reset_high) begin
+        if (fop_led == 3'd1) begin
+            color <= RGB_TO_GRB(8'h40, 8'h00, 8'h00);             // DELETE (erase): red
+        end else if (fop_led == 3'd2) begin
+            color <= RGB_TO_GRB(8'h2A, 8'h15, 8'h3D);             // WRITE (program): accent purple
+        end else if (fop_led == 3'd3) begin
+            color <= RGB_TO_GRB(8'h00, 8'h20, 8'h20);             // VERIFY (read): cyan
+        end else if (fop_led == 3'd4) begin
+            color <= hb[23] ? RGB_TO_GRB(8'h2A, 8'h15, 8'h3D)
+                            : RGB_TO_GRB(8'h08, 8'h04, 8'h0C);    // SYNC (reload): purple pulse
+        end else if (i2c_led_mode == 2'd1) begin
+            // Rainbow mode: the updater sets this on entry (LEDMODE 0x38 = 1) and
+            // clears it on exit. It overrides only the IDLE state -- the flash-op
+            // statuses above (erase/write/verify/sync) still show through so the
+            // user sees real activity while the update app is running.
+            color <= rainbow_grb;
+        end else if (!seen_reset_high) begin
             // Xbox LPC reset not released / not seen.
             color <= hb[23] ? RGB_TO_GRB(8'h30, 8'h00, 8'h00)
                             : RGB_TO_GRB(8'h04, 8'h00, 8'h00);   // red pulse
@@ -853,15 +927,6 @@ module eos_hdmi_top (
         end else if (!pdone) begin
             // BIOS still preloading from flash to SDRAM.
             color <= RGB_TO_GRB(8'h30, 8'h18, 8'h00);             // amber
-        end else if (fop_led == 3'd1) begin
-            color <= RGB_TO_GRB(8'h40, 8'h00, 8'h00);             // DELETE (erase): red
-        end else if (fop_led == 3'd2) begin
-            color <= RGB_TO_GRB(8'h2A, 8'h15, 8'h3D);             // WRITE (program): accent purple
-        end else if (fop_led == 3'd3) begin
-            color <= RGB_TO_GRB(8'h00, 8'h20, 8'h20);             // VERIFY (read): cyan
-        end else if (fop_led == 3'd4) begin
-            color <= hb[23] ? RGB_TO_GRB(8'h2A, 8'h15, 8'h3D)
-                            : RGB_TO_GRB(8'h08, 8'h04, 8'h0C);    // SYNC (reload): purple pulse
         end else if (bank_sy2 != 4'h1) begin
             // a launched user bank is being served (not the boot/loader bank)
             color <= hb[24] ? RGB_TO_GRB(8'h00, 8'h30, 8'h00)

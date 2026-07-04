@@ -2,6 +2,11 @@
 // See eos_flash.h. Self-contained: own port-I/O, no kernel imports.
 #include "eos_flash.h"
 
+/* Optional progress hook: if set, the image-write loops call it once per page
+   with (pagesDone, pagesTotal) so the UI can paint a progress bar. NULL = off. */
+static FlashProgressCb s_progCb = 0;
+void Flash_SetProgressCb(FlashProgressCb cb) { s_progCb = cb; }
+
 // --- command interface ports ------------------------------------------------
 #define EOS_PORT_INDEX   0x00EC
 #define EOS_PORT_DATA    0x00ED
@@ -15,6 +20,8 @@
 #define IDX_GO           0x05
 #define IDX_STATUS       0x06
 #define IDX_LASTSTAT     0x07
+#define IDX_DESCRELOAD   0x0D
+#define IDX_ERASEBLK     0x0E
 
 // --- ops --------------------------------------------------------------------
 #define OP_ERASE         0
@@ -24,6 +31,7 @@
 
 // --- STATUS bits ------------------------------------------------------------
 #define ST_BUSY          0x01
+#define ST_NRGN_READY    0x20   /* ext region resident in SDRAM (STATUS bit5) */
 #define ST_DONE          0x02
 #define ST_REFUSED       0x04
 #define ST_RELOAD        0x08   // SDRAM reload in progress (post-flash)
@@ -171,6 +179,87 @@ int Flash_Sync(int bankEf)
     return waitReload();             // SDRAM copy now matches flash
 }
 
+int Flash_SyncNewRegion(void)
+{
+    return Flash_Sync(0x00);         /* bank 0x0 -> backend routes to NRGN_SD */
+}
+
+/* STATUS bit5: 1 = ext region resident in SDRAM (a large bank can be served). */
+int Flash_NewRegionReady(void)
+{
+    unsigned char st;
+    io_out8(EOS_PORT_INDEX, IDX_STATUS);
+    st = io_in8(EOS_PORT_DATA);
+    return (st & ST_NRGN_READY) ? 1 : 0;
+}
+
+/* Erase a single 64K block within a bank. block = 64K index (0,1,2...). Arms
+   block-erase mode so ERASE clears just that block; used to place one 512K half
+   of the new region without disturbing the other half. */
+int Flash_EraseBlock(int bankEf, int block)
+{
+    int page = block * 256;   /* 256 pages per 64K block */
+    int rc;
+    regw(IDX_ERASEBLK, 1);
+    regw(IDX_OP, (unsigned char)OP_ERASE);
+    regw(IDX_BANK, (unsigned char)(bankEf & 0x0F));
+    regw(IDX_PAGELO, (unsigned char)(page & 0xFF));
+    regw(IDX_PAGEHI, (unsigned char)((page >> 8) & 0x1F));
+    regw(IDX_GO, 1);
+    rc = waitDone();
+    regw(IDX_ERASEBLK, 0);
+    return rc;
+}
+
+/* Write `len` bytes starting at page `startPage` within the bank, NO sync.
+   Erases only the 64K blocks the image spans (from startPage's block), so a
+   write to new-region half 1 does not disturb half 0. */
+int Flash_WriteImageAtNoSync(int bankEf, int startPage, const unsigned char* data, int len)
+{
+    int           rc, pages, page, off, i;
+    unsigned char pg[256];
+    int           firstBlock, lastByte, blk;
+
+    firstBlock = startPage / 256;
+    lastByte = startPage * 256 + len - 1;
+    for (blk = firstBlock; blk <= lastByte / 65536; ++blk) {
+        rc = Flash_EraseBlock(bankEf, blk);
+        if (rc != EOS_FLASH_OK) return rc;
+    }
+
+    pages = (len + 255) / 256;
+    for (page = 0; page < pages; ++page) {
+        off = page * 256;
+        for (i = 0; i < 256; ++i)
+            pg[i] = (off + i < len) ? data[off + i] : 0xFF;
+        rc = Flash_ProgramPage(bankEf, startPage + page, pg);
+        if (rc != EOS_FLASH_OK) return rc;
+        if (s_progCb) s_progCb(page + 1, pages);
+    }
+    return EOS_FLASH_OK;
+}
+
+int Flash_WriteImageNoSync(int bankEf, const unsigned char* data, int len)
+{
+    return Flash_WriteImageAtNoSync(bankEf, 0, data, len);
+}
+
+/* Trigger the FPGA to re-read the descriptor block (bank 0xF), then WAIT for
+   the engine to go idle -- the re-read grabs the flash bus for ~64 bytes and a
+   following op that races it hangs the console. */
+void Flash_ReloadDescriptor(void)
+{
+    volatile long t;
+    unsigned char st;
+    regw(IDX_DESCRELOAD, 1);
+    for (t = 0; t < 2000; ++t) {}
+    io_out8(EOS_PORT_INDEX, IDX_STATUS);
+    for (t = 0; t < POLL_LIMIT; ++t) {
+        st = io_in8(EOS_PORT_DATA);
+        if (!(st & ST_BUSY)) break;
+    }
+}
+
 int Flash_WriteImage(int bankEf, const unsigned char* data, int len)
 {
     int           rc, pages, page, off, i;
@@ -234,6 +323,7 @@ int Flash_WriteImageVerified(int bankEf, const unsigned char* data, int len)
             s_lastFailPage = page;
             return EOS_FLASH_VERIFY;                   /* gave up on this page */
         }
+        if (s_progCb) s_progCb(page + 1, pages);
     }
 
     /* whole image verified byte-for-byte; make the served SDRAM copy match */

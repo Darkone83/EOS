@@ -61,6 +61,8 @@
 #define EOS_CMD_SELECT    0x30
 #define EOS_CMD_BOOTMODE  0x36
 #define EOS_CMD_SETLOCK   0x37
+#define EOS_CMD_LEDMODE   0x38     /* arg0: 0=normal, 1=rainbow */
+#define EOS_CMD_DESCRELOAD 0x39   /* FPGA re-reads bank 0xF descriptor */
 
 #define EOS_CMD(region, action)  (BYTE)(((region) << 4) | (action))
 
@@ -87,6 +89,7 @@ BOOL Smb_SetCrc(BYTE region, DWORD crc);
 BOOL Smb_Validate(BYTE region);                      /* async: poll Smb_WaitDone */
 BOOL Smb_Commit(BYTE region);                        /* async: poll Smb_WaitDone */
 BOOL Smb_Clear(void);                                /* disarm + invalidate + scr_clear */
+BOOL Smb_SetLedMode(BYTE mode);                      /* 0=normal, 1=rainbow (updater active) */
 
 /* Poll engine status until BUSY clears or timeout. Returns the final status
    byte (check EOS_ST_VALID / EOS_ST_COMMITOK / EOS_ST_ERR); 0xFF on bus error. */

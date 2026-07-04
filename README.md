@@ -16,6 +16,20 @@ dashboard over HDMI.
 
 ---
 
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `Source/` | Gowin EDA project + FPGA gateware (`src/*.v`, `.cst`, `.sdc`, generated IP) |
+| `Firmware/` | Prebuilt bitstream (`Eos.fs`) |
+| `Updater/` | **EOS Updater** — native Xbox in-system update client (`src/` + `xbe/EOS_Updater.xbe`) |
+| `Tools/` | Host tooling: `Recovery/` (un-brick GUI), `eos_pack.py` (BIOS packer), `gen_hud.py` (HUD generator) — see `Tools/readme.md` |
+| `Gerbers/` | PCB fabrication set (`EOS.zip`), `BOM.xlsx`, `PickAndPlace.xlsx` |
+| `Schematics/` | Board schematic (`EOS.png`) |
+| `images/` | Logos + board renders (`Top.png`, `Bottom.png`) |
+
+---
+
 ## Quick start (the short version)
 
 1. **Flash the board once** (chip prep) — bitstream + BIOS image, over the Nano's USB.
@@ -264,16 +278,16 @@ The packed `eos.bin` (the full 2 MB BIOS, produced by the loader's `eos_pack.py`
 to the SPI flash at the gateware's serve base:
 
 ```bash
-openFPGALoader -b tangnano20k --external-flash -o 0x2000000 eos.bin
+openFPGALoader -b tangnano20k --external-flash -o 0x200000 eos.bin
 ```
 
-> ⚠️ **CONFIRM THE OFFSET.** The gateware serves from `FLASH_OFF = 0x2000000`
-> (`eos_sdram_backend.v`), so the BIOS must be written there. Some of the working tooling
-> shows `-o 0x200000` (one fewer zero) — that would land the BIOS *inside* the ~570 KB
-> bitstream and is almost certainly a typo. Verify `0x2000000` against your board before
-> publishing, and make the Recovery app default match.
+> ⚠️ **CONFIRM THE OFFSET.** The gateware serves from `FLASH_OFF = 0x200000`
+> (`eos_sdram_backend.v`, `FLOOR = 24'h200000` in `eos_bank_ctrl.v`), so the BIOS must be
+> written there. Note the Recovery app currently defaults to `0x20000` (one fewer zero) —
+> confirm `0x200000` against your board and fix the Recovery default before shipping. A wrong
+> offset lands the BIOS inside the bitstream or where the FPGA can't find it.
 
-The image's internal layout maps to banks (physical flash = `0x2000000` + offset-in-image):
+The image's internal layout maps to banks (physical flash = `0x200000` + offset-in-image):
 
 | Offset in image | Contents | Bank (`0xEF`) |
 |---|---|---|
@@ -288,6 +302,12 @@ The image's internal layout maps to banks (physical flash = `0x2000000` + offset
 The board cold-boots bank `0x1` (kernel @ image `0x180000`); the kernel selects `0xEF=0x2`
 to launch the loader XBE at image `0x100000`.
 
+Beyond the initial 2 MB image, `bank_base()` (`eos_bank_ctrl.v`) maps runtime regions above
+the Xenium space: bank `0xE` is the full-image loader-commit target (base 0, phys `0x200000`),
+`0xD` is XbDiag Lite (phys `0x400000`), `0x0` the oversized-bank "new region" (phys `0x5C0000`),
+`0xB`/`0xC` the config bank-table / settings (phys `0x7F0000` / `0x7E0000`), and `0xF` the
+descriptor block (phys `0x6C0000`). Every physical target is `FLOOR (0x200000) + bank_base + offset`.
+
 **Recovery:** JTAG/SRAM configuration always works regardless of what's in flash, so a bad
 bitstream is never bricking — reload SRAM to confirm a fix, then rewrite flash.
 
@@ -296,6 +316,16 @@ bitstream is never bricking — reload SRAM to confirm a fix, then rewrite flash
 With a bootable image present, banks are rewritten from a running unit — push a new image
 over the loader's HTTP/OTA or FTP path, stage and validate it, commit to a bank via the flash
 engine (`0xEC`/`0xED`), select the bank, and warm-reset so the FPGA serves it. No programmer.
+
+The **EOS Updater** (`Updater/`) is the native Xbox client for this flow. It loads a full
+image into RAM (from local file or network), then runs a pumped state machine that stages the
+image in chunks to the FPGA scratch region, validates it with a streaming CRC-32, and **pauses
+for a commit confirmation** exactly at the scratch→flash boundary before writing. It drives the
+three update flows — **loader**, **BIOS**, and **XbDiag** — over the Darkone SMBus command
+plane, with an XbDiag version gate (the installed version is parsed from the XbDiag bank name).
+Region→bank mapping: loader commits to bank `0xE` (full image, phys `0x200000`), XbDiag to
+`0xD` (phys `0x400000`). The build ships as `Updater/xbe/EOS_Updater.xbe` with full source in
+`Updater/src/`.
 
 ---
 
@@ -351,7 +381,8 @@ src/
 > The serve HUD is **generated** — regenerate it with the HUD generator rather than
 > hand-editing the cell case in `eos_serve_hud.v`. The updater datapath (scratch staging →
 > CRC validate → commit) spans `eos_sdram_backend`, `eos_bank_ctrl`, `eos_crc32`, and
-> `eos_i2c`, driven by the SMBus command plane — built, but not yet exercised on hardware.
+> `eos_i2c`, driven by the SMBus command plane; its host-side client is the **EOS Updater**
+> XBE (`Updater/`).
 
 ---
 

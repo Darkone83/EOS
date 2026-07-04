@@ -33,3 +33,4 @@ int  File_Exists(const char* path);
 // Read a whole file into buf (up to cap bytes). Returns bytes read, or -1 on
 // error -- including a file larger than cap (caller decides the cap).
 int  File_ReadInto(const char* path, unsigned char* buf, int cap);
+int  File_WriteFrom(const char* path, const unsigned char* buf, int len);

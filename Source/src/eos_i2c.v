@@ -64,7 +64,9 @@ module eos_i2c #(
     output reg         scr_clear,    // pulse on CLEAR/ABORT
     output reg  [3:0]  sel_bank,     // SELECT (0x30)
     output reg  [1:0]  boot_mode,    // BOOTMODE (0x36)
-    output reg  [15:0] lock_mask     // locked-bank bitmask (boot+recovery default)
+    output reg  [15:0] lock_mask,    // locked-bank bitmask (boot+recovery default)
+    output reg  [1:0]  led_mode,     // LEDMODE (0x38): 0=normal, 1=rainbow
+    output reg         desc_reload   // DESCRELOAD (0x39): 1-clk pulse -> FPGA re-reads descriptor
 );
     // ---- line sync + edge / start-stop detect --------------------------------
     reg [2:0] sda_ss = 3'b111, scl_ss = 3'b111;
@@ -285,11 +287,12 @@ module eos_i2c #(
             commit_ok<=1'b0; val_wait<=1'b0; com_wait<=1'b0;
             crc_go<=1'b0; crc_len<=21'd0; commit_go<=1'b0; commit_bank<=4'd0;
             commit_pages<=13'd0; scr_clear<=1'b0; sel_bank<=4'd0; boot_mode<=2'd0;
-            lock_mask<=LOCK_DEFAULT;
+            lock_mask<=LOCK_DEFAULT; led_mode<=2'd0; desc_reload<=1'b0;
         end else begin
             crc_go    <= 1'b0;
             commit_go <= 1'b0;
             scr_clear <= 1'b0;
+            desc_reload <= 1'b0;
 
             if (cmd_stb) begin
                 if (cmd == 8'h01) begin
@@ -304,6 +307,10 @@ module eos_i2c #(
                     sel_bank <= arg0[3:0];                    // SELECT
                 end else if (cmd == 8'h36) begin
                     boot_mode <= arg0[1:0];                   // BOOTMODE
+                end else if (cmd == 8'h38) begin
+                    led_mode <= arg0[1:0];                    // LEDMODE (0=normal,1=rainbow)
+                end else if (cmd == 8'h39) begin
+                    desc_reload <= 1'b1;                      // DESCRELOAD: pulse re-read
                 end else if (cmd == 8'h37) begin
                     lock_mask[arg0[3:0]] <= arg1[0];          // SETLOCK
                 end else begin
