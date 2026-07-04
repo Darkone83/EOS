@@ -36,7 +36,8 @@ dashboard over HDMI.
    The easiest way is the **Eos Recovery** app (point-and-click); the CLI equivalents
    are below.
 2. **Wire it to the Xbox LPC header** — six series resistors, power, and either a D0
-   ground (1.0–1.5) or an LFRAME# tap + LPC rebuild (1.6).
+   connection (1.0–1.5 — used as normal or grounded, depending on install) or an LFRAME# tap
+   + LPC rebuild (1.6).
 3. **Set the revision switch** — open for 1.0–1.5, closed-to-ground for 1.6.
 4. **Power on.** The status LEDs and RGB tell you exactly how far the boot got; the HDMI
    HUD shows live serve state if you have a screen attached.
@@ -92,7 +93,7 @@ Put a **22 kΩ series resistor in-line on each of the six Xbox-driven inputs** �
 | 1 | Sipeed Tang Nano 20K (GW2AR-18C) | the modchip |
 | 6 | 22 kΩ resistor | series on LAD0–3, LCLK, LRESET# |
 | 1 | SPST switch (or jumper) | revision select (open = 1.0–1.5, GND = 1.6) |
-| — | wire to D0 point | 1.0–1.5 install |
+| — | wire to D0 point | 1.0–1.5 install (ground **or** FPGA-driven) |
 | — | wire to LFRAME# + LPC rebuild | 1.6 install |
 
 ---
@@ -112,9 +113,15 @@ correctly before trusting a boot.
 
 ### 1.0 – 1.5
 
-Ground **D0** to disable the onboard TSOP and force LPC boot. On the current test rig D0 is
-grounded externally; the gateware also contains a driven-D0 path (grounds while active,
-releases only for a TSOP/stock boot), for boards that wire D0 to the FPGA.
+D0 must go low to disable the onboard TSOP and force LPC boot. Two install methods work,
+pick whichever suits your board:
+
+- **Ground D0 externally** — tie the D0 point to GND. Simplest; the FPGA leaves D0 alone.
+  (This is how the current test rig is wired.)
+- **Drive D0 from the FPGA** — wire D0 to the FPGA's D0 pin and let the gateware's driven-D0
+  path handle it: it grounds D0 while Eos is active and releases it only for a TSOP/stock
+  boot. Use this if you want the board to hand the bus back for a normal TSOP boot without
+  rewiring.
 
 ### 1.6
 
