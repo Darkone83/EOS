@@ -1,16 +1,59 @@
 // eos_sdram_backend.v -- flash->SDRAM preloader + LPC server.
 //
-// SAFE TEST VERSION:
-// - Reads SPI flash one byte at a time during preload.
-// - Writes one byte to SDRAM before requesting the next flash byte.
-// - Slower, but avoids burst-stream overwrite/corruption during preload.
-// - Good for proving BIOS-in-flash -> SDRAM -> LPC serving correctness.
+// Reads SPI flash in 256-byte BURSTS with hardware backpressure.
 //
-// Expected flow:
-//   flash BIOS @ FLASH_OFF
-//   -> preload 256K into SDRAM
-//   -> preload_done = 1
-//   -> LPC reads served from SDRAM
+// PHASE 4: the reader's 'stall' input is tied to wpend -- the backend's existing
+// one-byte holding register's full flag. When a byte is waiting to be written to
+// SDRAM the reader parks at a bit boundary with SCK low and CS# still asserted.
+// A byte cannot complete for another 7 bit-periods after stall asserts, so wpend
+// can never be overwritten and NO FIFO IS NEEDED. See eos_flash_reader.v.
+//
+// Cost per byte drops from ~176 sclk (2.72 us) to ~40 sclk (0.61 us): only 8 of
+// the old 40 SPI bits carried payload, the rest was per-byte command overhead.
+//
+// CRITICAL: fr_start must pulse ONCE PER BURST, never mid-burst. A mid-burst
+// start drops CS#, re-issues 0x03, and streams from the wrong address. burst_active
+// exists solely to enforce that. Burst lengths are clamped so a burst always ends
+// exactly at a chunk / region / SCRATCH_BASE boundary -- the reader is therefore
+// never left busy across a state change, which would deadlock the !fr_busy guards.
+//
+// Flow:
+//   flash image @ FLASH_OFF
+//     -> preload the fast-boot region (LENGTH) into SDRAM, top-down
+//     -> preload_done = 1
+//     -> probe flash slot 1 for 'XBEH'; if present, page in the 768K window
+//     -> page in the 1MB ext region (oversized banks)
+//   LPC reads are served from SDRAM throughout.
+//
+// =============================================================================
+// PHASE 2 -- THE STALL CLASS
+// =============================================================================
+//
+// (A) LPC reads are now served DURING the fill loops.
+//     S_PRE and S_SERVE always serviced req_pending, but S_RL_REQ (the shared
+//     reload/slot1/ext byte loop) and S_S1_PROBE did not. Those loops run for
+//     SECONDS -- 768K + 1MB of single-byte SPI reads -- and they run AFTER
+//     preload_done, i.e. exactly while the Xbox is booting. Any LPC read that
+//     landed in that window was never answered, and the loader hung in SYNCING
+//     with LFRAME# low.
+//
+//     Both loops now check for a pending, in-range request at the top of each
+//     byte iteration and divert through S_RD to serve it. Max added latency is
+//     one flash byte (~2.6 us). S_RD returns to whichever state dispatched it
+//     via rd_ret, which replaces the old 1-bit ret_serve.
+//
+// (B) A request that cannot be served is DROPPED, not left pending.
+//     eos_lpc_loader now abandons a cycle after SYNC_TIMEOUT (~61.4 us). If
+//     this backend later answered that abandoned request, mem_valid would
+//     arrive ORPHANED inside a subsequent, unrelated LPC transaction and the
+//     wrong byte would be served. So req_pending is aged out after REQ_TIMEOUT
+//     sclk (~15.8 us) and silently discarded -- ~45 us BEFORE the loader gives
+//     up, versus a ~0.2 us serve-to-mem_valid path. The two timeouts cannot
+//     race. If you change one, recompute the other.
+//
+//     This fires in exactly one legitimate case today: a read of an oversized
+//     bank (ext region) before newrgn_ready. The host sees a SYNC error and
+//     retries; once the fill completes the retry is served.
 
 module eos_sdram_backend #(
     parameter integer FREQ      = 64_800_000,
@@ -88,12 +131,22 @@ module eos_sdram_backend #(
     output wire        dbg_newrgn_ready // ext-region resident in SDRAM
 );
 
+    // Width-clean derived constants (no behavioural change; these exist purely so
+    // the truncations are explicit in the source instead of implicit in synthesis).
+    localparam [22:0] PRELOAD_TOP = (LENGTH - CHUNK);   // first (highest) chunk base
+
     // -------------------------------------------------------------------------
     // SPI flash reader
     // -------------------------------------------------------------------------
     //
     // This backend intentionally requests exactly one byte at a time.
     // Do not change fr_len back to 256 until we add a FIFO or backpressure.
+
+    // Declared here (not with the other FSM regs) because wpend feeds the
+    // reader's stall input at the instantiation below.
+    reg        wpend;      // 1 = a flash byte is waiting to be written to SDRAM
+    reg [7:0]  wbyte;
+    reg        burst_active;   // 1 while a multi-byte SPI burst is streaming
 
     reg         fr_start;
     reg [23:0] fr_addr;
@@ -111,6 +164,7 @@ module eos_sdram_backend #(
         .clk        (sclk),
         .rstn       (sresetn),
         .start      (fr_start),
+        .stall      (wpend),        // PHASE 4 backpressure: hold while a byte waits
         .addr       (fr_addr),
         .len        (fr_len),
         .busy       (fr_busy),
@@ -298,7 +352,8 @@ module eos_sdram_backend #(
     // NORMALLY (plain 0xEF nibble) -- the redirect lives entirely here.
     //   ext index i = bank_eff - 3 (EF 0x3->0 .. 0x6->3)
     wire        eff_is_user  = (bank_eff >= 4'h3) && (bank_eff <= 4'h6);
-    wire [1:0]  eff_ix       = bank_eff[3:0] - 4'd3;   // 0x3->0,0x4->1,0x5->2,0x6->3
+    wire [3:0]  eff_ix4      = bank_eff - 4'd3;        // 0x3->0,0x4->1,0x5->2,0x6->3
+    wire [1:0]  eff_ix       = eff_ix4[1:0];           // gated by eff_is_user below
     wire        eff_anchor   = eff_is_user && ext_anchor[eff_ix];
     wire [1:0]  eff_szc      = ext_szc [eff_ix*2 +: 2];
     wire [23:0] eff_base     = ext_base[eff_ix*24 +: 24];   // rel FLOOR
@@ -322,6 +377,14 @@ module eos_sdram_backend #(
     end
 
     reg req_pending;
+
+    // ---- stale-request ageing (see note (B) in the header) ----
+    // 1024 sclk @ 64.8 MHz = 15.8 us. Worst legitimate serve latency is one
+    // flash byte plus an SDRAM write plus a refresh, ~183 sclk (2.8 us), so
+    // this is ~5.6x margin. It MUST remain well below eos_lpc_loader's
+    // SYNC_TIMEOUT (2048 lclk = 61.4 us) in wall-clock terms.
+    localparam integer REQ_TIMEOUT = 1024;
+    reg [10:0] req_age;
 
     // -------------------------------------------------------------------------
     // Result CDC: SDRAM clock domain -> LPC clock domain
@@ -381,7 +444,8 @@ module eos_sdram_backend #(
     reg [7:0]  scr_wdata_r;
 
     // Post-flash reload bookkeeping
-    parameter [22:0] SCRATCH_BASE = 23'h60_0000;   // SDRAM serve ceiling (6MB managed)
+    localparam [22:0] SCRATCH_BASE = 23'h60_0000;  // SDRAM serve ceiling (6MB managed)
+    wire [23:0] rl_sd_next = reload_base - FLASH_OFF;   // 24b; [23] provably 0, see use
     reg         reload_pending;
     reg [23:0]  rl_fl_base;     // physical flash base
     reg [22:0]  rl_sd_base;     // SDRAM base = flash base - FLASH_OFF
@@ -405,10 +469,19 @@ module eos_sdram_backend #(
     reg [22:0] filled_lo;
     reg [8:0]  got;
 
-    reg        wpend;
-    reg [7:0]  wbyte;
+    // ---- reload burst sizing -------------------------------------------------
+    // A burst must end exactly at the region end OR the SCRATCH_BASE clamp, never
+    // past either. If a burst could overshoot we would have to abort the reader
+    // mid-stream; fr_busy would then stay high and every !fr_busy guard in the
+    // FSM (S_S1_PROBE, S_FLASH_REQ) would deadlock. Clamping is what makes
+    // burst_active safe to clear on the last byte.
+    reg [8:0]  rl_burst_left;                 // bytes remaining in the active burst
+    wire [23:0] rl_remain = rl_len - rl_idx;                       // to region end
+    wire [23:0] rl_room   = {1'b0, SCRATCH_BASE} - ({1'b0, rl_sd_base} + rl_idx);
+    wire [23:0] rl_cap    = (rl_remain < rl_room) ? rl_remain : rl_room;
+    wire [8:0]  rl_blen   = (rl_cap >= 24'd256) ? 9'd256 : rl_cap[8:0];
 
-    reg        ret_serve;
+    reg [4:0]  rd_ret;        // state to return to when S_RD completes
     reg        op_lock;
     reg        seen_busy;
     reg        sdram_ready;
@@ -446,18 +519,21 @@ module eos_sdram_backend #(
 
             preload_done  <= 1'b0;
 
-            chunk_base    <= LENGTH - CHUNK;
+            chunk_base    <= PRELOAD_TOP;
             filled_lo     <= LENGTH[22:0];
             got           <= 9'd0;
 
             wpend         <= 1'b0;
             wbyte         <= 8'd0;
+            burst_active  <= 1'b0;
+            rl_burst_left <= 9'd0;
 
             done_tog      <= 1'b0;
             result        <= 8'd0;
 
             req_pending   <= 1'b0;
-            ret_serve     <= 1'b0;
+            req_age       <= 11'd0;
+            rd_ret        <= S_PRE;
             op_lock       <= 1'b0;
             seen_busy     <= 1'b0;
             sdram_ready   <= 1'b0;
@@ -507,9 +583,19 @@ module eos_sdram_backend #(
             if (seen_busy && !sd_busy)
                 sdram_ready <= 1'b1;
 
-            // Capture LPC read request.
-            if (req_edge)
+            // Capture LPC read request, and age out one we cannot serve.
+            // A dropped request is never answered; the loader's SYNC timeout
+            // handles the host side. Serve branches below clear req_pending
+            // later in this same always block, so they win over the ageing.
+            if (req_edge) begin
                 req_pending <= 1'b1;
+                req_age     <= 11'd0;
+            end else if (req_pending) begin
+                if (req_age == REQ_TIMEOUT[10:0] - 11'd1)
+                    req_pending <= 1'b0;          // stale: discard, stay silent
+                else
+                    req_age <= req_age + 11'd1;
+            end
 
             // Capture exactly one flash byte.
             if (fr_dvalid) begin
@@ -532,7 +618,9 @@ module eos_sdram_backend #(
                     rl_sd_base <= NRGN_SD;
                     nr_filling <= 1'b1;           // completion sets newrgn_ready
                 end else begin
-                    rl_sd_base <= (reload_base - FLASH_OFF);
+                    // reload_base >= FLASH_OFF is checked by the guard above, and
+                    // the difference is < SCRATCH_BASE, so bit 23 is always 0.
+                    rl_sd_base <= rl_sd_next[22:0];
                 end
                 rl_len         <= reload_len;
             end else if (pwr_reload && !reload_pending) begin
@@ -569,7 +657,7 @@ module eos_sdram_backend #(
                             sd_rd       <= 1'b1;
                             op_lock     <= 1'b1;
                             req_pending <= 1'b0;
-                            ret_serve   <= 1'b0;
+                            rd_ret      <= S_PRE;
                             st          <= S_RD;
                         end else begin
                             st <= S_FLASH_REQ;
@@ -578,23 +666,50 @@ module eos_sdram_backend #(
                 end
 
                 // -------------------------------------------------------------
-                // Request one byte from flash.
+                // Start a CHUNK-byte burst at the base of this chunk, or -- if one
+                // is already streaming -- simply go wait for the next byte.
+                // fr_start must NEVER pulse mid-burst.
+                //
+                // got walks 0..CHUNK-1 within a chunk and CHUNK == the burst size,
+                // so a burst maps exactly onto a chunk. burst_active is cleared by
+                // S_WRITE on the last byte, which is also when the reader reaches
+                // FIN and drops fr_busy.
                 // -------------------------------------------------------------
                 S_FLASH_REQ: begin
-                    if (!fr_busy && !wpend) begin
-                        fr_addr  <= FLASH_OFF + chunk_base + got;
-                        fr_len   <= 9'd1;
-                        fr_start <= 1'b1;
-                        st       <= S_FLASH_WAIT;
+                    if (burst_active) begin
+                        st <= S_FLASH_WAIT;
+                    end else if (!fr_busy && !wpend) begin
+                        fr_addr      <= FLASH_OFF + chunk_base;   // burst base, not +got
+                        fr_len       <= CHUNK[8:0];
+                        fr_start     <= 1'b1;
+                        burst_active <= 1'b1;
+                        st           <= S_FLASH_WAIT;
                     end
                 end
 
                 // -------------------------------------------------------------
-                // Wait until that one byte is captured.
+                // Wait for the next byte of the burst. The SDRAM is completely
+                // idle here, so LPC reads are served for free.
+                //
+                // This matters most at the START of a burst, where the reader is
+                // still clocking out PRECS + the 0x03 command + 24 address bits
+                // (~168 sclk). A request landing in that window used to wait the
+                // whole header out. Serving here makes it wait for nothing.
+                //
+                // No blocking guard needed (unlike S_RL_REQ / S_PRE): nothing here
+                // competes for the SDRAM, so a plain conditional cannot starve.
                 // -------------------------------------------------------------
                 S_FLASH_WAIT: begin
-                    if (wpend)
+                    if (wpend) begin
                         st <= S_WRITE;
+                    end else if (!sd_busy && !op_lock && req_pending && req_filled) begin
+                        sd_addr     <= BIOS_BASE + req23;
+                        sd_rd       <= 1'b1;
+                        op_lock     <= 1'b1;
+                        req_pending <= 1'b0;
+                        rd_ret      <= S_FLASH_WAIT;
+                        st          <= S_RD;
+                    end
                 end
 
                 // -------------------------------------------------------------
@@ -613,14 +728,15 @@ module eos_sdram_backend #(
                             wpend   <= 1'b0;
 
                             if (got == CHUNK - 1) begin
-                                got       <= 9'd0;
-                                filled_lo <= chunk_base;
+                                got          <= 9'd0;
+                                filled_lo    <= chunk_base;
+                                burst_active <= 1'b0;   // burst drained exactly here
 
                                 if (chunk_base == 0) begin
                                     preload_done <= 1'b1;
                                     st           <= S_SERVE;
                                 end else begin
-                                    chunk_base <= chunk_base - CHUNK;
+                                    chunk_base <= chunk_base - CHUNK[22:0];
                                     st         <= S_PRE;
                                 end
                             end else begin
@@ -634,11 +750,12 @@ module eos_sdram_backend #(
                 // -------------------------------------------------------------
                 // SDRAM read completion.
                 // -------------------------------------------------------------
+                // Shared SDRAM-read completion. rd_ret says who asked.
                 S_RD: begin
                     if (sd_data_ready) begin
                         result   <= sd_dout;
                         done_tog <= ~done_tog;
-                        st       <= ret_serve ? S_SERVE : S_PRE;
+                        st       <= rd_ret;
                     end
                 end
 
@@ -663,25 +780,27 @@ module eos_sdram_backend #(
                             // Second phase after the fast boot preload + XbDiag:
                             // page the 1MB ext region (flash NRGN_FL) into SDRAM
                             // at NRGN_SD (0x3C0000) so oversized banks are resident.
-                            newrgn_done <= 1'b1;
-                            rl_fl_base  <= NRGN_FL;
-                            rl_sd_base  <= NRGN_SD;
-                            rl_len      <= NRGN_LEN;
-                            rl_idx      <= 24'd0;
-                            nr_filling  <= 1'b1;
-                            st          <= S_RL_REQ;
+                            newrgn_done  <= 1'b1;
+                            rl_fl_base   <= NRGN_FL;
+                            rl_sd_base   <= NRGN_SD;
+                            rl_len       <= NRGN_LEN;
+                            rl_idx       <= 24'd0;
+                            nr_filling   <= 1'b1;
+                            burst_active <= 1'b0;
+                            st           <= S_RL_REQ;
                         end else if (reload_pending && flash_free) begin
                             // freshly-flashed region: re-read flash -> SDRAM in
                             // place so it serves without a cold boot. Only once
                             // the engine has released the flash bus.
-                            rl_idx <= 24'd0;
-                            st     <= S_RL_REQ;
+                            rl_idx       <= 24'd0;
+                            burst_active <= 1'b0;
+                            st           <= S_RL_REQ;
                         end else if (req_pending && req_filled) begin
                             sd_addr     <= BIOS_BASE + req23;
                             sd_rd       <= 1'b1;
                             op_lock     <= 1'b1;
                             req_pending <= 1'b0;
-                            ret_serve   <= 1'b1;
+                            rd_ret      <= S_SERVE;
                             st          <= S_RD;
                         // if req_pending && !req_filled: a new-region read arrived
                         // before its SDRAM fill finished. Do nothing -- hold the
@@ -699,6 +818,11 @@ module eos_sdram_backend #(
                 // Reload: copy a flashed region flash -> SDRAM, one byte at a
                 // time, mirroring the preload path. Clamped to the serve ceiling.
                 // -------------------------------------------------------------
+                // Top of the byte loop. This is the ONLY place in the reload
+                // path where the SPI reader is idle and the SDRAM is free, so it
+                // is where an LPC read gets serviced. Without this the loader
+                // sits in SYNCING for the entire multi-second fill. Priority:
+                // completion > refresh > LPC serve > next flash byte.
                 S_RL_REQ: begin
                     if (rl_idx >= rl_len ||
                         (rl_sd_base + rl_idx[22:0]) >= SCRATCH_BASE) begin
@@ -713,17 +837,52 @@ module eos_sdram_backend #(
                             reload_pending <= 1'b0;
                         end
                         st             <= S_SERVE;
+                    end else if (!sd_busy && !op_lock && refresh_due) begin
+                        sd_refresh <= 1'b1;
+                        op_lock    <= 1'b1;
+                    end else if (req_pending && req_filled) begin
+                        // A pending LPC read BLOCKS the next flash byte. It is not
+                        // enough to merely offer the serve as a same-priority
+                        // alternative: S_RL_WRITE leaves op_lock set for a cycle,
+                        // so a serve guarded on (!sd_busy && !op_lock) would lose
+                        // the race to the flash branch on every single iteration
+                        // and never fire. Stall here until the SDRAM is free.
+                        if (!sd_busy && !op_lock) begin
+                            sd_addr     <= BIOS_BASE + req23;
+                            sd_rd       <= 1'b1;
+                            op_lock     <= 1'b1;
+                            req_pending <= 1'b0;
+                            rd_ret      <= S_RL_REQ;
+                            st          <= S_RD;
+                        end
+                    end else if (burst_active) begin
+                        st <= S_RL_WAIT;                  // burst already streaming
                     end else if (!fr_busy && !wpend) begin
-                        fr_addr  <= rl_fl_base + rl_idx;
-                        fr_len   <= 9'd1;
-                        fr_start <= 1'b1;
-                        st       <= S_RL_WAIT;
+                        // rl_blen is clamped to the region end and the SCRATCH_BASE
+                        // ceiling, so this burst always terminates on a boundary.
+                        fr_addr       <= rl_fl_base + rl_idx;
+                        fr_len        <= rl_blen;
+                        fr_start      <= 1'b1;
+                        burst_active  <= 1'b1;
+                        rl_burst_left <= rl_blen;
+                        st            <= S_RL_WAIT;
                     end
                 end
 
+                // Same as S_FLASH_WAIT: the SDRAM is idle while the reader shifts
+                // bits, so serve LPC here rather than making the request wait out
+                // a burst header.
                 S_RL_WAIT: begin
-                    if (wpend)
+                    if (wpend) begin
                         st <= S_RL_WRITE;
+                    end else if (!sd_busy && !op_lock && req_pending && req_filled) begin
+                        sd_addr     <= BIOS_BASE + req23;
+                        sd_rd       <= 1'b1;
+                        op_lock     <= 1'b1;
+                        req_pending <= 1'b0;
+                        rd_ret      <= S_RL_WAIT;
+                        st          <= S_RD;
+                    end
                 end
 
                 S_RL_WRITE: begin
@@ -738,6 +897,9 @@ module eos_sdram_backend #(
                             op_lock <= 1'b1;
                             wpend   <= 1'b0;
                             rl_idx  <= rl_idx + 1'b1;
+                            rl_burst_left <= rl_burst_left - 9'd1;
+                            if (rl_burst_left == 9'd1)
+                                burst_active <= 1'b0;   // burst drained exactly here
                             st      <= S_RL_REQ;
                         end
                     end
@@ -748,8 +910,28 @@ module eos_sdram_backend #(
                 // at SLOT1_SIG. If all match, page in the 768K window; else leave
                 // slot 1 cold. Latches slot1_done either way so it runs once.
                 // -------------------------------------------------------------
+                // Same rule as S_RL_REQ: the probe loop must not starve LPC.
+                // Four single-byte reads is ~10 us, well past the 2.8 us serve
+                // budget, so it gets a serve branch too.
+                // Four bytes, ~10 us. Deliberately left at fr_len = 1: with
+                // stall = wpend the single-byte path is unchanged and there is
+                // nothing to gain from bursting it.
                 S_S1_PROBE: begin
-                    if (!fr_busy && !wpend) begin
+                    if (!sd_busy && !op_lock && refresh_due) begin
+                        sd_refresh <= 1'b1;
+                        op_lock    <= 1'b1;
+                    end else if (req_pending && req_filled) begin
+                        // Pending serve blocks the next probe byte -- same
+                        // priority rule as S_RL_REQ above.
+                        if (!sd_busy && !op_lock) begin
+                            sd_addr     <= BIOS_BASE + req23;
+                            sd_rd       <= 1'b1;
+                            op_lock     <= 1'b1;
+                            req_pending <= 1'b0;
+                            rd_ret      <= S_S1_PROBE;
+                            st          <= S_RD;
+                        end
+                    end else if (!fr_busy && !wpend) begin
                         fr_addr  <= SLOT1_SIG + {22'd0, sig_i};
                         fr_len   <= 9'd1;
                         fr_start <= 1'b1;
@@ -791,15 +973,16 @@ module eos_sdram_backend #(
                 S_S1_FILL: begin
                     // hand off to the shared reload loop; s1_filling tells the
                     // loop's exit (in S_RL_REQ) to raise slot1_ready when it drains.
-                    slot1_ready <= 1'b0;   // not ready until the loop drains
-                    s1_filling  <= 1'b1;
-                    st          <= S_RL_REQ;
+                    slot1_ready  <= 1'b0;   // not ready until the loop drains
+                    s1_filling   <= 1'b1;
+                    burst_active <= 1'b0;
+                    st           <= S_RL_REQ;
                 end
 
                 // -------------------------------------------------------------
-                // NEW REGION preload: probe the first byte; if the region is not
-                // blank (0xFF), page the 1MB new region into SDRAM so oversized
-                // banks (0xEF 0x7/0x8/0x9) serve from a resident copy. Runs once.
+                // Scratch write (update staging). The comment that used to sit
+                // here described a NEW REGION probe that does not exist in this
+                // state -- the ext-region fill is dispatched from S_SERVE.
                 // -------------------------------------------------------------
                 S_SCR_WR: begin
                     if (!sd_busy && !op_lock) begin

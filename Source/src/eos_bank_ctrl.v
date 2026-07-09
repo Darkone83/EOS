@@ -264,6 +264,9 @@ module eos_bank_ctrl #(
 
     // descriptor-load working state
     localparam DESC_BYTES = 7'd64;         // read 64 bytes of the descriptor block
+    // Physical descriptor address, byte-sliced for the 0x03 READ command below.
+    // Explicit slices instead of >>16 / >>8 / &0xFF so no implicit truncation.
+    localparam [23:0] DESC_PHYS = FLOOR + DESC_OFF;   // 0x200000 + 0x4C0000 = 0x6C0000
     reg [6:0]  db_idx;                     // 0..63
     reg [7:0]  db_buf [0:63];              // raw descriptor bytes
     reg        desc_loaded;                // 1 once the boot load has completed
@@ -417,9 +420,9 @@ module eos_bank_ctrl #(
                     end
                 end
                 S_DCMD: begin flash_cs_n<=1'b0; tx_byte<=CMD_READ; ret<=S_DA2; st<=S_KICK; end
-                S_DA2:  begin tx_byte<=(FLOOR+DESC_OFF)>>16;      ret<=S_DA1; st<=S_KICK; end
-                S_DA1:  begin tx_byte<=(FLOOR+DESC_OFF)>>8;       ret<=S_DA0; st<=S_KICK; end
-                S_DA0:  begin tx_byte<=(FLOOR+DESC_OFF)&24'hFF;   ret<=S_DRD; st<=S_KICK; end
+                S_DA2:  begin tx_byte<=DESC_PHYS[23:16];          ret<=S_DA1; st<=S_KICK; end
+                S_DA1:  begin tx_byte<=DESC_PHYS[15:8];           ret<=S_DA0; st<=S_KICK; end
+                S_DA0:  begin tx_byte<=DESC_PHYS[7:0];            ret<=S_DRD; st<=S_KICK; end
                 S_DRD:  begin
                     if (db_idx==DESC_BYTES) begin flash_cs_n<=1'b1; st<=S_DFIN; end
                     else begin tx_byte<=8'h00; ret<=S_DCAP; st<=S_KICK; end

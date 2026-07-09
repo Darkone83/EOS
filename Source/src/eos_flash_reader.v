@@ -4,12 +4,35 @@
 // the prior operation and accepts a new command -- without this, an abort with CS
 // held low just continues the old stream and returns wrong bytes.
 // SCK divided by SCK_DIV; MISO sampled at end of SCK-high for clean alignment.
+//
+// -----------------------------------------------------------------------------
+// PHASE 4: 'stall' -- backpressure for multi-byte bursts.
+// -----------------------------------------------------------------------------
+// With len > 1 the reader emits a byte every 8*PERIOD clocks whether or not the
+// sink is ready. 'stall' lets the sink hold the burst:
+//
+//   * Honoured ONLY in DATA, and ONLY at pc == 0 (a bit boundary).
+//   * pc == 0 is the one point where sck_lvl == 0, so flash_clk parks LOW --
+//     which is what SPI mode 0 requires of an idle clock.
+//   * CS# stays asserted. The burst is PAUSED, not aborted.
+//   * SPI NOR is a fully static interface: no minimum SCK frequency, no maximum
+//     CS-low time. The clock may stop indefinitely between bits.
+//
+// ZERO-SLOP GUARANTEE: a byte is emitted at pc_last (pc == PERIOD-1). If the sink
+// raises 'stall' on that same edge, the reader sees it at pc == 0 on the very next
+// clock and holds. The next byte cannot complete for another 7*PERIOD clocks.
+// Therefore AT MOST ZERO further bytes are produced after stall asserts, and a
+// one-entry sink buffer can never overflow. No FIFO is required.
+//
+// Tie stall = 1'b0 to restore the pre-Phase-4 behaviour exactly.
+// -----------------------------------------------------------------------------
 module eos_flash_reader #(
     parameter         FLASH_BASE = 24'h200000,
     parameter integer SCK_DIV    = 2,
     parameter integer CSH_CYCLES = 8
 )(
     input  wire        clk, rstn, start,
+    input  wire        stall,            // 1 = hold the burst at a bit boundary
     input  wire [23:0] addr,
     input  wire [8:0]  len,
     output reg         busy, done, dvalid,
@@ -62,7 +85,11 @@ module eos_flash_reader #(
                     end
                     DATA: begin
                         flash_clk<=sck_lvl;
-                        if (pc_last) begin
+                        if (stall && pc==0) begin
+                            // Hold at a bit boundary. sck_lvl==0 here, so the
+                            // registered flash_clk goes low and stays low. CS#
+                            // remains asserted; nothing else advances.
+                        end else if (pc_last) begin
                             pc<=0;
                             if (rbits==3'd7) begin
                                 dout<={rx[6:0],flash_miso}; dvalid<=1'b1; rbits<=0;

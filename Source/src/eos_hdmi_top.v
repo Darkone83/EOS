@@ -49,6 +49,10 @@ module eos_hdmi_top (
     output     [3:0]   O_sdram_dqm
 );
 
+    // rst_btn is a real pad in the CST but nothing uses it. Tie it off rather
+    // than removing the port (which would also mean editing the .cst).
+    wire _unused_rst_btn = rst_btn;
+
     // -------------------------------------------------------------------------
     // HDMI clocks
     // -------------------------------------------------------------------------
@@ -259,6 +263,9 @@ module eos_hdmi_top (
     wire        crc_go, crc_busy, crc_done;  wire [20:0] crc_len;  wire [31:0] crc_result;
     wire        i2c_commit_go; wire [3:0] i2c_commit_bank;  wire [12:0] i2c_commit_pages;
     wire        bank_commit_busy, bank_commit_done, bank_commit_err;
+    // RESERVED: driven by eos_i2c, consumed by nothing yet. Left connected so the
+    // SMBus register map stays stable for the updater. Wire them up or delete the
+    // eos_i2c outputs -- do not silently drop them.
     wire        i2c_scr_clear; wire [3:0] i2c_sel_bank;  wire [1:0] i2c_boot_mode;
     wire [15:0] i2c_lock_mask;
     wire [1:0]  i2c_led_mode;   // LEDMODE (0x38): 1 = rainbow (updater active)
@@ -574,7 +581,6 @@ module eos_hdmi_top (
         .mem_addr     (mem_addr),
         .lad          (lpc_lad),
 
-        .mem_valid    (mem_valid),
         .sd_ready     (sd_rstn),
         .preload_done (preload_done),
         .filled_lo    (dbg_filled_lo),
@@ -754,28 +760,20 @@ module eos_hdmi_top (
     // Loader-domain sticky/activity flags
     // -------------------------------------------------------------------------
 
-    reg b_start  = 1'b0;
+    // b_start (lst != 0) and b_sync (lst == SYNC_COMPLETE) were assigned here and
+    // read nowhere. Removed. b_drive and b_serv feed the LED bank below.
     reg b_drive  = 1'b0;
-    reg b_sync   = 1'b0;
     reg b_serv   = 1'b0;
     reg serv_tog = 1'b0;
 
     always @(posedge clk_lpc or negedge lpc_lreset_n) begin
         if (!lpc_lreset_n) begin
-            b_start  <= 1'b0;
             b_drive  <= 1'b0;
-            b_sync   <= 1'b0;
             b_serv   <= 1'b0;
             serv_tog <= 1'b0;
         end else begin
-            if (lst != 4'd0)
-                b_start <= 1'b1;
-
             if (lad_oe_c)
                 b_drive <= 1'b1;
-
-            if (lst == 4'd6)
-                b_sync <= 1'b1;
 
             if (mem_valid) begin
                 b_serv   <= 1'b1;
@@ -817,13 +815,25 @@ module eos_hdmi_top (
     end
 
     // -------------------------------------------------------------------------
-    // Rainbow hue generator (for LED rainbow mode while the updater is active).
-    // A free-running phase; the top byte is a 0..255 hue swept through a 6-segment
-    // color wheel. hue_phase[23] pace gives a pleasant ~1-2s full cycle at 27MHz.
+    // Rainbow hue generator (LED rainbow mode while the updater is active).
+    //
+    // WAS: a 32-bit free-running counter with hue = hue_phase[31:24]. That steps
+    // the hue once every 2^24 sys_clk ticks = 0.62 s, so a full 256-step wheel
+    // took 159 SECONDS -- the comment claimed 1-2 s and the LED looked static.
+    // Worse, the hue fed h[7:5] (EIGHT sectors) into a SIX-arm case, so segments
+    // 6 and 7 hit the default arm: 25% of the wheel was a flat red hold.
+    //
+    // NOW: the hue counts 0..191 = exactly 6 sectors x 32 steps, so every arm of
+    // the wheel is used and none is reachable by the default. Stepped once per
+    // 2^18 ticks -> 192 * 2^18 / 27 MHz = 1.86 s per full wheel.
     // -------------------------------------------------------------------------
-    reg [31:0] hue_phase = 32'd0;
-    always @(posedge sys_clk) hue_phase <= hue_phase + 32'd1;
-    wire [7:0] hue = hue_phase[31:24];        // 0..255 sweeping hue
+    reg [17:0] hue_pre = 18'd0;
+    reg [7:0]  hue     = 8'd0;               // 0..191
+    always @(posedge sys_clk) begin
+        hue_pre <= hue_pre + 1'b1;
+        if (hue_pre == 18'd0)
+            hue <= (hue == 8'd191) ? 8'd0 : hue + 1'b1;
+    end
 
     // hue -> RGB (full saturation/value), classic 6-sector wheel. Scaled down to
     // a gentle brightness so it matches the other LED states (~0x40 peak).
@@ -832,8 +842,8 @@ module eos_hdmi_top (
         reg [7:0] seg; reg [7:0] t; reg [7:0] r; reg [7:0] g; reg [7:0] b;
         reg [7:0] up; reg [7:0] dn;
         begin
-            seg = h[7:5];              // which of 8 sectors (approx 6-sector wheel)
-            t   = {h[4:0], 3'b000};    // position within sector, 0..255
+            seg = h[7:5];              // h is 0..191, so seg is 0..5: all arms used
+            t   = {h[4:0], 3'b000};    // position within sector, 0..248
             up  = t;                   // rising ramp
             dn  = 8'hFF - t;           // falling ramp
             case (seg)
@@ -843,7 +853,7 @@ module eos_hdmi_top (
                 3'd3: begin r=8'h00; g=dn;    b=8'hFF; end
                 3'd4: begin r=up;    g=8'h00; b=8'hFF; end
                 3'd5: begin r=8'hFF; g=8'h00; b=dn;    end
-                default: begin r=8'hFF; g=8'h00; b=8'h00; end
+                default: begin r=8'hFF; g=8'h00; b=8'h00; end   // unreachable: h <= 191
             endcase
             // scale to gentle brightness (>>2 ~= 0x40 peak) and pack GRB
             HUE_TO_GRB = { g[7:2], 2'b00, r[7:2], 2'b00, b[7:2], 2'b00 };
@@ -884,14 +894,6 @@ module eos_hdmi_top (
             boot_activity <= 25'd13500000;   // ~500 ms at 27 MHz
         else if (boot_activity != 0)
             boot_activity <= boot_activity - 1'b1;
-    end
-
-    // Optional crude serve counter. Useful if you later want to expose this to HUD.
-    reg [15:0] serve_count = 16'd0;
-
-    always @(posedge sys_clk) begin
-        if (serve_evt)
-            serve_count <= serve_count + 1'b1;
     end
 
     // -------------------------------------------------------------------------

@@ -77,6 +77,10 @@ module eos_text_render #(
     wire [11:0] yrel = ay - LOGO_Y;
     wire in_logo_c = (ax>=LOGO_X)&&(ax<LOGO_X+LOGO_W)&&(ay>=LOGO_Y)&&(ay<LOGO_Y+LOGO_W);
     wire [13:0] logo_addr_c = {yrel[7:1], xrel[7:1]};
+    // row*COLS + col, COLS=160=128+32 -> two shifts + add, no multiplier.
+    // row<=44, col<=159 => max 7199, fits 13 bits.
+    wire [13:0] caddr1_sum = {row, 7'b0} + {2'b0, row, 5'b0} + {6'b0, col};
+    wire [12:0] caddr1_c   = caddr1_sum[12:0];
 
     // ---- S1 ----
     reg [12:0] caddr1; reg [2:0] px1; reg [3:0] py1; reg title1; reg de1, hs1, vs1;
@@ -84,7 +88,7 @@ module eos_text_render #(
     always @(posedge pclk or negedge rst_n)
         if (!rst_n) begin caddr1<=0; px1<=0; py1<=0; title1<=0; de1<=0; hs1<=0; vs1<=0; logo_addr1<=0; il1<=0; end
         else begin
-            caddr1 <= row*COLS + col;
+            caddr1 <= caddr1_c;
             px1<=ax[2:0]; py1<=ay[3:0]; title1<=(row<6'd2);
             de1<=de_in; hs1<=hs_in; vs1<=vs_in;
             logo_addr1<=logo_addr_c; il1<=in_logo_c;
