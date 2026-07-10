@@ -38,8 +38,8 @@ it's doing.
    easiest way is the **Eos Recovery** app — point, click, done. CLI commands are further down
    if you'd rather.
 2. **Wire it to the Xbox LPC header.** Six series resistors, power, and either a D0 connection
-   (1.0–1.5) or an LFRAME# tap plus an LPC rebuild (1.6).
-3. **Set the revision switch.** Open for 1.0–1.5, closed to ground for 1.6.
+   (1.0–1.4) or an LFRAME# tap plus an LPC rebuild (1.6).
+3. **Set the revision switch.** Open for 1.0–1.4, closed to ground for 1.6.
 4. **Power on.** The LEDs and RGB tell you how far the boot got; the HDMI dashboard shows live
    serve state if a screen is attached.
 
@@ -52,7 +52,7 @@ needed.
 
 - **Serves the BIOS over LPC** — answers the MCPX's memory-read cycles and streams the active
   BIOS image out of SDRAM.
-- **Works on 1.0–1.5 and 1.6** — D0 on the older boards, LFRAME# transaction abort on 1.6,
+- **Works on 1.0–1.4 and 1.6** — D0 on the older boards, LFRAME# transaction abort on 1.6,
   picked by a hardware switch. See **Console revisions** below.
 - **Xenium-style bank select** — the bank register lives at I/O `0xEF` (low nibble = bank),
   the same convention Xenium-family tools expect. It's a clean-room implementation of that
@@ -97,8 +97,8 @@ Put a **22 kΩ resistor in-line on each of the six Xbox-driven inputs** — `LAD
 |---|---|---|
 | 1 | Sipeed Tang Nano 20K (GW2AR-18C) | the modchip |
 | 6 | 22 kΩ resistor | in series on LAD0–3, LCLK, LRESET# |
-| 1 | SPST switch or jumper | revision select (open = 1.0–1.5, GND = 1.6) |
-| — | wire to the D0 point | 1.0–1.5 install (ground it, or drive it from `lpc_d0`) |
+| 1 | SPST switch or jumper | revision select (open = 1.0–1.4, GND = 1.6) |
+| — | wire to the D0 point | 1.0–1.4 install (ground it, or drive it from `lpc_d0`) |
 | — | wire to LFRAME# + LPC rebuild | 1.6 install |
 
 ---
@@ -110,13 +110,13 @@ switch** on `mode16_n`:
 
 | Switch | Console | How it boots |
 |---|---|---|
-| **Open** | 1.0 – 1.5 | D0 (disables the onboard TSOP) |
+| **Open** | 1.0 – 1.4 | D0 (disables the onboard TSOP) |
 | **Closed → GND** | 1.6 | LFRAME# transaction abort |
 
-The dashboard prints the revision it read (`1.5` / `1.6`), so you can check the switch is set
+The dashboard prints the revision it read (`1.4` / `1.6`), so you can check the switch is set
 right before you trust a boot.
 
-### 1.0 – 1.5
+### 1.0 – 1.4
 
 D0 has to go low to disable the onboard TSOP and force an LPC boot. Two ways to do it, pick
 whichever suits your board:
