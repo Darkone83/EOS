@@ -8,8 +8,6 @@ Host-side tooling for building, flashing, and maintaining an Eos modchip. Three 
 | **`eos_pack.py`** | Build the flashable BIOS image from your loader XBE | Chip prep / dev |
 | **`gen_hud.py`** | Regenerate the HDMI serve-HUD gateware | Firmware dev |
 
-> Team Resurgent · Darkone83 · **Private — do not distribute**
-
 ---
 
 ## Recovery/  — end-user reflash & un-brick
