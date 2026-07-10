@@ -370,11 +370,6 @@ flash at Eos's serve base:
 openFPGALoader -b tangnano20k --external-flash -o 0x200000 eos.bin
 ```
 
-> ⚠️ **Check the offset.** Eos serves from `0x200000`, so the BIOS has to be written there. The
-> Recovery app currently defaults to `0x20000` (one zero short) — confirm `0x200000` for your
-> board and fix the Recovery default before shipping. A wrong offset drops the BIOS inside the
-> bitstream or somewhere the FPGA can't find it.
-
 The image maps to banks like this (physical flash address = `0x200000` + offset in image):
 
 | Offset in image | Contents | Bank (`0xEF`) |
