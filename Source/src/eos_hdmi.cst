@@ -1,5 +1,5 @@
 // eos_hdmi.cst -- Tang Nano 20K (GW2AR-LV18QN88C8/I7). HDMI + Phase-1 LPC probe.
-// KNOWN-GOOD video path. pin 4 (27 MHz) = Bank 7 (1.8V) -> sys_clk MUST be LVCMOS18.
+// KNOWN-GOOD video path. pin 4 (27 MHz) = Bank 7 (3.3v) -> sys_clk MUST be LVCMOS18.
 // LPC inputs moved to TOP IOT bank (71-76,86) so live-bus switching noise is OUT
 // of the bottom IOB bank that sources the LVDS TMDS pairs (was dropping HDMI sync
 // when the Xbox powered on).

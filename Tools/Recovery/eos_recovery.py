@@ -5,15 +5,17 @@ Eos Recovery -- Darkone Customs
 ================================
 A self-contained recovery / initial-flash tool for the Eos modchip (Tang Nano 20K).
 
-Two independent operations, each with its own Program button so a user can recover
+Four independent operations, each with its own Program button so a user can recover
 exactly what's broken:
 
-    Bitstream :  openFPGALoader -b tangnano20k -f  <bitstream.fs>
-    BIOS      :  openFPGALoader -b tangnano20k --external-flash -o <offset> <bios.bin>
+    Bitstream :  openFPGALoader -b tangnano20k -f  <bitstream.fs>          (local file)
+    BIOS      :  openFPGALoader -b tangnano20k --external-flash -o <off> <bios.bin>  (local file)
+    Loader    :  loader.bin   downloaded from the Darkone server -> 0x200000 (bank 0xE)
+    XbDiag    :  xbdlite.bin  downloaded from the Darkone server -> 0x400000 (bank 0xD)
 
-Both write the Nano's external SPI flash over the onboard USB-JTAG bridge, so a board
-with a dead bitstream is still recoverable (USB still enumerates; the FPGA design does
-not have to be valid to reprogram the flash).
+All of them write the Nano's external SPI flash over the onboard USB-JTAG bridge, so a
+board with a dead bitstream is still recoverable (USB still enumerates; the FPGA design
+does not have to be valid to reprogram the flash).
 
 Ship openFPGALoader(.exe) next to this program (or freeze with PyInstaller). No install.
 """
@@ -39,16 +41,28 @@ from PySide6.QtWidgets import (
 APP_NAME     = "Eos Recovery"
 ORG_NAME     = "Darkone Customs"
 BOARD        = "tangnano20k"
-BIOS_OFFSET  = "0x200000"         # default BIOS offset in external flash
+
+# Physical flash offsets. These come straight from eos_bank_ctrl.v bank_base()
+# plus FLOOR (0x200000), and must match the gateware:
+#     bank 0xE  base 0x000000  ->  phys 0x200000   full loader/BIOS image
+#     bank 0xD  base 0x200000  ->  phys 0x400000   XbDiag Lite reserve
+BIOS_OFFSET   = "0x200000"        # default BIOS offset in external flash
+LOADER_OFFSET = "0x200000"        # loader image lives in bank 0xE (phys 0x200000)
 XBDIAG_OFFSET = "0x400000"        # XbDiag Lite lives in bank 0xD (phys 0x400000)
 
-# XbDiag Lite is pulled from the same server the updater uses (no local file):
-#   http://<host>:<port><base>/xbdlite.bin   -- CRC ignored (known-good image).
-XBDIAG_HOST  = "darkone83.myddns.me"
-XBDIAG_PORT  = 8008
-XBDIAG_BASE  = "/EOS"
+# Loader and XbDiag are pulled from the same server the updater uses (no local file).
+# CRC is intentionally not checked here -- the server images are known-good.
+SERVER_HOST  = "darkone83.myddns.me"
+SERVER_PORT  = 8008
+SERVER_BASE  = "/EOS"
+
+def _server_url(leaf):
+    return "http://%s:%d%s/%s" % (SERVER_HOST, SERVER_PORT, SERVER_BASE, leaf)
+
+LOADER_LEAF  = "loader.bin"
 XBDIAG_LEAF  = "xbdlite.bin"
-XBDIAG_URL   = "http://%s:%d%s/%s" % (XBDIAG_HOST, XBDIAG_PORT, XBDIAG_BASE, XBDIAG_LEAF)
+LOADER_URL   = _server_url(LOADER_LEAF)
+XBDIAG_URL   = _server_url(XBDIAG_LEAF)
 ACCENT       = "#A855F7"          # Darkone purple  rgb(168,85,247)
 ACCENT_DIM   = "#7E3FBF"
 OK_GREEN     = "#22C55E"
@@ -118,9 +132,10 @@ class DownloadWorker(QThread):
     line     = Signal(str)
     finished = Signal(bool, str)     # (success, temp_path or "")
 
-    def __init__(self, url):
+    def __init__(self, url, prefix="eos_"):
         super().__init__()
         self._url = url
+        self._prefix = prefix
 
     def run(self):
         tmp_path = ""
@@ -130,8 +145,9 @@ class DownloadWorker(QThread):
             with urllib.request.urlopen(req, timeout=30) as resp:
                 total = resp.getheader("Content-Length")
                 total = int(total) if total and total.isdigit() else 0
-                fd, tmp_path = tempfile.mkstemp(suffix=".bin", prefix="xbdlite_")
+                fd, tmp_path = tempfile.mkstemp(suffix=".bin", prefix=self._prefix)
                 got = 0
+                last_pct = -1
                 with os.fdopen(fd, "wb") as f:
                     while True:
                         chunk = resp.read(65536)
@@ -140,8 +156,11 @@ class DownloadWorker(QThread):
                         f.write(chunk)
                         got += len(chunk)
                         if total:
-                            self.line.emit("  %d / %d bytes (%d%%)"
-                                           % (got, total, (got * 100) // total))
+                            # only log every 5% so a 2 MB image doesn't spam the log
+                            pct = (got * 100) // total
+                            if pct >= last_pct + 5 or got == total:
+                                self.line.emit("  %d / %d bytes (%d%%)" % (got, total, pct))
+                                last_pct = pct
                         else:
                             self.line.emit("  %d bytes" % got)
             if got == 0:
@@ -246,6 +265,18 @@ class EosRecovery(QMainWindow):
             self.biosPath, self.biosBtn, browse_filter="BIOS image (*.bin);;All files (*.*)",
             offset_field=self.biosOff))
 
+        # loader card (pulled from server -- no local file)
+        self.loaderBtn = QPushButton("Download + Flash Loader")
+        self.loaderBtn.setObjectName("primary")
+        self.loaderBtn.clicked.connect(self.program_loader)
+        col.addWidget(self._server_card(
+            "Loader / BIOS image (external flash)",
+            "Downloads the current Eos loader image from the Darkone server and flashes "
+            "it to bank 0xE (0x200000). No file needed \u2014 use this if you have no "
+            "eos.bin to hand. This replaces the whole BIOS image, so it will ask you "
+            "to confirm.",
+            self.loaderBtn))
+
         # xbdiag card (pulled from server -- no local file)
         self.xbdBtn = QPushButton("Download + Flash XbDiag")
         self.xbdBtn.setObjectName("primary")
@@ -313,6 +344,8 @@ class EosRecovery(QMainWindow):
         g.addWidget(prog_btn, 2, 2)
         g.setColumnStretch(0, 1)
         return card
+
+    def _apply_style(self):
         self.setStyleSheet("""
             QMainWindow, QWidget { background:%(bg)s; color:%(text)s; font-family:'Segoe UI',sans-serif; }
             QLineEdit { background:#15151B; border:1px solid #383843; border-radius:8px;
@@ -358,7 +391,7 @@ class EosRecovery(QMainWindow):
             "color:%s;font-size:13px;" % (TEXT if found else MUTED))
 
     def _busy(self, on):
-        for w in (self.bitBtn, self.biosBtn, self.xbdBtn, self.refreshBtn,
+        for w in (self.bitBtn, self.biosBtn, self.loaderBtn, self.xbdBtn, self.refreshBtn,
                   self.bitPath, self.biosPath, self.biosOff):
             w.setEnabled(not on)
 
@@ -406,37 +439,69 @@ class EosRecovery(QMainWindow):
             return
         off = self.biosOff.text().strip() or BIOS_OFFSET
         if not re.fullmatch(r"0x[0-9A-Fa-f]+|[0-9]+", off):
-            QMessageBox.warning(self, APP_NAME, "Offset must be a number, e.g. 0x20000.")
+            QMessageBox.warning(self, APP_NAME, "Offset must be a number, e.g. 0x200000.")
             return
         self.settings.setValue("bios_path", path)
         self.settings.setValue("bios_off", off)
         self._run([self.loader, "-b", BOARD, "--external-flash", "-o", off, path],
                   "BIOS", "Your Eos BIOS is reflashed.")
 
-    def program_xbdiag(self):
-        # No local file: pull xbdlite.bin from the server, then flash to 0x400000.
-        # CRC is intentionally not checked here -- the server image is known-good.
+    # ---- server-hosted images (no local file) -------------------------------
+    def _download_and_flash(self, url, offset, label, ok_msg, prefix):
+        """Shared flow behind the Loader and XbDiag cards.
+
+        Pull the image from the Darkone server to a temp file, flash it at
+        `offset`, then delete the temp file. CRC is intentionally not checked --
+        the server images are known-good.
+        """
         if not self.loader:
             QMessageBox.warning(self, APP_NAME,
                 "openFPGALoader was not found. Place it in this folder and reopen.")
             return
         self.banner.setVisible(False)
         self._busy(True)
-        self._log("\n$ download %s" % XBDIAG_URL)
-        self._dl = DownloadWorker(XBDIAG_URL)
+        self._log("\n$ download %s" % url)
+        self._dl_offset = offset
+        self._dl_label  = label
+        self._dl_ok_msg = ok_msg
+        self._dl = DownloadWorker(url, prefix=prefix)
         self._dl.line.connect(self._log)
-        self._dl.finished.connect(self._xbdiag_downloaded)
+        self._dl.finished.connect(self._server_image_downloaded)
         self._dl.start()
 
-    def _xbdiag_downloaded(self, ok, tmp_path):
+    def _server_image_downloaded(self, ok, tmp_path):
         if not ok:
             self._busy(False)
-            self._set_banner("\u2717  XbDiag download failed \u2014 check the activity log.", False)
+            self._set_banner("\u2717  %s download failed \u2014 check the activity log."
+                             % self._dl_label, False)
             return
-        # Flash the freshly-downloaded image, then remove the temp file when done.
-        self._xbd_tmp = tmp_path
-        self._run([self.loader, "-b", BOARD, "--external-flash", "-o", XBDIAG_OFFSET, tmp_path],
-                  "XbDiag", "XbDiag Lite is flashed.")
+        # Flash the freshly-downloaded image; _run_done removes the temp file.
+        self._tmp_image = tmp_path
+        self._run([self.loader, "-b", BOARD, "--external-flash", "-o", self._dl_offset, tmp_path],
+                  self._dl_label, self._dl_ok_msg)
+
+    def program_loader(self):
+        # loader.bin is the FULL image and lands at 0x200000 (bank 0xE) -- the same
+        # region the BIOS card writes. That is destructive, so confirm first.
+        # XbDiag writes 0x400000 (a reserve) and needs no prompt.
+        if self.loader:
+            reply = QMessageBox.question(
+                self, APP_NAME,
+                "This downloads the current Eos loader image and writes it to "
+                "0x200000, replacing your whole BIOS image.\n\n"
+                "Any BIOS banks you have flashed will be overwritten.\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+        self._download_and_flash(LOADER_URL, LOADER_OFFSET,
+                                 "Loader", "Your Eos loader image is reflashed.",
+                                 prefix="loader_")
+
+    def program_xbdiag(self):
+        self._download_and_flash(XBDIAG_URL, XBDIAG_OFFSET,
+                                 "XbDiag", "XbDiag Lite is flashed.",
+                                 prefix="xbdlite_")
+
 
     def _run(self, argv, label, ok_msg):
         self.banner.setVisible(False)
@@ -451,15 +516,15 @@ class EosRecovery(QMainWindow):
 
     def _run_done(self, ok):
         self._busy(False)
-        # Remove the downloaded XbDiag temp image, if this run used one.
-        tmp = getattr(self, "_xbd_tmp", "")
+        # Remove the downloaded temp image, if this run used one (Loader or XbDiag).
+        tmp = getattr(self, "_tmp_image", "")
         if tmp:
             try:
                 if os.path.isfile(tmp):
                     os.remove(tmp)
             except OSError:
                 pass
-            self._xbd_tmp = ""
+            self._tmp_image = ""
         if ok:
             self._set_banner("\u2713  Done \u2014 %s" % self._ok_msg, True)
         else:
