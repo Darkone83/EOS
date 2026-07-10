@@ -491,9 +491,6 @@ src/
   eos_hdmi.cst          pin + IO constraints
   eos_hdmi.sdc          timing constraints
 
-  tb_eos_lpc_loader.v     testbench — modelled LPC master (10 tests)
-  tb_eos_sdram_backend.v  testbench — modelled flash + SDRAM (8 tests)
-
   dvi_tx/  gowin_rpll/  sdram_pll/    Gowin IP (generated)
 ```
 
