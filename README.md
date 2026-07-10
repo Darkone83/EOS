@@ -16,8 +16,6 @@ consoles. It reports in over the Xbox SMBus as a Darkone control device, and —
 screen plugged in — draws a live diagnostic dashboard over HDMI so you can watch exactly what
 it's doing.
 
-> Team Resurgent · Darkone83 · **Private — do not distribute**
-
 ---
 
 ## What's in the box
