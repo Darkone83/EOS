@@ -390,9 +390,6 @@ full-image loader-commit target, `0xD` is the XbDiag reserve, `0x0` is the overs
 region, `0xB`/`0xC` are the config bank-table and settings, and `0xF` is the descriptor block.
 Every physical target is `0x200000 + bank_base + offset`.
 
-> **Can't brick it.** JTAG/SRAM config always works no matter what's in flash, so a bad
-> bitstream is never fatal — reload SRAM to test a fix, then rewrite flash.
-
 ### Updating BIOS banks (in-system)
 
 Once a bootable image is on the board, you rewrite banks from a running console — push a new
@@ -435,21 +432,6 @@ python3 Tools/gen_hud.py Source/src/eos_serve_hud.v
 It emits the whole module (607 cells). Panels: title, boot/link, serve, flash engine, I2C
 engine, SDRAM preload, address-space serve map, serve log, stability.
 
-### Testbenches
-
-The LPC loader and the SDRAM backend have self-checking testbenches — an LPC bus master, an
-SPI flash, and the SDRAM, all modelled. Run them before flashing anything that changes the LPC
-path or the preload:
-
-```bash
-cd Source/src
-iverilog -g2005 -o lpc.out tb_eos_lpc_loader.v eos_lpc_loader.v && vvp lpc.out
-iverilog -g2005 -o be.out  tb_eos_sdram_backend.v eos_sdram_backend.v eos_flash_reader.v && vvp be.out
-```
-
-18 tests. The backend one checks every preloaded byte against the flash model, not just that
-preload finished — that's what caught the burst bugs during bring-up.
-
 ---
 
 ## Active Notes
@@ -477,12 +459,6 @@ which is decoded first — so **region-3 arm never runs**. This doesn't affect t
 only arms the **loader** and **XbDiag** regions (`0x10` / `0x20`). It does mean SETLOCK's bank
 lock has nothing to enforce against yet. Fixing it means giving bank-arm its own opcode, which
 is a firmware + updater change and is deliberately left for later.
-
-### sys_clk IO type
-
-The `.cst` sets `sys_clk` to `LVCMOS33`, but the file's own header note says pin 4 sits in a
-1.8 V bank and should be `LVCMOS18`. It builds and runs as-is, but if you touch the clock pin,
-work out which is actually right for your board rather than trusting either line.
 
 ---
 
@@ -520,38 +496,6 @@ src/
 
   dvi_tx/  gowin_rpll/  sdram_pll/    Gowin IP (generated)
 ```
-
-> `eos_stream_cache.v` is a leftover from an earlier serve path — it isn't in the project and
-> isn't built. `Eos.gprj.user` and `src/dvi_tx/temp/` are build artifacts, don't commit them.
-
----
-
-## Maintainer notes
-
-A few things in the RTL look like they could be tidied and shouldn't be. Each one bit during
-bring-up.
-
-- **The one-clock gap before the 1.6 abort window is on purpose.** LFRAME# must not be low
-  during the cycle-type phase, or the MCPX reads it as a new frame start and kills Eos's own
-  cycle. The window runs from address capture to the turnaround, per cycle, and lifts between
-  reads. That's correct.
-- **The two serve timeouts are a matched pair.** The backend drops a request it can't serve
-  (~15.8 µs) *before* the loader gives up on a stuck read (~61.4 µs). If the backend ever
-  answered after the loader walked away, that byte would land in a later, unrelated cycle and
-  serve the wrong data. Change one timeout, recompute the other.
-- **A pending read blocks the next flash byte** in the fill loops, rather than politely
-  waiting its turn — otherwise it loses the same race every pass and never gets served. The
-  wait states are different (the SDRAM is idle there) and serve freely, which is why serve
-  latency during a fill is a fraction of a microsecond.
-- **The flash reader starts a burst once, never mid-burst.** Restarting mid-burst drops CS and
-  re-issues the read command from the wrong address. Burst lengths are clamped to end on a
-  clean boundary so this can't happen.
-- **Don't add `always @(negedge <reset>)` anywhere.** It makes the reset pin synthesize as a
-  clock — unconstrained and prone to ringing. The dashboard's fault-capture had this once and
-  it caused phantom clock warnings; it's synchronised properly now.
-- **The dashboard's `WAIT_START` stays cheap on purpose.** This build treats any `0000` nibble
-  as a START, so a leftover data nibble can look like one; it self-corrects on the next nibble
-  only because the state does nothing heavy. Don't add logic there.
 
 ---
 
