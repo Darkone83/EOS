@@ -24,7 +24,7 @@
 #                               maxes at 0x1900000 so the slice is exact.
 #     - pd_t/pd_o via 7-bit intermediates, then sliced to 4b. pr1 <= 99.
 #
-# * PHASE 6 / F1: `always @(negedge lreset_n)` is GONE. It made GowinSynthesis
+# * `always @(negedge lreset_n)` is GONE. It made GowinSynthesis
 #   infer a CLOCK on lpc_lreset_n -- an unconstrained, bouncing, asynchronous pin
 #   driving a 12-bit counter and a capture register, and the source of three
 #   CK3000 warnings. On a warm reset LRESET can ring, so `resets` counted ring
@@ -33,7 +33,7 @@
 #   back. Consequence: the reset count needs LCLK running to register, which is
 #   true on a warm reset and false on a power-down. That is the right trade.
 #
-# * PHASE 6: removed the unused `mem_valid` input port (declared, connected by
+# * Removed the unused `mem_valid` input port (declared, connected by
 #   eos_hdmi_top, read nowhere) and the `failb` register (latched on reset, never
 #   displayed). If you re-add either, wire it to something.
 #
@@ -267,7 +267,7 @@ module eos_serve_hud (
         wtick<=wtick+1'b1;
         if (&wtick) begin rate<=rdcnt-rdcnt_prev; rdcnt_prev<=rdcnt; end
     end
-    // ---- LRESET fall detector, in the lclk domain (PHASE 6 / F1) ------------
+    // ---- LRESET fall detector, in the lclk domain -------------------------
     // This was `always @(negedge lreset_n)`, which synthesised lpc_lreset_n as a
     // clock net: unconstrained, asynchronous, and prone to ringing on a warm
     // reset. Synchronise and edge-detect on lclk instead. faila/resets are the
