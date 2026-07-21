@@ -86,7 +86,7 @@ needed.
 
 Connect to the LPC header: `LAD0–3`, `LCLK`, `LRESET#`, `LFRAME#`, plus `3.3V` and `GND`.
 
-Put a **22 kΩ resistor in-line on each of the six Xbox-driven inputs** — `LAD0–3`, `LCLK`, and
+Put a **22 Ω resistor in-line on each of the six Xbox-driven inputs** — `LAD0–3`, `LCLK`, and
 `LRESET#` — between the Xbox header and the Nano.
 
 > Only feed the board LPC **3.3V**. Don't back-power the 5V rail from USB.
@@ -96,7 +96,7 @@ Put a **22 kΩ resistor in-line on each of the six Xbox-driven inputs** — `LAD
 | Qty | Part | Why |
 |---|---|---|
 | 1 | Sipeed Tang Nano 20K (GW2AR-18C) | the modchip |
-| 6 | 22 kΩ resistor | in series on LAD0–3, LCLK, LRESET# |
+| 6 | 22 Ω resistor | in series on LAD0–3, LCLK, LRESET# |
 | 1 | SPST switch or jumper | revision select (open = 1.0–1.4, GND = 1.6) |
 | — | wire to the D0 point | 1.0–1.4 install (ground it, or drive it from `lpc_d0`) |
 | — | wire to LFRAME# + LPC rebuild | 1.6 install |
