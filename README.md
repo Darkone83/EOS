@@ -414,7 +414,8 @@ project, constraints, and programmer — a mismatch is the usual "won't configur
    synthesis, and a missing one silently zero-fills (a blank dashboard, for instance):
    `eos_font.hex`, `eos_attr.hex`, `eos_logo.hex`, `eos_screen.hex`.
 3. Apply `eos_hdmi.cst` and `eos_hdmi.sdc`.
-4. Synthesize → Place & Route → generate the bitstream (`.fs`).
+4. Under Project configuration -> Bitstream -> sysControl set Loading Rate to 62.5MHz
+5. Synthesize → Place & Route → generate the bitstream (`.fs`).
 
 A clean build produces **no synthesis warnings**. If width-truncation, unused-input, or
 clock-relationship warnings come back, something regressed — the maintainer notes at the bottom
