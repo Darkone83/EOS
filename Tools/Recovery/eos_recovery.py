@@ -61,8 +61,10 @@ def _server_url(leaf):
 
 LOADER_LEAF  = "loader.bin"
 XBDIAG_LEAF  = "xbdlite.bin"
+BITSTREAM_LEAF = "Eos.fs"           # gateware bitstream on the Darkone server
 LOADER_URL   = _server_url(LOADER_LEAF)
 XBDIAG_URL   = _server_url(XBDIAG_LEAF)
+BITSTREAM_URL = _server_url(BITSTREAM_LEAF)
 ACCENT       = "#A855F7"          # Darkone purple  rgb(168,85,247)
 ACCENT_DIM   = "#7E3FBF"
 OK_GREEN     = "#22C55E"
@@ -239,53 +241,49 @@ class EosRecovery(QMainWindow):
         topbar.addLayout(st); topbar.addSpacing(10); topbar.addWidget(self.refreshBtn)
         col.addLayout(topbar)
 
-        # bitstream card
+        # ---- Bitstream (FPGA) : local file OR server, one card ----
         self.bitPath = QLineEdit(self.settings.value("bit_path", "", str))
         self.bitPath.setPlaceholderText("Select the Eos bitstream  (eos.fs)")
-        self.bitBtn  = QPushButton("Program Bitstream")
-        self.bitBtn.setObjectName("primary")
+        self.bitBtn  = QPushButton("Program"); self.bitBtn.setObjectName("primary")
         self.bitBtn.clicked.connect(self.program_bitstream)
-        col.addWidget(self._file_card(
+        self.bitOnlineBtn = QPushButton("Update from Server"); self.bitOnlineBtn.setObjectName("primary")
+        self.bitOnlineBtn.clicked.connect(self.program_bitstream_online)
+        col.addWidget(self._unit_card(
             "Bitstream (FPGA)",
-            "Recovers a bricked or blank FPGA design. Safe to run anytime.",
-            self.bitPath, self.bitBtn, browse_filter="Bitstream (*.fs *.bit);;All files (*.*)",
-            offset_field=None))
+            "Recovers a bricked or blank FPGA design. Flash a local eos.fs, or pull the "
+            "latest from the Darkone server. Safe to run anytime.",
+            path_edit=self.bitPath, browse_filter="Bitstream (*.fs *.bit);;All files (*.*)",
+            local_btn=self.bitBtn,
+            server_btn=self.bitOnlineBtn,
+            server_hint="No file? Update the gateware to the latest release:"))
 
-        # bios card
+        # ---- BIOS / Loader (bank 0xE @ 0x200000) : local file OR server, one card ----
         self.biosPath = QLineEdit(self.settings.value("bios_path", "", str))
-        self.biosPath.setPlaceholderText("Select the Eos BIOS image  (eos.bin)")
+        self.biosPath.setPlaceholderText("Select a BIOS / loader image  (eos.bin)")
         self.biosOff  = QLineEdit(self.settings.value("bios_off", BIOS_OFFSET, str))
         self.biosOff.setFixedWidth(110)
-        self.biosBtn  = QPushButton("Program BIOS")
-        self.biosBtn.setObjectName("primary")
+        self.biosBtn  = QPushButton("Program"); self.biosBtn.setObjectName("primary")
         self.biosBtn.clicked.connect(self.program_bios)
-        col.addWidget(self._file_card(
-            "BIOS (external flash)",
-            "Recovers the Eos loader/BIOS image. Programmed at the offset below.",
-            self.biosPath, self.biosBtn, browse_filter="BIOS image (*.bin);;All files (*.*)",
-            offset_field=self.biosOff))
-
-        # loader card (pulled from server -- no local file)
-        self.loaderBtn = QPushButton("Download + Flash Loader")
-        self.loaderBtn.setObjectName("primary")
+        self.loaderBtn = QPushButton("Download Latest"); self.loaderBtn.setObjectName("primary")
         self.loaderBtn.clicked.connect(self.program_loader)
-        col.addWidget(self._server_card(
-            "Loader / BIOS image (external flash)",
-            "Downloads the current Eos loader image from the Darkone server and flashes "
-            "it to bank 0xE (0x200000). No file needed \u2014 use this if you have no "
-            "eos.bin to hand. This replaces the whole BIOS image, so it will ask you "
-            "to confirm.",
-            self.loaderBtn))
+        col.addWidget(self._unit_card(
+            "BIOS / Loader image  (bank 0xE, 0x200000)",
+            "Writes the loader/BIOS image to bank 0xE. Flash your own eos.bin at the "
+            "offset below, or download the current Eos loader from the server. Either "
+            "way this replaces the whole BIOS image.",
+            path_edit=self.biosPath, browse_filter="BIOS image (*.bin);;All files (*.*)",
+            offset_field=self.biosOff, local_btn=self.biosBtn,
+            server_btn=self.loaderBtn,
+            server_hint="No eos.bin to hand? Pull the current loader image:"))
 
-        # xbdiag card (pulled from server -- no local file)
-        self.xbdBtn = QPushButton("Download + Flash XbDiag")
-        self.xbdBtn.setObjectName("primary")
+        # ---- XbDiag Lite (bank 0xD) : server only, one card ----
+        self.xbdBtn = QPushButton("Download + Flash"); self.xbdBtn.setObjectName("primary")
         self.xbdBtn.clicked.connect(self.program_xbdiag)
-        col.addWidget(self._server_card(
-            "XbDiag Lite (external flash)",
-            "Downloads XbDiag Lite from the Darkone server and flashes it to bank "
-            "0xD (0x400000). No file needed \u2014 use this to install or recover XbDiag.",
-            self.xbdBtn))
+        col.addWidget(self._unit_card(
+            "XbDiag Lite  (bank 0xD, 0x400000)",
+            "Downloads XbDiag Lite from the Darkone server and flashes it to bank 0xD. "
+            "No file needed \u2014 use this to install or recover XbDiag.",
+            server_btn=self.xbdBtn))
 
         # banner
         self.banner = QLabel("")
@@ -309,6 +307,47 @@ class EosRecovery(QMainWindow):
             self._log("WARNING: openFPGALoader was not found next to this program "
                       "or on your PATH. Place openFPGALoader%s in this folder."
                       % (".exe" if os.name == "nt" else ""))
+
+    def _unit_card(self, title, desc, *, path_edit=None, browse_filter=None,
+                   offset_field=None, local_btn=None, server_btn=None,
+                   server_hint=None):
+        """One card per function. Optional local row (Browse [+ Offset] + local_btn)
+        and/or an online row (server_hint + server_btn). Keeps each function to a
+        single card instead of a local card + a server card."""
+        card = Card()
+        g = QGridLayout(card); g.setContentsMargins(18, 16, 18, 16)
+        g.setHorizontalSpacing(10); g.setVerticalSpacing(10)
+        t = QLabel(title); t.setStyleSheet("font-size:15px;font-weight:700;color:%s;" % TEXT)
+        d = QLabel(desc);  d.setStyleSheet("color:%s;font-size:11px;" % MUTED); d.setWordWrap(True)
+        g.addWidget(t, 0, 0, 1, 3)
+        g.addWidget(d, 1, 0, 1, 3)
+        row = 2
+        # --- local file row (optional) ---
+        if path_edit is not None:
+            browse = QPushButton("Browse\u2026"); browse.setObjectName("ghost")
+            browse.clicked.connect(lambda: self._browse(path_edit, browse_filter))
+            g.addWidget(path_edit, row, 0)
+            g.addWidget(browse,    row, 1)
+            if offset_field is not None:
+                off_row = QHBoxLayout(); off_row.setSpacing(6)
+                ol = QLabel("Offset"); ol.setStyleSheet("color:%s;font-size:11px;" % MUTED)
+                off_row.addWidget(ol); off_row.addWidget(offset_field); off_row.addStretch(1)
+                row += 1
+                g.addLayout(off_row, row, 0, 1, 2)
+                g.addWidget(local_btn, row, 2)
+            else:
+                g.addWidget(local_btn, row, 2)
+            row += 1
+        # --- online row (optional): a subtle divider label + the server button ---
+        if server_btn is not None:
+            if server_hint:
+                h = QLabel(server_hint)
+                h.setStyleSheet("color:%s;font-size:11px;" % MUTED); h.setWordWrap(True)
+                g.addWidget(h, row, 0, 1, 2)
+            g.addWidget(server_btn, row, 2)
+            row += 1
+        g.setColumnStretch(0, 1)
+        return card
 
     def _file_card(self, title, desc, path_edit, prog_btn, browse_filter, offset_field):
         card = Card()
@@ -432,6 +471,36 @@ class EosRecovery(QMainWindow):
         self.settings.setValue("bit_path", path)
         self._run([self.loader, "-b", BOARD, "-f", path],
                   "Bitstream", "Your Eos FPGA is reflashed.")
+
+    def program_bitstream_online(self):
+        """Download the current bitstream (Eos.fs) from the server, then program
+        the FPGA flash with it. Unlike the loader/XbDiag images (which flash to a
+        SPI offset via --external-flash), the bitstream is written with the plain
+        `-f` command, so it uses its own download-then-flash path."""
+        if not self.loader:
+            QMessageBox.warning(self, APP_NAME,
+                "openFPGALoader was not found. Place it in this folder and reopen.")
+            return
+        self.banner.setVisible(False)
+        self._busy(True)
+        self._log("\n$ download %s" % BITSTREAM_URL)
+        self._dl_label  = "Bitstream"
+        self._dl_ok_msg = "Your Eos FPGA is reflashed."
+        self._dl = DownloadWorker(BITSTREAM_URL, prefix="bitstream_")
+        self._dl.line.connect(self._log)
+        self._dl.finished.connect(self._server_bitstream_downloaded)
+        self._dl.start()
+
+    def _server_bitstream_downloaded(self, ok, tmp_path):
+        if not ok:
+            self._busy(False)
+            self._set_banner("\u2717  Bitstream download failed \u2014 check the activity log.", False)
+            return
+        # Flash the freshly-downloaded bitstream with the plain -f command.
+        # _run_done removes the temp file.
+        self._tmp_image = tmp_path
+        self._run([self.loader, "-b", BOARD, "-f", tmp_path],
+                  self._dl_label, self._dl_ok_msg)
 
     def program_bios(self):
         path = self.biosPath.text().strip()
