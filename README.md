@@ -195,11 +195,11 @@ serving · **blue** is up and idle. The write/sync purple is the project accent 
 ## Pinmap
 
 Taken straight from `eos_hdmi.cst`. That file is the source of truth — check against it before
-you wire anything. "Series 22k" marks the Xbox-driven inputs that take an in-line resistor.
+you wire anything. "Series 22" marks the Xbox-driven inputs that take an in-line resistor.
 
 ### Xbox LPC
 
-| Signal | Port | Pin | 22k | Pad settings |
+| Signal | Port | Pin | 22 | Pad settings |
 |---|---|---|:---:|---|
 | `LAD0` | `lpc_lad[0]` | 25 | ✔ | pull-up, hysteresis (bidirectional) |
 | `LAD1` | `lpc_lad[1]` | 26 | ✔ | pull-up, hysteresis |
