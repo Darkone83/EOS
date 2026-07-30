@@ -57,7 +57,8 @@ needed.
 - **Xenium-style bank select** — the bank register lives at I/O `0xEF` (low nibble = bank),
   the same convention Xenium-family tools expect. It's a clean-room implementation of that
   convention — it is **not** OpenXenium.
-- **SD Card BIOS loading** - Place your favorite BIOSs on a FAT32 formatted MicroSD card and boot directly from the SD Card	 no flashing needed.
+- **SD Card BIOS loading** - Place your favorite BIOSs on a FAT32 formatted MicroSD card and
+  boot directly from the SD Card no flashing needed.
 - **In-system flashing** — an I/O path (`0xEC`/`0xED`) lets the Xbox side erase, write, read,
   and verify the backing flash, so you never need a programmer after the first flash.
 - **Only answers its own ports** — Eos claims exactly `0x00EC`–`0x00EF` and nothing else, so
@@ -193,7 +194,11 @@ serving · **blue** is up and idle. The write/sync purple is the project accent 
 
 ### Status RGB LED (pin 29)
 
-The Status led is fully programable per bank. Once a BIOS is flashed you can set a color via Bank Management or from the WebUI. Choose from 11 colors and OFF. 3 Banks have pre determined colors that are not changable via the Loader or the WebUI. Recovery = White, breathing, XbDiag Lite = Purple, breathing, and SD Card = Magenta, breating.
+The Status RGB LED is fully programmable per bank. Once a BIOS is flashed, you can set a color 
+via Bank Management or from the WebUI. Choose from 11 colors and OFF. 3 Banks have predetermined 
+colors that are not changeable via the Loader or the WebUI. Recovery = White, breathing, 
+XbDiag Lite = Purple, breathing, and SD Card = Magenta, breathing.
+
 ---
 
 ## Pinmap
