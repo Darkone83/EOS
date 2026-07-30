@@ -11,14 +11,38 @@
 // Device address = DEV_ADDR (7-bit, default 0x6E -> 8-bit 0xDC write / 0xDD read,
 // "DC" = Darkone Customs). Change via the parameter if SmBusScan finds a clash.
 //
-// Register map:
-//   0x00 MAGIC     (R) 0xD8   Darkone signature
-//   0x01 VER_MAJOR (R) 1
-//   0x02 VER_MINOR (R) 0
-//   0x03 VER_PATCH (R) 0      -> base firmware 1.0.0
-//   0x04 STATUS    (R) {live status bits from the top}
-//   0x10 CMD       (W) latched opcode; pulses cmd_stb
-//   0x11..0x14 ARG0..3 (W) latched command args
+// Register map (read side):
+//   0x00 MAGIC      (R) 0xD8   Darkone signature
+//   0x01 VER_MAJOR  (R) 1
+//   0x02 VER_MINOR  (R) 0
+//   0x03 VER_PATCH  (R) 1      -> base firmware 1.0.0
+//   0x04 STATUS     (R) live bits from the top, low->high:
+//                       preload_done, mode_16, d0_active, abort_active,
+//                       slot1_ready; top 3 bits 0.
+//   0x05 ENGINE     (R) update-engine flags: armed, staged_valid, crc_set,
+//                       eng_busy, err_flag, commit_ok
+//   0x06 COMMIT     (R) {commit_bank[3:0], armed_region[3:0]}
+//   0x07..0x0A CRC32 (R) streaming CRC-32 result, low byte first
+//   0x0B..0x0C LOCK  (R) lock-mask, low byte first (default 0x0402)
+//   0x10 CMD        (R) reads back the last opcode
+//   0x11..0x14 ARG0..3 (R) read back the last command args
+//
+// Command opcodes (write to 0x10, args in 0x11..0x14):
+//   0x01 PING              liveness, no state change
+//   0x02 / 0x03 ABORT/CLEAR disarm + invalidate the staged image
+//   0x38 LEDMODE          arg0: 0 normal, 1 rainbow
+//   0x39 DESCRELOAD       re-read the descriptor block
+//   0x3A SETBANKCOLOR     arg0=bank(1..4) arg1=R arg2=G arg3=B -> stage a color,
+//                         pulse set_color_stb (top commits to the LEDCFG block)
+//   0xN0/0xN1/0xN4 ARM/SETCRC/COMMIT  update flow for region N
+//                       (region 1 = loader, 2 = XbDiag)
+//
+// KNOWN OPCODE ISSUES (see the firmware README's Active Notes):
+//   * SELECT (0x30), BOOTMODE (0x36), SETLOCK (0x37) latch cleanly but their
+//     outputs are not consumed by anything on the FPGA yet.
+//   * SELECT (0x30) is decoded before the generic ARM case, so ARM for an
+//     arbitrary bank (region 3 -> opcode 0x30) can never run. The updater only
+//     arms regions 1 and 2, so this does not affect it.
 //
 // SDA is open-drain: sda_oe=1 pulls the line LOW, sda_oe=0 releases (Hi-Z). SCL
 // is input only (no clock stretching). Runs on a fast sample clock (>= ~16x SCL;
@@ -29,7 +53,7 @@ module eos_i2c #(
     parameter [7:0] MAGIC     = 8'hD8,     // Darkone signature
     parameter [7:0] VER_MAJOR = 8'd1,
     parameter [7:0] VER_MINOR = 8'd0,
-    parameter [7:0] VER_PATCH = 8'd0
+    parameter [7:0] VER_PATCH = 8'd1
 )(
     input  wire        clk,
     input  wire        resetn,
@@ -66,7 +90,10 @@ module eos_i2c #(
     output reg  [1:0]  boot_mode,    // BOOTMODE (0x36)
     output reg  [15:0] lock_mask,    // locked-bank bitmask (boot+recovery default)
     output reg  [1:0]  led_mode,     // LEDMODE (0x38): 0=normal, 1=rainbow
-    output reg         desc_reload   // DESCRELOAD (0x39): 1-clk pulse -> FPGA re-reads descriptor
+    output reg         desc_reload,  // DESCRELOAD (0x39): 1-clk pulse -> FPGA re-reads descriptor
+    output reg  [2:0]  set_color_bank, // SETBANKCOLOR (0x3A): target bank 1..4
+    output reg  [23:0] set_color_rgb,  // packed {R,G,B}
+    output reg         set_color_stb   // 1-clk pulse when 0x3A is issued
 );
     // ---- line sync + edge / start-stop detect --------------------------------
     reg [2:0] sda_ss = 3'b111, scl_ss = 3'b111;
@@ -288,11 +315,13 @@ module eos_i2c #(
             crc_go<=1'b0; crc_len<=21'd0; commit_go<=1'b0; commit_bank<=4'd0;
             commit_pages<=13'd0; scr_clear<=1'b0; sel_bank<=4'd0; boot_mode<=2'd0;
             lock_mask<=LOCK_DEFAULT; led_mode<=2'd0; desc_reload<=1'b0;
+            set_color_bank<=3'd0; set_color_rgb<=24'd0; set_color_stb<=1'b0;
         end else begin
             crc_go    <= 1'b0;
             commit_go <= 1'b0;
             scr_clear <= 1'b0;
             desc_reload <= 1'b0;
+            set_color_stb <= 1'b0;
 
             if (cmd_stb) begin
                 if (cmd == 8'h01) begin
@@ -311,6 +340,12 @@ module eos_i2c #(
                     led_mode <= arg0[1:0];                    // LEDMODE (0=normal,1=rainbow)
                 end else if (cmd == 8'h39) begin
                     desc_reload <= 1'b1;                      // DESCRELOAD: pulse re-read
+                end else if (cmd == 8'h3A) begin
+                    // SETBANKCOLOR: stage bank+RGB and pulse. Only banks 1..4 are
+                    // user-colorable; other values are ignored by the consumer.
+                    set_color_bank <= arg0[2:0];
+                    set_color_rgb  <= {arg1, arg2, arg3};     // R,G,B
+                    set_color_stb  <= 1'b1;
                 end else if (cmd == 8'h37) begin
                     lock_mask[arg0[3:0]] <= arg1[0];          // SETLOCK
                 end else begin

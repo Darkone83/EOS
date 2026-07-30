@@ -8,6 +8,7 @@
         <File path="src/dvi_tx/dvi_tx.v" type="file.verilog" enable="1"/>
         <File path="src/eos_attr_buffer.v" type="file.verilog" enable="1"/>
         <File path="src/eos_bank_ctrl.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_bank_led.v" type="file.verilog" enable="1"/>
         <File path="src/eos_boot_ctrl.v" type="file.verilog" enable="1"/>
         <File path="src/eos_char_buffer.v" type="file.verilog" enable="1"/>
         <File path="src/eos_crc32.v" type="file.verilog" enable="1"/>
@@ -18,6 +19,8 @@
         <File path="src/eos_i2c.v" type="file.verilog" enable="1"/>
         <File path="src/eos_logo_rom.v" type="file.verilog" enable="1"/>
         <File path="src/eos_lpc_loader.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_sd_precache.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_sd_spi.v" type="file.verilog" enable="1"/>
         <File path="src/eos_sdram_backend.v" type="file.verilog" enable="1"/>
         <File path="src/eos_sdram_pll.v" type="file.verilog" enable="1"/>
         <File path="src/eos_serve_hud.v" type="file.verilog" enable="1"/>

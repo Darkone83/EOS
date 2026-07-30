@@ -15,7 +15,7 @@
 //   SYNC_ABORT    1010   (timeout only)
 //
 // =============================================================================
-// PHASE 2 -- THE STALL CLASS. Read this before touching any of it.
+// STALL / TIMEOUT HANDLING. Read this before touching any of it.
 // =============================================================================
 //
 // (1) SYNCING now has a timeout.
@@ -46,7 +46,7 @@
 //     The gate here is the second line of defence. KEEP BOTH.
 //
 // =============================================================================
-// PHASE 3 -- I/O PORT DECODE
+// I/O PORT DECODE
 // =============================================================================
 //
 //     The I/O decode used to be:
@@ -94,7 +94,7 @@
 //
 //   * I/O decode is an exact 16-bit match on 0x00EC..0x00EF. It used to test
 //     only lpc_addr[7:4]==0xE and the low two bits, which claimed 1024 ports
-//     (0x01EC, 0x02EF, 0x80EE, ...) rather than 4. See PHASE 3 below.
+//     (0x01EC, 0x02EF, 0x80EE, ...) rather than 4. See the I/O PORT DECODE note.
 //
 //   * D0 is externally grounded on this build; the FPGA does not drive it.
 
@@ -408,8 +408,9 @@ module eos_lpc_loader #(
                 //   count 1 : A7:A4
                 //   count 0 : A3:A0
                 //
-                // The I/O port decode is an EXACT 16-bit match (see PHASE 3 in
-                // the header). io_port is the full address: the upper 12 bits are
+                // The I/O port decode is an EXACT 16-bit match (see the I/O PORT
+                // DECODE note in the header). io_port is the full address: the
+                // upper 12 bits are
                 // already registered in lpc_addr, the last nibble is live on LAD.
                 // -------------------------------------------------------------
                 ADDRESS: begin

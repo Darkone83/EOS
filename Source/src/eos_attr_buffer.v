@@ -1,6 +1,7 @@
-// eos_attr_buffer.v -- per-cell 3-bit colour attribute store, parallel to the
-// char buffer. Write port = HUD/LPC domain, read port = pixel domain.
-// 160x45 = 7200 cells. Power-on contents from eos_attr.hex (all 0 = NORMAL).
+// eos_attr_buffer.v -- per-cell colour attribute store, parallel to the char
+// buffer. Write port = HUD/LPC domain, read port = pixel domain. 160x45 = 7200
+// cells. The memory is 4 bits wide (see note below); the ports expose the low 3
+// bits. Power-on contents from eos_attr.hex (all 0 = NORMAL).
 module eos_attr_buffer #(
     parameter AW    = 13,
     parameter DEPTH = 7200

@@ -89,7 +89,7 @@ module eos_serve_hud (
         wtick<=wtick+1'b1;
         if (&wtick) begin rate<=rdcnt-rdcnt_prev; rdcnt_prev<=rdcnt; end
     end
-    // ---- LRESET fall detector, in the lclk domain (PHASE 6 / F1) ------------
+    // ---- LRESET fall detector, in the lclk domain -------------------------
     // This was `always @(negedge lreset_n)`, which synthesised lpc_lreset_n as a
     // clock net: unconstrained, asynchronous, and prone to ringing on a warm
     // reset. Synchronise and edge-detect on lclk instead. faila/resets are the

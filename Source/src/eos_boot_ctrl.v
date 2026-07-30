@@ -5,12 +5,19 @@
 // NO D0 logic here (D0 is owned by the top).
 //
 // This is the ModXo model, which is the known-good reference on the target rig:
-// ModXo's PIO asserts LFRAME (side 0) the instant it decodes a memory-read
-// cycle-type it will serve, HOLDS it through the address nibbles AND the data it
-// drives back, and releases (side 1) only at the end of the transaction. It is a
-// HELD WINDOW, not a fixed-width pulse -- a short pulse lets the Xyclops re-engage
-// mid-cycle and fight the serve. serving_mem (from eos_lpc_loader) is exactly that
-// window: high from cycle-type decode through TAR_EXIT, mem-read only.
+// ModXo holds LFRAME across the whole served transaction rather than pulsing it,
+// so the Xyclops can't re-engage mid-cycle and fight the serve. serving_mem (from
+// eos_lpc_loader) is that held window.
+//
+// EXACT WINDOW (verified against eos_lpc_loader, not the intent): serving_mem is
+// high from the ADDRESS state through TAR_EXIT, for memory cycles only. It is LOW
+// during CYCTYPE -- the one clock right after START -- and low again in
+// WAIT_START. So LFRAME# is NOT asserted the instant the cycle-type is decoded;
+// it comes up one clock later, at ADDRESS. That one-clock gap is deliberate and
+// load-bearing: asserting LFRAME# during CYCTYPE reads as a fresh frame-start to
+// the MCPX and aborts the serve. LFRAME# also lifts in the gap between
+// consecutive boot reads -- it is a per-cycle held window, not one continuous
+// hold across a burst.
 //
 //     lframe_oe = mode_16 & serving_mem
 //

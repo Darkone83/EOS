@@ -57,6 +57,7 @@ needed.
 - **Xenium-style bank select** — the bank register lives at I/O `0xEF` (low nibble = bank),
   the same convention Xenium-family tools expect. It's a clean-room implementation of that
   convention — it is **not** OpenXenium.
+- **SD Card BIOS loading** - Place your favorite BIOSs on a FAT32 formatted MicroSD card and boot directly from the SD Card	 no flashing needed.
 - **In-system flashing** — an I/O path (`0xEC`/`0xED`) lets the Xbox side erase, write, read,
   and verify the backing flash, so you never need a programmer after the first flash.
 - **Only answers its own ports** — Eos claims exactly `0x00EC`–`0x00EF` and nothing else, so
@@ -190,6 +191,9 @@ serving · **blue** is up and idle. The write/sync purple is the project accent 
 > The amber preload is quick now — about a second. If it hangs there for several seconds
 > something's wrong with the flash read path.
 
+### Status RGB LED (pin 29)
+
+The Status led is fully programable per bank. Once a BIOS is flashed you can set a color via Bank Management or from the WebUI. Choose from 11 colors and OFF. 3 Banks have pre determined colors that are not changable via the Loader or the WebUI. Recovery = White, breathing, XbDiag Lite = Purple, breathing, and SD Card = Magenta, breating.
 ---
 
 ## Pinmap
@@ -473,8 +477,11 @@ src/
   eos_lpc_loader.v      LPC cycle decode + serve; drives the 1.6 LFRAME abort
   eos_boot_ctrl.v       1.6 LFRAME# abort (mode16_n-gated)
   eos_bank_ctrl.v       0xEF bank register + address map + flash write engine
+  eos_bank_led.v        Bank and status LED framework and command set
   eos_flash_cmd.v       flash command bridge (0xEC/0xED) + scratch staging
   eos_flash_reader.v    SPI flash read path (burst reads with backpressure)
+  eos_sd_spi.v			SPI framework to allow raw LBA / byte access to the SD Card
+  eos_sd_precache.v		SD precaching framewrok for SDRAM precache
   eos_sdram_backend.v   SDRAM serve + preload + scratch
   eos_sdram_pll.v       SDRAM PLL wrapper
   sdram.v               SDRAM controller

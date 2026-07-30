@@ -6,7 +6,7 @@
 // SCK divided by SCK_DIV; MISO sampled at end of SCK-high for clean alignment.
 //
 // -----------------------------------------------------------------------------
-// PHASE 4: 'stall' -- backpressure for multi-byte bursts.
+// 'stall' -- backpressure for multi-byte bursts.
 // -----------------------------------------------------------------------------
 // With len > 1 the reader emits a byte every 8*PERIOD clocks whether or not the
 // sink is ready. 'stall' lets the sink hold the burst:
@@ -24,7 +24,7 @@
 // Therefore AT MOST ZERO further bytes are produced after stall asserts, and a
 // one-entry sink buffer can never overflow. No FIFO is required.
 //
-// Tie stall = 1'b0 to restore the pre-Phase-4 behaviour exactly.
+// Tie stall = 1'b0 to restore the original single-byte behaviour exactly.
 // -----------------------------------------------------------------------------
 module eos_flash_reader #(
     parameter         FLASH_BASE = 24'h200000,

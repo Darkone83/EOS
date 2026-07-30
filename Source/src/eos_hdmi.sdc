@@ -12,7 +12,7 @@
 // lpc_lreset_n used to appear here as a phantom clock: eos_serve_hud contained
 // `always @(negedge lreset_n)`, so GowinSynthesis built a clock net on an
 // unconstrained, bouncing async pin. That block now synchronises into lclk and
-// edge-detects (Phase 6 / F1), so the three CK3000 warnings are gone. If they
+// edge-detects, so the three CK3000 warnings are gone. If they
 // come back, someone reintroduced a negedge-of-a-reset always block.
 //
 // Keep sys_clk at LVCMOS33 in the CST because SDRAM/bank VCCIO requires 3.3 V.

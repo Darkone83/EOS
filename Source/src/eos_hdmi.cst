@@ -53,6 +53,22 @@ IO_LOC  "led[5]" 20;  IO_PORT "led[5]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
 // ---- WS2812 status LED  (PIN79 = IOT27B/GCLKC_0) ----
 IO_LOC  "ws2812" 79;
 IO_PORT "ws2812" IO_TYPE=LVCMOS33 DRIVE=8;
+// ---- Bank-selection WS2812 (external, PIN 29) ----
+IO_LOC  "ws2812_bank" 29;
+IO_PORT "ws2812_bank" IO_TYPE=LVCMOS33 DRIVE=8;
+
+
+// ---- On-board microSD slot, SPI mode (eos_sd_spi.v, via eos_sd_precache.v).
+//      Named card_* -- NOT sd_* -- because eos_sdram_backend.v already owns
+//      sd_busy/sd_refresh/NRGN_SD for the unrelated SDRAM refresh state
+//      machine; reusing sd_* here would collide. D1/D2 (pins 85/80) are
+//      unused in SPI mode and left unconstrained/unconnected -- no top-level
+//      port drives or reads them. If reads are ever flaky on hardware, that's
+//      the first thing to revisit (add them as NC ports with PULL_MODE=UP).
+IO_LOC  "card_sck"   83;  IO_PORT "card_sck"   IO_TYPE=LVCMOS33 DRIVE=8;
+IO_LOC  "card_mosi"  82;  IO_PORT "card_mosi"  IO_TYPE=LVCMOS33 DRIVE=8;
+IO_LOC  "card_miso"  84;  IO_PORT "card_miso"  IO_TYPE=LVCMOS33 PULL_MODE=UP;
+IO_LOC  "card_cs_n"  81;  IO_PORT "card_cs_n"  IO_TYPE=LVCMOS33 DRIVE=8;
 
 // ---- On-board 64Mbit SPI flash, via the dedicated MSPI config pins ----
 // Flash U2:  CLK<-MCLK(59)  ~CS<-MCS_N(60)  DI(MOSI)<-MO(61)  DO(MISO)->MI(62)

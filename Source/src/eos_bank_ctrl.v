@@ -6,6 +6,8 @@
 // does not -- writing the flash:
 //   * ERASE a bank   (loop 64K block-erase 0xD8 over the bank's size)
 //   * PROGRAM a page (0x02, a 256-byte page from the page buffer)
+//   * READ a page    (0x03, clock 256 bytes back into the page buffer for host
+//                     read-back; cmd_op = 2)
 //   * real STATUS poll (0x05, wait WIP bit0 clear after every erase/program)
 //   * HARD floor guard: every physical target is FLOOR + bank_base + offset, so
 //     it is impossible to address below FLOOR. Chip-erase is not implemented.
@@ -62,6 +64,12 @@ module eos_bank_ctrl #(
     output wire [3:0]  ext_anchor,     // 1 = this slot is an oversized anchor
     output wire [7:0]  ext_szc,        // 2 bits per slot: size code (512K/1MB)
     output wire [95:0] ext_base,       // 24 bits per slot: phys base rel FLOOR
+    // Bank-LED user colors, packed RGB {R,G,B}. FF,FF,FF = unset (LED off).
+    // Read from the descriptor block at boot (and on desc_reload). Blank -> FF.
+    output reg  [23:0] bank1_rgb,
+    output reg  [23:0] bank2_rgb,
+    output reg  [23:0] bank3_rgb,
+    output reg  [23:0] bank4_rgb,
     output reg         bus_req,
     input  wire        bus_gnt,
     output reg         flash_cs_n,
@@ -255,9 +263,12 @@ module eos_bank_ctrl #(
                // ---- boot-time descriptor load (Pass 1) ----
                S_DBOOT=5'd24,   // wait for bus grant, start read
                S_DCMD=5'd25,S_DA2=5'd26,S_DA1=5'd27,S_DA0=5'd28,
-               S_DRD=5'd29,S_DCAP=5'd30,S_DFIN=5'd31;
+               S_DRD=5'd29,S_DCAP=5'd30,S_DFIN=5'd31,
+               // ---- boot-time LED color-block load (after descriptor) ----
+               S_LBOOT=6'd32,S_LCMD=6'd33,S_LA2=6'd34,S_LA1=6'd35,S_LA0=6'd36,
+               S_LRD=6'd37,S_LCAP=6'd38,S_LFIN=6'd39;
 
-    reg [4:0]  st, ret; reg [1:0] op_l;
+    reg [5:0]  st, ret; reg [1:0] op_l;
     reg [23:0] addr_l; reg [8:0] blocks_left; reg [8:0] pbyte;
     reg [23:0] flashed_base, flashed_len;
     reg [8:0]  rd_idx;     // read-back byte counter (0..256)
@@ -288,6 +299,8 @@ module eos_bank_ctrl #(
             addr_l<=0; blocks_left<=0; pbyte<=0; op_l<=0; flashed_base<=0; flashed_len<=0; ret<=S_IDLE;
             rd_we<=0; rd_waddr<=0; rd_wdata<=0; rd_idx<=0;
             db_idx<=0; desc_loaded<=0; descriptor_valid<=0; reload_pending<=0;
+            bank1_rgb<=24'hFFFFFF; bank2_rgb<=24'hFFFFFF;
+            bank3_rgb<=24'hFFFFFF; bank4_rgb<=24'hFFFFFF;
         end else begin
             done<=1'b0; refresh_req<=1'b0; shift_go<=1'b0; rd_we<=1'b0;
             // Latch a descriptor re-read request from the i2c domain. Consumed only
@@ -454,8 +467,24 @@ module eos_bank_ctrl #(
                     end else begin
                         descriptor_valid<=1'b0;   // blank/invalid -> legacy
                     end
+                    // LED bank colors live in the SAME descriptor block: a color
+                    // sub-magic 'C','O','L','R' at 0x2C..0x2F, then 4x RGB at 0x30.
+                    // If the sub-magic is absent (older descriptor / blank) the
+                    // colors default to FF,FF,FF = unset -> LED off.
+                    if (db_buf[6'h2C]==8'h43 && db_buf[6'h2D]==8'h4F &&
+                        db_buf[6'h2E]==8'h4C && db_buf[6'h2F]==8'h52) begin
+                        bank1_rgb<={db_buf[6'h30],db_buf[6'h31],db_buf[6'h32]};
+                        bank2_rgb<={db_buf[6'h33],db_buf[6'h34],db_buf[6'h35]};
+                        bank3_rgb<={db_buf[6'h36],db_buf[6'h37],db_buf[6'h38]};
+                        bank4_rgb<={db_buf[6'h39],db_buf[6'h3A],db_buf[6'h3B]};
+                    end else begin
+                        bank1_rgb<=24'hFFFFFF; bank2_rgb<=24'hFFFFFF;
+                        bank3_rgb<=24'hFFFFFF; bank4_rgb<=24'hFFFFFF;
+                    end
+                    bus_req<=1'b0;
                     st<=S_IDLE;
                 end
+
 
                 default: st<=S_IDLE;
             endcase

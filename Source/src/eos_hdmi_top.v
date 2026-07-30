@@ -35,6 +35,13 @@ module eos_hdmi_top (
     input              flash_miso,
 
     output             ws2812,
+    output             ws2812_bank,
+
+    // ---- onboard microSD slot, SPI mode (eos_sd_spi.v) ----
+    output             card_sck,
+    output             card_mosi,
+    input              card_miso,
+    output             card_cs_n,
 
     // ---- on-chip SDRAM: magic names, leave OUT of the .cst ----
     output             O_sdram_clk,
@@ -245,6 +252,34 @@ module eos_hdmi_top (
     wire [7:0]  ext_szc;          // per user-slot: size code (2b each)
     wire [95:0] ext_base;         // per user-slot: phys base rel FLOOR (24b each)
 
+    // ---- SD precache (eos_sd_precache.v -> eos_sdram_backend NRGN_SD fill port) ----
+    wire        sdp_nr_wr;
+    wire [19:0] sdp_nr_waddr;
+    wire [7:0]  sdp_nr_wdata;
+    wire        sdp_nr_busy;
+    wire        sdp_nr_fill_start;
+    wire        sdp_nr_fill_done;
+    wire [1:0]  fc_nr_szc;             // NR_SZC holding reg, from eos_flash_cmd
+    wire [31:0] fc_sd_lba;             // SD_LBA0-3
+    wire [11:0] fc_sd_blkcnt;          // SD_BLKLO/HI
+    wire        fc_sd_go;              // SD_GO pulse
+    wire        sdp_busy, sdp_done, sdp_err;
+    wire [3:0]  sdp_err_code;
+    wire        sdp_sd_start;
+    wire [31:0] sdp_sd_lba;
+    wire        sdp_sd_stall;
+    wire        sds_busy, sds_done, sds_dvalid;
+    wire [7:0]  sds_dout;
+    wire        sds_card_ready, sds_card_err;
+    wire [3:0]  sds_err_code;
+    // ---- SD browse-read (single sector, FAT32 driver support) ----
+    wire [31:0] fc_sd_br_lba;
+    wire        fc_sd_br_go;
+    wire [8:0]  fc_sd_br_raddr;
+    wire [7:0]  sdp_br_rdata;
+    wire        sdp_br_busy, sdp_br_done, sdp_br_err;
+    wire [3:0]  sdp_br_err_code;
+
     // Flash SPI bus, muxed between the backend reader (preload, default owner)
     // and the flash engine (bank erase/program). One driver at a time, selected
     // by bus_grant; both sample the shared MISO.
@@ -270,6 +305,13 @@ module eos_hdmi_top (
     wire [15:0] i2c_lock_mask;
     wire [1:0]  i2c_led_mode;   // LEDMODE (0x38): 1 = rainbow (updater active)
     wire        i2c_desc_reload; // DESCRELOAD (0x39, updater SMBus): re-read descriptor
+    // SETBANKCOLOR (0x3A): staged bank+RGB pulse from the loader. Consumed by the
+    // LEDCFG color-commit path (finished alongside the loader work). Wired now so
+    // the i2c outputs are not silently dropped.
+    wire [23:0] bl_c1, bl_c2, bl_c3, bl_c4;   // bank LED colors from bank_ctrl
+    wire [2:0]  i2c_set_color_bank;
+    wire [23:0] i2c_set_color_rgb;
+    wire        i2c_set_color_stb;
     wire        ldr_desc_reload; // IDX_DESCRELOAD (0x0D, loader flash port): re-read
     wire        ldr_blk_erase;   // IDX_ERASEBLK (0x0E): next erase = single 64K block
     wire        any_desc_reload = i2c_desc_reload | ldr_desc_reload;
@@ -328,7 +370,68 @@ module eos_hdmi_top (
         .scr_raddr     (be_scr_raddr),
         .scr_rdata     (be_scr_rdata),
         .scr_rvalid    (be_scr_rvalid),
-        .scr_busy      (be_scr_busy)
+        .scr_busy      (be_scr_busy),
+
+        .nr_wr         (sdp_nr_wr),       // SD precache -> NRGN_SD (eos_sd_precache.v)
+        .nr_waddr      (sdp_nr_waddr),
+        .nr_wdata      (sdp_nr_wdata),
+        .nr_busy       (sdp_nr_busy),
+        .nr_fill_start (sdp_nr_fill_start),
+        .nr_fill_done  (sdp_nr_fill_done),
+        .nr_szc        (fc_nr_szc)
+    );
+
+    // -------------------------------------------------------------------------
+    // SD card: raw block reader + NRGN_SD precache sequencer. Both live on
+    // clk_sd/sd_rstn -- same domain as eos_sdram_backend, so the nr_wr port
+    // connects directly with no CDC (same pattern as scr_wr from flash_cmd).
+    // -------------------------------------------------------------------------
+    eos_sd_spi u_sdspi (
+        .clk        (clk_sd), .rstn (sd_rstn),
+        .start      (sdp_sd_start), .lba (sdp_sd_lba), .stall (sdp_sd_stall),
+        .busy       (sds_busy), .done (sds_done),
+        .dvalid     (sds_dvalid), .dout (sds_dout),
+        .card_ready (sds_card_ready), .card_err (sds_card_err), .err_code (sds_err_code),
+        .card_sck   (card_sck), .card_mosi (card_mosi),
+        .card_miso  (card_miso), .card_cs_n (card_cs_n)
+    );
+
+    eos_sd_precache u_sdprecache (
+        .clk (clk_sd), .rstn (sd_rstn),
+        .start       (fc_sd_go),
+        .lba         (fc_sd_lba),
+        .blkcnt      (fc_sd_blkcnt),
+        .busy        (sdp_busy),
+        .done_sticky (sdp_done),
+        .err         (sdp_err),
+        .err_code    (sdp_err_code),
+
+        .nr_wr         (sdp_nr_wr),
+        .nr_waddr      (sdp_nr_waddr),
+        .nr_wdata      (sdp_nr_wdata),
+        .nr_busy       (sdp_nr_busy),
+        .nr_fill_start (sdp_nr_fill_start),
+        .nr_fill_done  (sdp_nr_fill_done),
+
+        .sd_start      (sdp_sd_start),
+        .sd_lba        (sdp_sd_lba),
+        .sd_stall      (sdp_sd_stall),
+        .sd_busy       (sds_busy),
+        .sd_done       (sds_done),
+        .sd_dvalid     (sds_dvalid),
+        .sd_dout       (sds_dout),
+        .sd_card_ready (sds_card_ready),
+        .sd_card_err   (sds_card_err),
+        .sd_err_code   (sds_err_code),
+
+        .browse_go        (fc_sd_br_go),
+        .browse_lba       (fc_sd_br_lba),
+        .browse_busy      (sdp_br_busy),
+        .browse_done      (sdp_br_done),
+        .browse_err       (sdp_br_err),
+        .browse_err_code  (sdp_br_err_code),
+        .browse_raddr     (fc_sd_br_raddr),
+        .browse_rdata     (sdp_br_rdata)
     );
 
     // -------------------------------------------------------------------------
@@ -388,6 +491,8 @@ module eos_hdmi_top (
     wire [7:0]  pb_raddr, pb_rdata;
     wire        eng_busy, eng_done, eng_refused; wire [7:0] eng_last_status;
 
+    wire [2:0]  fc_led_mode;   // LED show mode from loader (clk_sd)
+    wire [23:0] fc_led_rgb;    // LED show color from loader (clk_sd)
     eos_flash_cmd u_fcmd (
         .clk          (clk_sd),
         .cold_rstn    (sd_rstn),
@@ -412,13 +517,33 @@ module eos_hdmi_top (
         .eng_last_status (eng_last_status),
         .stock_boot   (stock_boot),
         .desc_reload  (ldr_desc_reload),
+        .led_show_mode(fc_led_mode),
+        .led_show_rgb (fc_led_rgb),
         .blk_erase    (ldr_blk_erase),
         .eng_reload   (dbg_reload),       // SDRAM reload-in-progress -> STATUS bit3
         .scr_wr       (stg_scr_wr),
         .scr_waddr    (stg_scr_waddr),
         .scr_wdata    (stg_scr_wdata),
         .scr_busy     (be_scr_busy),
-        .newrgn_ready (dbg_newrgn_ready)
+        .newrgn_ready (dbg_newrgn_ready),
+
+        .nr_szc             (fc_nr_szc),
+        .sd_lba             (fc_sd_lba),
+        .sd_blkcnt          (fc_sd_blkcnt),
+        .sd_precache_stb    (fc_sd_go),
+        .sd_eng_busy        (sdp_busy),
+        .sd_eng_done_sticky (sdp_done),
+        .sd_eng_err         (sdp_err),
+        .sd_eng_err_code    (sdp_err_code),
+
+        .sd_br_lba      (fc_sd_br_lba),
+        .sd_br_stb      (fc_sd_br_go),
+        .sd_br_raddr    (fc_sd_br_raddr),
+        .sd_br_rdata    (sdp_br_rdata),
+        .sd_br_busy     (sdp_br_busy),
+        .sd_br_done     (sdp_br_done),
+        .sd_br_err      (sdp_br_err),
+        .sd_br_err_code (sdp_br_err_code)
     );
 
     // --- engine (clk_sd): floor-guarded erase/program/poll ---
@@ -444,6 +569,10 @@ module eos_hdmi_top (
         .ext_anchor   (ext_anchor),
         .ext_szc      (ext_szc),
         .ext_base     (ext_base),
+        .bank1_rgb    (bl_c1),
+        .bank2_rgb    (bl_c2),
+        .bank3_rgb    (bl_c3),
+        .bank4_rgb    (bl_c4),
         .bus_req      (eng_bus_req),
         .bus_gnt      (bus_grant),
         .flash_cs_n   (eng_flash_cs_n),
@@ -561,7 +690,10 @@ module eos_hdmi_top (
         .commit_busy(bank_commit_busy), .commit_done(bank_commit_done), .commit_err(bank_commit_err),
         .scr_clear(i2c_scr_clear), .sel_bank(i2c_sel_bank), .boot_mode(i2c_boot_mode), .lock_mask(i2c_lock_mask),
         .led_mode(i2c_led_mode),
-        .desc_reload(i2c_desc_reload)
+        .desc_reload(i2c_desc_reload),
+        .set_color_bank(i2c_set_color_bank),
+        .set_color_rgb(i2c_set_color_rgb),
+        .set_color_stb(i2c_set_color_stb)
     );
 
     // ---- CRC32 over scratch (drives VALIDATE) ----
@@ -963,6 +1095,37 @@ module eos_hdmi_top (
         .rstn   (ws_rst_n),
         .grb    (color),
         .ws_out (ws2812)
+    );
+
+    // ==== Bank-selection status LED (external WS2812 on pin 29) =========
+    // The loader drives what the bank LED shows, via the flash-cmd LED-show
+    // register (fc_led_mode / fc_led_rgb, clk_sd). Sync into sys_clk; these
+    // change only on menu navigation so a 2-flop sync is sufficient.
+    reg [2:0]  led_mode_s1, led_mode_s2;
+    reg [23:0] led_rgb_s1, led_rgb_s2;
+    always @(posedge sys_clk) begin
+        led_mode_s1<=fc_led_mode; led_mode_s2<=led_mode_s1;
+        led_rgb_s1 <=fc_led_rgb;  led_rgb_s2 <=led_rgb_s1;
+    end
+
+    wire [23:0] bank_led_grb;
+    eos_bank_led #(
+        .CLK_HZ(27_000_000)
+    ) u_bank_led (
+        .clk       (sys_clk),
+        .rstn      (ws_rst_n),
+        .show_mode (led_mode_s2),
+        .show_rgb  (led_rgb_s2),
+        .grb       (bank_led_grb)
+    );
+
+    eos_ws2812 #(
+        .CLK_HZ(27_000_000)
+    ) u_ws_bank (
+        .clk    (sys_clk),
+        .rstn   (ws_rst_n),
+        .grb    (bank_led_grb),
+        .ws_out (ws2812_bank)
     );
 
 endmodule

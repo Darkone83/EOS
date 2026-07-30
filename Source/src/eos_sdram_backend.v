@@ -2,7 +2,7 @@
 //
 // Reads SPI flash in 256-byte BURSTS with hardware backpressure.
 //
-// PHASE 4: the reader's 'stall' input is tied to wpend -- the backend's existing
+// The reader's 'stall' input is tied to wpend -- the backend's existing
 // one-byte holding register's full flag. When a byte is waiting to be written to
 // SDRAM the reader parks at a bit boundary with SCK low and CS# still asserted.
 // A byte cannot complete for another 7 bit-periods after stall asserts, so wpend
@@ -26,7 +26,7 @@
 //   LPC reads are served from SDRAM throughout.
 //
 // =============================================================================
-// PHASE 2 -- THE STALL CLASS
+// LPC SERVE / STALL HANDLING
 // =============================================================================
 //
 // (A) LPC reads are now served DURING the fill loops.
@@ -66,6 +66,17 @@ module eos_sdram_backend #(
     parameter [23:0]  NRGN_FL   = 24'h5C_0000,   // NEW REGION flash base (oversized banks)
     parameter [22:0]  NRGN_SD   = 23'h3C_0000,   // EXT region SDRAM base = flash 0x5C0000 in the contiguous mirror (0x5C0000-FLASH_OFF)
     parameter integer NRGN_LEN  = 24'h10_0000,   // 1MB new region
+    // Dedicated SD-card BIOS staging lane -- DELIBERATELY SEPARATE from
+    // NRGN_SD above. Bank 0x0 used to be redirected into NRGN_SD, sharing it
+    // with the flash-sourced oversized-anchor copy (EF 0x3-0x6); that shared
+    // a physical SDRAM lane between two independent fill sources with only a
+    // one-shot flash refill to paper over it (see the now-removed
+    // newrgn_done-clearing patch). Wrong call -- bank 0x0 gets its own lane,
+    // zero sharing, zero coupling to the flash-anchor path. Sits in the free
+    // gap between NRGN_SD's end (0x4C0000) and SCRATCH_BASE (0x600000),
+    // 1.25MB of headroom for a 1MB region.
+    parameter [22:0]  NRGN_SDCARD = 23'h4C_0000,
+    parameter integer NRGN_SDCARD_LEN = 24'h10_0000,   // 1MB, same size class ceiling
     parameter [23:0]  SLOT1_SIG = 24'h50_000B,   // flash addr of 'XBEH' magic in slot1
     parameter integer CHUNK     = 256
 )(
@@ -123,6 +134,23 @@ module eos_sdram_backend #(
     output reg         scr_rvalid,      // 1-cycle pulse when scr_rdata valid
     output wire        scr_busy,        // 1 while a scratch op is queued/in flight
 
+    // ---- NRGN_SDCARD fill port (SD precache -- see eos_sd_precache.v) ----
+    // Mirrors scr_wr/scr_waddr/scr_wdata exactly, but targets NRGN_SDCARD, a
+    // dedicated 1MB lane of its own -- NOT NRGN_SD, which stays exclusively
+    // the flash-sourced oversized-anchor path's. nr_fill_start/nr_fill_done
+    // bracket a fill: start clears sdcard_ready (so a stale/torn copy is
+    // never served mid-fill), done sets it once the whole image is resident.
+    // nr_szc is the size class of whatever is CURRENTLY resident in
+    // NRGN_SDCARD (0=256K,1=512K,2=1MB) -- held continuously (like ext_szc),
+    // not a strobe.
+    input  wire        nr_wr,
+    input  wire [19:0] nr_waddr,        // byte offset within the 1MB NRGN_SDCARD lane
+    input  wire [7:0]  nr_wdata,
+    output wire        nr_busy,
+    input  wire        nr_fill_start,   // pulse: clear sdcard_ready
+    input  wire        nr_fill_done,    // pulse: set sdcard_ready
+    input  wire [1:0]  nr_szc,          // 0=256K, 1=512K, 2=1MB
+
     output reg         preload_done,
     output reg         slot1_ready,     // XbDiag slot-1 window resident in SDRAM
     output wire [22:0] dbg_filled_lo,
@@ -164,7 +192,7 @@ module eos_sdram_backend #(
         .clk        (sclk),
         .rstn       (sresetn),
         .start      (fr_start),
-        .stall      (wpend),        // PHASE 4 backpressure: hold while a byte waits
+        .stall      (wpend),        // backpressure: hold the burst while a byte waits
         .addr       (fr_addr),
         .len        (fr_len),
         .busy       (fr_busy),
@@ -365,12 +393,25 @@ module eos_sdram_backend #(
     wire [22:0] ext_sd_base  = NRGN_SD + ext_off[22:0];
 
     reg [22:0] req_addr_s;
+    // bank 0x0 ("SD Card" -- see eos_sd_precache.v): serves directly from its
+    // own dedicated NRGN_SDCARD lane, sized by nr_szc. Deliberately NOT
+    // NRGN_SD -- see the NRGN_SDCARD parameter comment above for why sharing
+    // that lane with the flash-anchor path was the wrong call. Gated on
+    // sdcard_ready (its own independent flag), not newrgn_ready.
+    wire        bank0_is_nr  = (bank_eff == 4'h0);
+    wire [22:0] bank0_off18  = {5'b0,  mem_addr[17:0]};  // 256K wrap
+    wire [22:0] bank0_off19  = {4'b0,  mem_addr[18:0]};  // 512K wrap
+    wire [22:0] bank0_off20  = {3'b0,  mem_addr[19:0]};  // 1MB wrap
+    wire [22:0] bank0_off    = (nr_szc == 2'd0) ? bank0_off18 :
+                                (nr_szc == 2'd1) ? bank0_off19 : bank0_off20;
     always @(posedge sclk or negedge sresetn) begin
         if (!sresetn) req_addr_s <= 23'd0;
         else if (eff_anchor) begin
             // 512K uses a 19-bit offset (wraps within 512K); 1MB uses 20-bit.
             if (eff_szc == 2'd2) req_addr_s <= ext_sd_base + {3'b0, mem_addr[19:0]}; // 1MB
             else                 req_addr_s <= ext_sd_base + {4'b0, mem_addr[18:0]}; // 512K
+        end else if (bank0_is_nr) begin
+            req_addr_s <= NRGN_SDCARD + bank0_off;
         end else begin
             req_addr_s <= {1'b0, xlate(bank_eff, mem_addr)} | {slot_eff, 21'd0};
         end
@@ -436,12 +477,16 @@ module eos_sdram_backend #(
     localparam S_S1_PROBE   = 4'd13;   // slot1: request one 'XBEH' magic byte
     localparam S_S1_PWAIT   = 4'd14;   // slot1: check captured magic byte
     localparam S_S1_FILL    = 4'd15;   // slot1: run the 768K window reload
+    localparam S_NR_WR      = 5'd16;   // NRGN_SDCARD fill-port write (mirrors S_SCR_WR)
 
     reg [4:0] st;
 
     reg        scr_wr_pend, scr_rd_pend;
     reg [20:0] scr_waddr_r, scr_raddr_r;
     reg [7:0]  scr_wdata_r;
+    reg        nr_wr_pend;
+    reg [19:0] nr_waddr_r;
+    reg [7:0]  nr_wdata_r;
 
     // Post-flash reload bookkeeping
     localparam [22:0] SCRATCH_BASE = 23'h60_0000;  // SDRAM serve ceiling (6MB managed)
@@ -459,6 +504,8 @@ module eos_sdram_backend #(
     reg         newrgn_done;   // new-region preload STARTED (runs once)
     reg         newrgn_ready;  // new-region data RESIDENT in SDRAM (fill done)
     reg         nr_filling;    // the active reload is the new-region fill
+    reg         sdcard_ready;  // SD-card-sourced bank 0x0 data RESIDENT in NRGN_SDCARD
+                                // (own flag, own lane -- NOT newrgn_ready/NRGN_SD)
     // does the just-captured probe byte match its expected 'XBEH' position?
     wire        byte_ok = (sig_i == 2'd0) ? (wbyte == 8'h58) :
                           (sig_i == 2'd1) ? (wbyte == 8'h42) :
@@ -494,7 +541,10 @@ module eos_sdram_backend #(
     // at NRGN_SD (0x3C0000). Ext reads gate on newrgn_ready; everything else on
     // the main preload progress (filled_lo).
     wire        in_newrgn  = (req23 >= NRGN_SD) && (req23 < (NRGN_SD + NRGN_LEN[22:0]));
-    wire        req_filled = in_newrgn ? newrgn_ready : (req23 >= filled_lo);
+    wire        in_sdcard  = (req23 >= NRGN_SDCARD) && (req23 < (NRGN_SDCARD + NRGN_SDCARD_LEN[22:0]));
+    wire        req_filled = in_newrgn ? newrgn_ready :
+                              in_sdcard ? sdcard_ready :
+                                          (req23 >= filled_lo);
 
     assign dbg_filled_lo = filled_lo;
     assign dbg_bank      = bank_l;
@@ -502,6 +552,7 @@ module eos_sdram_backend #(
     assign dbg_newrgn_ready = newrgn_ready;
     assign scr_busy      = scr_wr_pend | scr_rd_pend |
                            (st == S_SCR_WR) | (st == S_SCR_RD_REQ) | (st == S_SCR_RD_WAIT);
+    assign nr_busy       = nr_wr_pend | (st == S_NR_WR);
 
     always @(posedge sclk or negedge sresetn) begin
         if (!sresetn) begin
@@ -546,6 +597,9 @@ module eos_sdram_backend #(
             scr_waddr_r    <= 21'd0;
             scr_raddr_r    <= 21'd0;
             scr_wdata_r    <= 8'd0;
+            nr_wr_pend     <= 1'b0;
+            nr_waddr_r     <= 20'd0;
+            nr_wdata_r     <= 8'd0;
             rl_fl_base     <= 24'd0;
             rl_sd_base     <= 23'd0;
             rl_len         <= 24'd0;
@@ -554,6 +608,7 @@ module eos_sdram_backend #(
             slot1_done     <= 1'b0;
             newrgn_done    <= 1'b0;
             newrgn_ready   <= 1'b0;
+            sdcard_ready   <= 1'b0;
             nr_filling     <= 1'b0;
             sig_i          <= 2'd0;
             sig_ok         <= 1'b1;
@@ -571,6 +626,20 @@ module eos_sdram_backend #(
             if (scr_rd && !scr_wr_pend && !scr_rd_pend) begin
                 scr_rd_pend <= 1'b1; scr_raddr_r <= scr_raddr;
             end
+            if (nr_wr && !nr_wr_pend) begin
+                nr_wr_pend <= 1'b1; nr_waddr_r <= nr_waddr; nr_wdata_r <= nr_wdata;
+            end
+            // Bracket an SD-card precache into its own dedicated NRGN_SDCARD
+            // lane: start clears sdcard_ready so an in-progress (or torn) copy
+            // is never served; done sets it once the whole image is resident.
+            // This is now fully independent of newrgn_ready/NRGN_SD -- the
+            // flash-sourced oversized-anchor path is untouched by SD precache
+            // activity, so there is nothing left needing a compensating reset
+            // (an earlier version of this patch cleared newrgn_done here to
+            // paper over NRGN_SD being a shared lane; giving SD its own lane
+            // outright removes the problem instead of working around it).
+            if (nr_fill_start)     sdcard_ready <= 1'b0;
+            else if (nr_fill_done) sdcard_ready <= 1'b1;
 
             // Clear op_lock once controller accepts the operation and goes busy.
             if (sd_busy)
@@ -810,6 +879,8 @@ module eos_sdram_backend #(
                             st <= S_SCR_WR;
                         end else if (scr_rd_pend) begin
                             st <= S_SCR_RD_REQ;
+                        end else if (nr_wr_pend) begin
+                            st <= S_NR_WR;
                         end
                     end
                 end
@@ -993,6 +1064,21 @@ module eos_sdram_backend #(
                             sd_din      <= scr_wdata_r;
                             sd_wr       <= 1'b1; op_lock <= 1'b1;
                             scr_wr_pend <= 1'b0; st <= S_SERVE;
+                        end
+                    end
+                end
+
+                // NRGN_SDCARD fill-port write -- identical shape to S_SCR_WR,
+                // just a different base/pending flag (see eos_sd_precache.v).
+                S_NR_WR: begin
+                    if (!sd_busy && !op_lock) begin
+                        if (refresh_due) begin
+                            sd_refresh <= 1'b1; op_lock <= 1'b1;
+                        end else begin
+                            sd_addr    <= NRGN_SDCARD + {3'b0, nr_waddr_r};
+                            sd_din     <= nr_wdata_r;
+                            sd_wr      <= 1'b1; op_lock <= 1'b1;
+                            nr_wr_pend <= 1'b0; st <= S_SERVE;
                         end
                     end
                 end
