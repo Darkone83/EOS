@@ -15,8 +15,10 @@
         <File path="src/eos_flash_cmd.v" type="file.verilog" enable="1"/>
         <File path="src/eos_flash_reader.v" type="file.verilog" enable="1"/>
         <File path="src/eos_font_rom.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_hd.v" type="file.verilog" enable="1"/>
         <File path="src/eos_hdmi_top.v" type="file.verilog" enable="1"/>
         <File path="src/eos_i2c.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_i2c_master.v" type="file.verilog" enable="1"/>
         <File path="src/eos_logo_rom.v" type="file.verilog" enable="1"/>
         <File path="src/eos_lpc_loader.v" type="file.verilog" enable="1"/>
         <File path="src/eos_sd_precache.v" type="file.verilog" enable="1"/>

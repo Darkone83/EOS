@@ -70,7 +70,23 @@ needed.
   talks to.
 - **HDMI dashboard** — a colour readout of link state, bank, serve rate, the flash engine,
   the preload bar, a live map of what's been served, a serve log, and a stability panel.
+- **HD addon support (experimental)** — Eos can drive an external ADV7511 HDMI transmitter
+  on a compatible **HD addon** board, giving the console a digital HDMI output. **Experimental.**
+  Uses a private I²C bus on the expansion header — see **Expansion header** in the pinmap (EXP1–EXP3
+  are reserved for HD addon compatibility) and **Credits**.
 - **Status LEDs / WS2812** — tells you where a boot got to without needing a screen.
+
+---
+
+## PCB revisions
+
+### V1
+
+The V1 carrier will preform all the basic functions EOS requires and is not FW dependant. V1 is missing the bank RGB led the HD Status LED and the expansion header along with the RTC
+
+### V2
+
+The V2 carrier offers easy accessability to all planed featurs and expansion options of EOS and includes the additional items: the RGB Bank LED, HD Status LED, Expansion header, and on-board RTC.
 
 ---
 
@@ -95,6 +111,7 @@ Put a **22 Ω resistor in-line on each of the six Xbox-driven inputs** — `LAD0
 
 ### Parts
 
+
 | Qty | Part | Why |
 |---|---|---|
 | 1 | Sipeed Tang Nano 20K (GW2AR-18C) | the modchip |
@@ -102,6 +119,7 @@ Put a **22 Ω resistor in-line on each of the six Xbox-driven inputs** — `LAD0
 | 1 | SPST switch or jumper | revision select (open = 1.0–1.4, GND = 1.6) |
 | — | wire to the D0 point | 1.0–1.4 install (ground it, or drive it from `lpc_d0`) |
 | — | wire to LFRAME# + LPC rebuild | 1.6 install |
+
 
 ---
 
@@ -194,10 +212,17 @@ serving · **blue** is up and idle. The write/sync purple is the project accent 
 
 ### Status RGB LED (pin 29)
 
+<<<<<<< Updated upstream
 The Status RGB LED is fully programmable per bank. Once a BIOS is flashed, you can set a color 
 via Bank Management or from the WebUI. Choose from 11 colors and OFF. 3 Banks have predetermined 
 colors that are not changeable via the Loader or the WebUI. Recovery = White, breathing, 
 XbDiag Lite = Purple, breathing, and SD Card = Magenta, breathing.
+=======
+The Status led is fully programable per bank. Once a BIOS is flashed you can set a color via Bank Management or from the WebUI. Choose from 11 colors and OFF. 3 Banks have pre determined colors that are not changable via the Loader or the WebUI. Recovery = White, breathing, XbDiag Lite = Purple, breathing, and SD Card = Magenta, breating.
+
+### HD Status LED (pins 30, 31)
+Pin 30, is PLL lock. Pin 31, Mode / Handoff Status.
+>>>>>>> Stashed changes
 
 ---
 
@@ -261,6 +286,27 @@ map is under **SMBus interface** below.
 | `flash_cs_n` | 60 |
 | `flash_mosi` | 61 |
 | `flash_miso` | 62 |
+
+### Expansion header
+
+Eight GPIO on the expansion header, 3.3 V (LVCMOS33), unwired to the Xbox. **EXP1–EXP3 are
+reserved for HD addon compatibility** (the experimental HD addon support drives an external
+ADV7511 over a private I²C bus on these pins — SDA / SCL / INT). **EXP4–EXP8 are free.** The
+HD addon lines need external pull-ups on the harness.
+
+| Label | Port | Pin | Use |
+|---|---|---|---|
+| EXP1 | `adv_sda` | 52 | HD addon — ADV7511 I²C SDA *(reserved)* |
+| EXP2 | `adv_scl` | 53 | HD addon — ADV7511 I²C SCL *(reserved)* |
+| EXP3 | `adv_int` | 49 | HD addon — ADV7511 INT (pull-up) *(reserved)* |
+| EXP4 | — | 55 | free |
+| EXP5 | — | 48 | free |
+| EXP6 | — | 51 | free |
+| EXP7 | — | 54 | free |
+| EXP8 | — | 56 | free |
+
+> The ADV7511 sits at its default 7-bit `0x39` on this private bus, which EOS masters alone —
+> it is separate from the Xbox SMBus. HD addon support is experimental (see **What it does**).
 
 ### Clock / reset / status
 
@@ -423,8 +469,9 @@ project, constraints, and programmer — a mismatch is the usual "won't configur
    synthesis, and a missing one silently zero-fills (a blank dashboard, for instance):
    `eos_font.hex`, `eos_attr.hex`, `eos_logo.hex`, `eos_screen.hex`.
 3. Apply `eos_hdmi.cst` and `eos_hdmi.sdc`.
-4. Under Project configuration -> Bitstream -> sysControl set Loading Rate to 62.5MHz
-5. Synthesize → Place & Route → generate the bitstream (`.fs`).
+4. Under Project -> Configuration -> Bitstream -> sysControl set Loading Rate to 62.5MHz
+5. Under Project -> Configuration -> Place & Route -> Dual-Purpose Pin set Use SSPI as regualr IO, and Use MSPI as regular IO as enabled.
+6. Synthesize → Place & Route → generate the bitstream (`.fs`).
 
 A clean build produces **no synthesis warnings**. If width-truncation, unused-input, or
 clock-relationship warnings come back, something regressed — the maintainer notes at the bottom
@@ -524,3 +571,11 @@ credited with thanks:
 
 Eos's LFRAME behaviour was matched against these known-good designs; no code from either is
 included.
+
+The **experimental HD addon support** is a gateware translation of **X-HD** by **Team
+Resurgent** — <https://github.com/Team-Resurgent/X-HD> — with the low-level **ADV7511**
+HDMI-transmitter handling deriving from work by **Ryzee119** — <https://github.com/Ryzee119>.
+The ADV7511 init sequences, encoder profiles, and video-timing data are traceable to that
+source and are credited with thanks under their respective licenses: **X-HD is GPLv3**, and the
+ADV7511 register primitives carry **Ryzee119's MIT** header. Eos's HD addon module is a
+derivative work of X-HD and is distributed under **GPLv3** accordingly.

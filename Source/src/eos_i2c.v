@@ -11,11 +11,25 @@
 // Device address = DEV_ADDR (7-bit, default 0x6E -> 8-bit 0xDC write / 0xDD read,
 // "DC" = Darkone Customs). Change via the parameter if SmBusScan finds a clash.
 //
-// Register map (read side):
+// DUAL-ADDRESS (added for HD/X-HD, see eos_hd_integration_spec.md): this
+// engine also answers HD_ADDR (0x69) -- but ONLY once hd_addr_en is raised
+// (eos_hd.v's collision guard must clear FIRST; the address doesn't come
+// live at reset). The bit-level protocol (START/STOP/ACK/clock-stretch) is
+// entirely shared between the two personas; ONLY the byte-level MEANING
+// differs. Deliberately kept that way: eos_i2c.v stays a dumb transport for
+// HD traffic (relay bytes in via hd_byte/hd_byte_valid, take response bytes
+// from hd_read_data) -- it does NOT interpret a single HD command byte
+// itself. All HD protocol semantics (READ_CONFIG, WRITE_CONFIG_APPLY, etc.)
+// live entirely in eos_hd.v, same as HD status stays entirely in eos_hd.v.
+// The updater persona (DEV_ADDR, 0x6E) below is completely unmodified by
+// this -- every existing register/command/state-machine path for it is
+// untouched; the HD paths are new parallel branches, not edits to it.
+//
+// Register map (read side, DEV_ADDR/updater persona only):
 //   0x00 MAGIC      (R) 0xD8   Darkone signature
 //   0x01 VER_MAJOR  (R) 1
 //   0x02 VER_MINOR  (R) 0
-//   0x03 VER_PATCH  (R) 1      -> base firmware 1.0.0
+//   0x03 VER_PATCH  (R) 3      -> base firmware 1.0.3
 //   0x04 STATUS     (R) live bits from the top, low->high:
 //                       preload_done, mode_16, d0_active, abort_active,
 //                       slot1_ready; top 3 bits 0.
@@ -45,15 +59,19 @@
 //     arms regions 1 and 2, so this does not affect it.
 //
 // SDA is open-drain: sda_oe=1 pulls the line LOW, sda_oe=0 releases (Hi-Z). SCL
-// is input only (no clock stretching). Runs on a fast sample clock (>= ~16x SCL;
-// the serve/sys clock is fine).
+// is input for the updater persona (never stretches -- its reads are always
+// immediately available). scl_oe (new) lets the HD persona stretch: held low
+// only when hd_addr_match && !hd_read_ready, so the updater path's timing is
+// completely unaffected. Runs on a fast sample clock (>= ~16x SCL; the
+// serve/sys clock is fine).
 // =====================================================================
 module eos_i2c #(
     parameter [6:0] DEV_ADDR  = 7'h6E,     // 7-bit SMBus address the scanner sees (0x6E; 0x6F alt)
+    parameter [6:0] HD_ADDR   = 7'h69,     // HD/X-HD address -- see dual-address note above
     parameter [7:0] MAGIC     = 8'hD8,     // Darkone signature
     parameter [7:0] VER_MAJOR = 8'd1,
     parameter [7:0] VER_MINOR = 8'd0,
-    parameter [7:0] VER_PATCH = 8'd1
+    parameter [7:0] VER_PATCH = 8'd3
 )(
     input  wire        clk,
     input  wire        resetn,
@@ -61,8 +79,28 @@ module eos_i2c #(
     input  wire        sda_in,
     input  wire        scl_in,
     output reg         sda_oe,       // 1 = pull SDA low, 0 = release
+    output reg         scl_oe,       // 1 = pull SCL low (HD clock-stretch only)
 
     input  wire [7:0]  status_in,    // reported at register 0x04
+
+    // ---- HD relay interface (see dual-address note above) ----------------
+    input  wire         hd_addr_en,     // gate: HD_ADDR only answers once this is 1
+    output reg           hd_addr_match, // 1 while an HD-addressed transaction owns the bus
+    output reg            hd_byte_valid, // 1-cycle strobe: hd_byte just arrived (write dir)
+    output reg  [7:0]      hd_byte,
+    output reg              hd_byte_first, // 1 = this is the transaction's command byte
+    input  wire [7:0]        hd_read_data,  // byte to return on a read turnaround
+    input  wire                hd_read_ready, // 0 = stretch SCL and wait; 1 = proceed
+
+    // Version, exposed as real outputs (not just readmux'd internally) so
+    // anything else on the FPGA -- the serve HUD, in particular -- has ONE
+    // true source instead of a second hardcoded copy that can silently drift
+    // out of sync with this one (which is exactly what had happened: the HUD
+    // instantiation hardcoded 1.0.0 as literals, untouched by any version
+    // bump made here). Purely combinational, always valid.
+    output wire [7:0]  ver_major_out,
+    output wire [7:0]  ver_minor_out,
+    output wire [7:0]  ver_patch_out,
 
     output reg  [7:0]  cmd,
     output reg  [7:0]  arg0, arg1, arg2, arg3,
@@ -95,6 +133,10 @@ module eos_i2c #(
     output reg  [23:0] set_color_rgb,  // packed {R,G,B}
     output reg         set_color_stb   // 1-clk pulse when 0x3A is issued
 );
+    assign ver_major_out = VER_MAJOR;
+    assign ver_minor_out = VER_MINOR;
+    assign ver_patch_out = VER_PATCH;
+
     // ---- line sync + edge / start-stop detect --------------------------------
     reg [2:0] sda_ss = 3'b111, scl_ss = 3'b111;
     always @(posedge clk or negedge resetn) begin
@@ -152,6 +194,7 @@ module eos_i2c #(
     reg  [7:0] rcmd    = 8'h00;                    // command for THIS transaction
     reg        have_cmd= 1'b0;                     // command byte captured?
     wire [7:0] rd_cur  = readmux(rcmd);            // response byte for rcmd
+    wire [7:0] resp_byte = hd_addr_match ? hd_read_data : rd_cur;  // whichever persona is live
 
     // ---- slave FSM -----------------------------------------------------------
     localparam ST_IDLE = 3'd0,
@@ -168,20 +211,46 @@ module eos_i2c #(
     reg [7:0] sh     = 8'd0;
     reg       rw     = 1'b0;
     reg       acked  = 1'b0;
+    reg       hd_first_pending = 1'b0;  // internal: primed by ST_AACK, captured
+                                       // into hd_byte_first on relay (not cleared
+                                       // directly -- see ST_WACK)
+    reg       hd_stretching = 1'b0;   // frozen here (SCL held low by us) until
+                                       // hd_read_ready -- see the top-priority
+                                       // branch below. No scl_rise/scl_fall will
+                                       // fire while this is set (we're the ones
+                                       // holding the line low), so this can't be
+                                       // driven from the normal edge-gated case
+                                       // logic -- it has to be checked every cycle.
 
     always @(posedge clk or negedge resetn) begin
         if (!resetn) begin
             st<=ST_IDLE; bcnt<=0; sh<=0; rw<=0; rcmd<=8'h00; have_cmd<=1'b0; acked<=0;
-            sda_oe<=0; selected<=0; cmd_stb<=0; rx_count<=0;
+            sda_oe<=0; scl_oe<=0; selected<=0; cmd_stb<=0; rx_count<=0;
             cmd<=0; arg0<=0; arg1<=0; arg2<=0; arg3<=0;
+            hd_addr_match<=0; hd_byte_valid<=0; hd_byte<=0; hd_byte_first<=0;
+            hd_first_pending<=0; hd_stretching<=0;
         end else begin
             cmd_stb <= 1'b0;
+            hd_byte_valid <= 1'b0;   // 1-cycle strobe, default low every cycle
 
-            if (start_c) begin
+            if (hd_stretching) begin
+                // Top priority, bypasses everything else below. We are
+                // physically holding SCL low (scl_oe=1) so the master cannot
+                // progress the bus at all from here -- no START, no STOP, no
+                // more clock edges -- until we release it. Just poll.
+                if (hd_read_ready) begin
+                    hd_stretching<=1'b0; scl_oe<=1'b0;
+                    sh<=hd_read_data; sda_oe<=~hd_read_data[7];
+                    st<=ST_RD; bcnt<=0;
+                end
+                // else: keep holding, nothing else to do this cycle.
+            end
+            else if (start_c) begin
                 st<=ST_ADDR; bcnt<=0; sh<=0; acked<=0; sda_oe<=0;
             end
             else if (stop_c) begin
-                st<=ST_IDLE; sda_oe<=0; selected<=0; have_cmd<=1'b0; acked<=0;
+                st<=ST_IDLE; sda_oe<=0; selected<=0; hd_addr_match<=0;
+                have_cmd<=1'b0; acked<=0;
             end
             else begin
                 case (st)
@@ -195,7 +264,7 @@ module eos_i2c #(
                     if (!acked) begin
                         if (sh[7:1]==DEV_ADDR) begin
                             sda_oe<=1'b1;
-                            selected<=1'b1; rw<=sh[0];
+                            selected<=1'b1; hd_addr_match<=1'b0; rw<=sh[0];
                             // On an addr+WRITE match, the byte that follows is
                             // ALWAYS this transaction's command/register selector.
                             // Clear have_cmd HERE (keyed off the cleanly-clocked
@@ -206,15 +275,30 @@ module eos_i2c #(
                             // A read-byte's addr+READ turnaround does NOT clear it,
                             // so rcmd from the preceding write phase is preserved.
                             if (!sh[0]) begin rx_count<=rx_count+8'd1; have_cmd<=1'b0; end
+                        end else if (hd_addr_en && sh[7:1]==HD_ADDR) begin
+                            // HD persona -- see the dual-address note at the top
+                            // of this file. 'selected' is deliberately NOT set
+                            // here; hd_addr_match is the HD equivalent of it, and
+                            // the two personas are never both live in the same
+                            // transaction (a single address byte matches at most
+                            // one of them).
+                            sda_oe<=1'b1;
+                            hd_addr_match<=1'b1; rw<=sh[0];
+                            if (!sh[0]) hd_first_pending<=1'b1;  // next write byte is HD's command byte
                         end else begin
-                            sda_oe<=1'b0; st<=ST_IDLE; selected<=1'b0;
+                            sda_oe<=1'b0; st<=ST_IDLE; selected<=1'b0; hd_addr_match<=1'b0;
                         end
                         acked<=1'b1;
                     end else begin
                         acked<=1'b0;
                         if (rw) begin
-                            sh<=rd_cur; sda_oe<=~rd_cur[7];
-                            st<=ST_RD; bcnt<=0;
+                            if (hd_addr_match && !hd_read_ready) begin
+                                scl_oe<=1'b1; hd_stretching<=1'b1;  // not ready yet -- stretch
+                            end else begin
+                                sh    <= resp_byte;
+                                sda_oe<= ~resp_byte[7];
+                                st<=ST_RD; bcnt<=0;
+                            end
                         end else begin
                             sda_oe<=1'b0; st<=ST_WR; bcnt<=0;
                         end
@@ -230,7 +314,18 @@ module eos_i2c #(
                 ST_WACK: if (scl_fall) begin
                     if (!acked) begin
                         sda_oe<=1'b1;                     // ACK the byte
-                        if (!have_cmd) begin
+                        if (hd_addr_match) begin
+                            // Dumb relay only -- eos_hd.v owns all HD protocol
+                            // meaning. hd_first_pending was primed in ST_AACK for
+                            // byte 0 of this transaction; CAPTURE it into
+                            // hd_byte_first here (not clear it directly -- that
+                            // would stomp the very value this byte needs to
+                            // output, since both would land on the same edge)
+                            // and only THEN clear the pending latch for the
+                            // byte after this one.
+                            hd_byte_valid<=1'b1; hd_byte<=sh;
+                            hd_byte_first<=hd_first_pending; hd_first_pending<=1'b0;
+                        end else if (!have_cmd) begin
                             // FIRST write byte = command/register selector for
                             // this transaction. Latch it; a following read will
                             // return readmux(rcmd). For a write transaction, the
@@ -272,7 +367,8 @@ module eos_i2c #(
 
                 ST_RACK: begin
                     if (scl_rise) begin
-                        if (sda_q) selected<=1'b0;         // master NACK = last byte
+                        // master NACK = last byte, for whichever persona is live
+                        if (sda_q) begin selected<=1'b0; hd_addr_match<=1'b0; end
                     end
                     if (scl_fall) begin
                         if (!acked) acked<=1'b1;
@@ -281,10 +377,18 @@ module eos_i2c #(
                             // Single-byte-per-command model. If the master ACKs
                             // for another byte, return the SAME command's byte
                             // again (no stale index walk). Normally it NACKs and
-                            // we go idle.
+                            // we go idle. HD mirrors this, through the same
+                            // stretch path if a second byte isn't ready yet.
                             if (selected) begin
                                 sh<=rd_cur; sda_oe<=~rd_cur[7];
                                 st<=ST_RD; bcnt<=0;
+                            end else if (hd_addr_match) begin
+                                if (hd_read_ready) begin
+                                    sh<=hd_read_data; sda_oe<=~hd_read_data[7];
+                                    st<=ST_RD; bcnt<=0;
+                                end else begin
+                                    scl_oe<=1'b1; hd_stretching<=1'b1;
+                                end
                             end else begin
                                 sda_oe<=1'b0; st<=ST_IDLE;
                             end

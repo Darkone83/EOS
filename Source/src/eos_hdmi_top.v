@@ -15,8 +15,21 @@ module eos_hdmi_top (
     output             lpc_d0,          // low = force LPC boot, Hi-Z = TSOP/stock
     input              lpc_lreset_n,
     inout      [3:0]   lpc_lad,
-    inout              i2c_sda,       // SMBus SDA (open-drain)
-    input              i2c_scl,       // SMBus SCL
+    inout              i2c_sda,       // Xbox SMBus SDA (open-drain) -- SLAVE only
+    inout              i2c_scl,       // Xbox SMBus SCL (open-drain) -- SLAVE only
+                                        // (eos_i2c.v answers 0x6E + 0x69 here;
+                                        // NOTHING masters this bus anymore --
+                                        // the HD/ADV master moved to adv_* below)
+    inout              adv_sda,       // PRIVATE ADV7511 I2C SDA (EXP1) -- EOS is
+                                        // sole master; open-drain via RTL Hi-Z +
+                                        // external pull-up. NOT the Xbox SMBus.
+    inout              adv_scl,       // PRIVATE ADV7511 I2C SCL (EXP2)
+    input              adv_int,       // ADV7511 INT -> FPGA pin 49
+    output              hd_led_green,  // on-board HD status LED (GPIO
+                                        // 30/31) -- self-contained in
+                                        // eos_hd.v, no path through
+                                        // eos_bank_led.v
+    output              hd_led_blue,
     input              mode16_n,      // 1.6 strap (pin 77): open=pre-1.6, GND=1.6 (active-low)
 
     // ---- boot control: LFRAME# abort (1.6) only. D0 stays externally grounded
@@ -675,14 +688,52 @@ module eos_hdmi_top (
     wire [2:0]  wr_attr;
 
     // ---- Darkone I2C (SMBus slave) engine --------------------------------
-    wire       i2c_sda_oe, i2c_cmd_stb, i2c_sel;
+    wire       i2c_sda_oe, i2c_scl_oe, i2c_cmd_stb, i2c_sel;
     wire [7:0] i2c_cmd, i2c_a0, i2c_a1, i2c_a2, i2c_a3, i2c_rxcnt;
-    assign i2c_sda = i2c_sda_oe ? 1'b0 : 1'bz;   // open-drain: low or release
+    // HD transport enable -- now driven for real by eos_hd.v's own
+    // hd_addr_en OUTPUT (its collision guard clearing), not tied to 0.
+    wire       hd_transport_en;
+    // eos_hd.v's HD/ADV master now drives a SEPARATE, private bus (adv_sda/
+    // adv_scl on EXP1/EXP2), NOT the Xbox SMBus. This is the whole fix: the
+    // ADV master and the console's own SMBus master are no longer on the same
+    // wire, so there is nothing to collide with -- video bring-up can't be
+    // NAKed/blocked and the console can't be fragged by our traffic.
+    wire       hd_sda_oe, hd_scl_oe;
 
+    // Xbox SMBus: SLAVE drive only (eos_i2c.v). No HD master term anymore.
+    assign i2c_sda = i2c_sda_oe ? 1'b0 : 1'bz;   // open-drain: low or release
+    assign i2c_scl = i2c_scl_oe ? 1'b0 : 1'bz;   // (slave clock-stretch only)
+
+    // Private ADV bus: EOS is the sole master; open-drain via Hi-Z + ext pull-up.
+    assign adv_sda = hd_sda_oe ? 1'b0 : 1'bz;
+    assign adv_scl = hd_scl_oe ? 1'b0 : 1'bz;
+
+    // eos_i2c.v <-> eos_hd.v relay interface (see eos_i2c.v's dual-address
+    // note) -- real wires now, eos_hd.v is both ends' other side.
+    wire        hd_addr_match, hd_byte_valid, hd_byte_first;
+    wire [7:0]  hd_byte;
+    wire [7:0]  hd_read_data;
+    wire        hd_read_ready;
+
+    // eos_hd.v -> serve HUD status (see gen_hud.py's HD STATUS panel)
+    wire [3:0]  hd_encoder_status;
+    wire        hd_pll_lock_status, hd_bios_active_status, hd_guard_blocked_status;
+    wire [5:0]  hd_brst_status;
+    wire [2:0]  hd_disable_reason_status;
+
+    wire [7:0] i2c_ver_major, i2c_ver_minor, i2c_ver_patch;
     eos_i2c u_i2c (
         .clk      (clk_sd),  .resetn (sd_rstn),
-        .sda_in   (i2c_sda), .scl_in (i2c_scl), .sda_oe (i2c_sda_oe),
+        .sda_in   (i2c_sda), .scl_in (i2c_scl), .sda_oe (i2c_sda_oe), .scl_oe (i2c_scl_oe),
         .status_in({3'b0, slot1_ready, abort_active_b, d0_active_b, mode_16, preload_done}),
+        .ver_major_out(i2c_ver_major), .ver_minor_out(i2c_ver_minor), .ver_patch_out(i2c_ver_patch),
+
+        // HD relay interface -- eos_hd.v is now the other end of all of
+        // these (was tied off before it existed).
+        .hd_addr_en(hd_transport_en), .hd_addr_match(hd_addr_match),
+        .hd_byte_valid(hd_byte_valid), .hd_byte(hd_byte), .hd_byte_first(hd_byte_first),
+        .hd_read_data(hd_read_data), .hd_read_ready(hd_read_ready),
+
         .cmd      (i2c_cmd), .arg0(i2c_a0), .arg1(i2c_a1), .arg2(i2c_a2), .arg3(i2c_a3),
         .cmd_stb  (i2c_cmd_stb), .rx_count(i2c_rxcnt), .selected(i2c_sel),
         .crc_go(crc_go), .crc_len(crc_len), .crc_busy(crc_busy), .crc_done(crc_done), .crc_result(crc_result),
@@ -694,6 +745,29 @@ module eos_hdmi_top (
         .set_color_bank(i2c_set_color_bank),
         .set_color_rgb(i2c_set_color_rgb),
         .set_color_stb(i2c_set_color_stb)
+    );
+
+    // ---- EOS-native HD (ADV7511) controller -------------------------------
+    // See eos_hd_integration_spec.md. Masters the ADV on the PRIVATE adv_*
+    // bus (EXP1/EXP2): ADV presence check, full base init, encoder tweak,
+    // standalone (pre-BIOS) video bring-up. The existing physical 1.6 strap
+    // selects Xcalibur at boot; otherwise the validated Conexant branch starts
+    // and only a BIOS 0xD4 report may transition it to Focus. There is no
+    // runtime Xcalibur detection or active encoder probe.
+    eos_hd u_hd (
+        .clk (clk_sd), .resetn (sd_rstn),
+        .xbox_16_mode (mode_16),
+        .adv_sda_in (adv_sda), .adv_scl_in (adv_scl),
+        .adv_sda_oe (hd_sda_oe), .adv_scl_oe (hd_scl_oe),
+        .adv_int (adv_int),
+        .hd_addr_en (hd_transport_en), .hd_addr_match (hd_addr_match),
+        .hd_byte_valid (hd_byte_valid), .hd_byte (hd_byte), .hd_byte_first (hd_byte_first),
+        .hd_read_data (hd_read_data), .hd_read_ready (hd_read_ready),
+        .led_green (hd_led_green), .led_blue (hd_led_blue),
+        .hd_encoder_out (hd_encoder_status), .hd_pll_lock_out (hd_pll_lock_status),
+        .hd_bios_active_out (hd_bios_active_status), .hd_guard_blocked_out (hd_guard_blocked_status),
+        .hd_brst_out (hd_brst_status),
+        .hd_disable_reason_out (hd_disable_reason_status)
     );
 
     // ---- CRC32 over scratch (drives VALIDATE) ----
@@ -725,10 +799,21 @@ module eos_hdmi_top (
         .abort_active (abort_active_b),
         .abort_count  (abort_count_b),
 
-        // I2C engine -> HUD panel
-        .i2c_addr     (8'hDC), .i2c_vmaj(8'd1), .i2c_vmin(8'd0), .i2c_vpat(8'd0),
+        // I2C engine -> HUD panel (version now the REAL eos_i2c output, not a
+        // separately-hardcoded copy -- that's what let this drift to 1.0.0
+        // while eos_i2c.v itself was already at 1.0.1)
+        .i2c_addr     (8'hDC), .i2c_vmaj(i2c_ver_major), .i2c_vmin(i2c_ver_minor), .i2c_vpat(i2c_ver_patch),
         .i2c_cmd      (i2c_cmd), .i2c_a0(i2c_a0), .i2c_a1(i2c_a1),
         .i2c_rx       (i2c_rxcnt), .i2c_sel(i2c_sel),
+
+        // HD controller status -- all real now (eos_hd.v exists).
+        .hd_encoder       (hd_encoder_status),
+        .hd_pll_lock      (hd_pll_lock_status),
+        .hd_bios_active   (hd_bios_active_status),
+        .hd_guard_blocked (hd_guard_blocked_status),
+        .hd_transport_en  (hd_transport_en),
+        .hd_brst          ({2'b00, hd_brst_status}),
+        .hd_dr            ({5'b00000, hd_disable_reason_status}),
 
         .wr_en        (wr_en),
         .wr_addr      (wr_addr),

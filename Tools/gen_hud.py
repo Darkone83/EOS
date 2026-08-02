@@ -102,6 +102,21 @@ T(8, 92, "A0 0x");   HX(8, 97, 'i2c_a0_s', 1, 0, 0)
 T(9, 82, "RX  0x");  HX(9, 88, 'i2c_rx_s', 1, 0, 0)
 T(9, 92, "A1 0x");   HX(9, 97, 'i2c_a1_s', 1, 0, 0)
 
+# --- HD STATUS (X-HD/HD+ ADV7511 controller, EOS-native -- see
+# eos_hd_integration_spec.md). eos_hd.v does not exist yet; these four ports
+# are RESERVED so the panel has somewhere to land the moment it does. Kept
+# deliberately simple -- one hex nibble + three Y/- style cells, the same
+# lightweight pattern FLASH ENGINE's BUSY field already uses -- rather than
+# inventing a new word-array template block for signals that aren't real yet.
+# Until eos_hd.v exists, eos_hdmi_top.v ties these off to a plain "not
+# installed" state (encoder=0/none, everything else 0) -- see that file.
+T(2, 110, "HD STATUS", 2)
+T(3, 110, "ENC"); HX(3, 114, 'hd_encoder', 0, 0, 0)
+T(3, 118, "PLL"); CELL(3, 122, 'hd_pll_lock?"Y":"-"', 'hd_pll_lock?A_OK:7')
+T(4, 110, "BIOS"); CELL(4, 115, 'hd_bios_active?"Y":"-"', 'hd_bios_active?A_OK:7')
+T(4, 118, "GRD"); CELL(4, 122, 'hd_guard_blocked?"B":"A"', 'hd_guard_blocked?A_WARN:A_OK')
+T(5, 110, "EN"); CELL(5, 113, 'hd_transport_en?"Y":"-"', 'hd_transport_en?A_OK:7')
+
 # --- SDRAM PRELOAD ---
 T(9, 1, "SDRAM PRELOAD", 2)
 T(10, 1, "[")
@@ -203,6 +218,16 @@ module eos_serve_hud (
     input  wire [7:0]  i2c_cmd, i2c_a0, i2c_a1,        // last command + args
     input  wire [7:0]  i2c_rx,        // transactions addressed to us
     input  wire        i2c_sel,
+    // HD controller status (X-HD/HD+ ADV7511 control -- see
+    // eos_hd_integration_spec.md). encoder/pll_lock/bios_active/
+    // guard_blocked are RESERVED: eos_hd.v doesn't exist yet. transport_en
+    // is different -- it's wired live to eos_i2c.v's dual-address gate
+    // (built and simulated), so it already shows real status.
+    input  wire [3:0]  hd_encoder,       // 0=none 1=Conexant 2=Focus 3=Xcalibur
+    input  wire        hd_pll_lock,      // ADV reg 0x9E[4]
+    input  wire        hd_bios_active,   // bios_took_over latch
+    input  wire        hd_guard_blocked, // 1 = existing HD controller detected, EOS backed off
+    input  wire        hd_transport_en,  // eos_i2c.v's HD_ADDR (0x69) match gate
     output reg         wr_en,
     output reg  [12:0] wr_addr,
     output reg  [7:0]  wr_data,

@@ -37,9 +37,16 @@ IO_LOC  "lpc_d0"       75;  IO_PORT "lpc_d0"       IO_TYPE=LVCMOS33 PULL_MODE=NO
 // mode16_n -- selection for 1.6/b xboxes
 IO_LOC  "mode16_n"     77;  IO_PORT "mode16_n"     IO_TYPE=LVCMOS33 PULL_MODE=UP HYSTERESIS=HIGH;
 
-// i2C pins
+// Xbox SMBus (SLAVE only -- eos_i2c.v answers 0x6E + 0x69; nothing masters here)
 IO_LOC  "i2c_sda" 71;  IO_PORT "i2c_sda" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
 IO_LOC  "i2c_scl" 72;  IO_PORT "i2c_scl" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
+
+// Private ADV7511 I2C bus (EOS sole master) -- EXP1=SDA, EXP2=SCL.
+// Open-drain is done in RTL (Hi-Z release); needs EXTERNAL pull-ups
+// (~2.2k-4.7k to 3.3V) on each line. This bus is isolated from the Xbox SMBus.
+IO_LOC  "adv_sda" 52;  IO_PORT "adv_sda" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
+IO_LOC  "adv_scl" 53;  IO_PORT "adv_scl" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
+IO_LOC  "adv_int" 49;  IO_PORT "adv_int" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
 
 // ---- onboard LEDs ----
 IO_LOC  "led[0]" 15;  IO_PORT "led[0]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
@@ -48,6 +55,11 @@ IO_LOC  "led[2]" 17;  IO_PORT "led[2]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
 IO_LOC  "led[3]" 18;  IO_PORT "led[3]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
 IO_LOC  "led[4]" 19;  IO_PORT "led[4]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
 IO_LOC  "led[5]" 20;  IO_PORT "led[5]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
+
+// ---- On-board HD status LED (GPIO 30/31, MHT194UGBCT dual green/blue) --
+//      self-contained in eos_hd.v, see eos_hd_integration_spec.md §7.1 ----
+IO_LOC  "hd_led_green" 30;  IO_PORT "hd_led_green" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
+IO_LOC  "hd_led_blue"  31;  IO_PORT "hd_led_blue"  IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
 
 
 // ---- WS2812 status LED  (PIN79 = IOT27B/GCLKC_0) ----
