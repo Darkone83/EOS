@@ -532,6 +532,7 @@ src/
   sdram.v               SDRAM controller
   eos_crc32.v           streaming CRC-32 (update validate)
   eos_i2c.v             Darkone SMBus slave (0x6E) + update command engine
+  eos_i2c_master.v      Private I2C matser for X-HD compatability
   eos_serve_hud.v       serve dashboard  ** GENERATED — edit Tools/gen_hud.py **
   eos_text_rendre.v     colour text renderer + logo overlay
   eos_char_buffer.v     char cell buffer
@@ -541,6 +542,7 @@ src/
   eos_video_timing.v    HDMI video timing
   eos_ws2812.v          WS2812 status LED
   *.hex                 memory inits (font / attr / logo / screen)
+  eos_hd.v              X-HD compatable compatability layer
   eos_hdmi.cst          pin + IO constraints
   eos_hdmi.sdc          timing constraints
 
