@@ -216,7 +216,6 @@ The Status led is fully programable per bank. Once a BIOS is flashed you can set
 
 ### HD Status LED (pins 30, 31)
 Pin 30, is PLL lock. Pin 31, Mode / Handoff Status.
->>>>>>> Stashed changes
 
 ---
 
