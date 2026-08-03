@@ -2,21 +2,23 @@
 // STM-based X-HD/HD+ device on boards with no onboard STM32. See
 // eos_hd_integration_spec.md for the full design; this file implements it.
 //
-// PHASE 1 of this module (what's built here): collision guard, ADV7511
-// presence check, base init, the 2-register encoder-specific tweak, the
-// SMBus command dispatch (READ_CONFIG/VERSION/MODE, WRITE_CONFIG family),
-// the bios_took_over latch, a PLL-lock poll, and the on-board status LED.
+// Implements the active X-HD application behavior in FPGA logic: ADV7511
+// initialization, encoder-specific setup, HPD/monitor interrupts, standalone
+// VIC following, the BIOS SMBus settings protocol, and the complete BIOS
+// table-driven mode applicator.
 //
-// CURRENT ENCODER-SELECTION SCOPE:
+// EOS ENCODER SELECTION:
 //   - The physical 1.6 enable strap is sampled at the beginning of BR_RESET.
 //     A strapped 1.6 boots directly into the exact X-HD Xcalibur profile.
-//   - An unstrapped/pre-1.6 console boots through the already-validated
-//     Conexant profile. The only runtime detection is a one-way transition to
-//     Focus when the BIOS reports encoder byte 0xD4.
-//   - Encoder-specific register values and standalone timing rows are direct
-//     ports of X-HD. EOS adds only the boot selector and Focus-detection layer.
-//   - Full BIOS-driven per-mode reconfiguration remains a separate engine;
-//     FORCE_STANDALONE may still be used while validating encoder branches.
+//   - An unstrapped/pre-1.6 console boots through the validated Conexant
+//     profile. A BIOS encoder byte of 0xD4 may make one one-way transition to
+//     the exact Focus profile.
+//   - X-HD's compile-time encoder build selection is intentionally replaced by
+//     this EOS-native mechanism; all register values and timing rows remain
+//     source-derived.
+//   - FORCE_STANDALONE preserves the validated VIC-following path as a build
+//     override. With it cleared, a valid BIOS APPLY switches to the complete
+//     X-HD BIOS mode engine after initial video is established.
 //
 // HD status (LED, GPIO 30/31) is entirely self-contained here -- no path
 // through eos_bank_led.v or eos_flash_cmd.v's LED_SHOW mechanism. Two
@@ -70,11 +72,10 @@ module eos_hd #(
                                                    // as an override hook.
     parameter [23:0] DLY_ENC_RESCAN = 24'd3_240_000,  // retained compatibility
                                                    // hook; no active probe is used
-    parameter FORCE_STANDALONE = 1'b1              // first-video bring-up mode.
-                                                   // 1 = ignore BIOS APPLY takeover
-                                                   //     and keep standalone active.
-                                                   // 0 = restore normal one-way BIOS
-                                                   //     takeover behavior later.
+    parameter FORCE_STANDALONE = 1'b0              // validated compatibility default.
+                                                   // 1 = keep EOS VIC-following active.
+                                                   // 0 = initial standalone video, then
+                                                   //     exact X-HD BIOS-table takeover.
 )(
     input  wire        clk,      // clk_sd domain, same as eos_i2c.v / eos_i2c_master.v
     input  wire        resetn,
@@ -576,10 +577,20 @@ module eos_hd #(
                     // subsequent write-direction bytes, dispatched by cur_cmd
                     case (cur_cmd)
                         CMD_WRITE_CONFIG: begin
-                            if (cfg_index[3:0] < 4'd14) cfg_scratch[cfg_index[3:0]] <= hd_byte;
-                            cfg_index <= cfg_index + 8'd1;
+                            if ({cfg_bank,cfg_index} < 16'd14) begin
+                                cfg_scratch[cfg_index[3:0]] <= hd_byte;
+                                if (cfg_index == 8'hFF) begin
+                                    cfg_index <= 8'd0;
+                                    cfg_bank <= cfg_bank + 8'd1;
+                                end else begin
+                                    cfg_index <= cfg_index + 8'd1;
+                                end
+                            end
                         end
-                        CMD_WRITE_CONFIG_BANK:  cfg_bank  <= hd_byte;
+                        CMD_WRITE_CONFIG_BANK: begin
+                            cfg_bank <= hd_byte;
+                            cfg_index <= 8'd0;
+                        end
                         CMD_WRITE_CONFIG_INDEX: cfg_index <= hd_byte;
                         CMD_WRITE_CONFIG_APPLY: begin
                             // The config packet is always accepted. That keeps
@@ -615,8 +626,11 @@ module eos_hd #(
             end
 
             // ---- read-side response, always kept current (no stretching needed) ----
+            // READ_CONFIG is latched when its command byte arrives so the
+            // X-HD post-increment cannot advance the response before the
+            // master's repeated-start read.
             case (cur_cmd)
-                CMD_READ_CONFIG:   hd_read_data <= (cfg_index[3:0] < 4'd14) ? cfg_live[cfg_index[3:0]] : 8'h00;
+                CMD_READ_CONFIG:   ; // held from the command-arrival block below
                 CMD_READ_VERSION1: hd_read_data <= HD_VER1;
                 CMD_READ_VERSION2: hd_read_data <= HD_VER2;
                 CMD_READ_VERSION3: hd_read_data <= HD_VER3;
@@ -624,6 +638,20 @@ module eos_hd #(
                 CMD_READ_MODE:     hd_read_data <= 8'h02;   // Application -- also our own presence signature
                 default:           hd_read_data <= 8'hFF;   // STM-reflash-path commands: ignored, per §5.2
             endcase
+
+            // X-HD READ_CONFIG returns the byte at bank:index and then
+            // post-increments the combined 16-bit offset.
+            if (hd_byte_valid && hd_byte_first &&
+                hd_byte == CMD_READ_CONFIG &&
+                {cfg_bank,cfg_index} < 16'd14) begin
+                hd_read_data <= cfg_live[cfg_index[3:0]];
+                if (cfg_index == 8'hFF) begin
+                    cfg_index <= 8'd0;
+                    cfg_bank <= cfg_bank + 8'd1;
+                end else begin
+                    cfg_index <= cfg_index + 8'd1;
+                end
+            end
 
             // clear the one-shot pending flag once the apply/reconfigure FSM
             // below has picked it up (that FSM sets it back to 0)
@@ -668,7 +696,8 @@ module eos_hd #(
         // Encoder report decision state. It runs only after a complete
         // X-HD settings packet has been committed to cfg_live.
         BR_ENCODER_REPORT    = 6'd2,
-        // 3..5 remain reserved for future diagnostics.
+        BR_BIOS_APPLY        = 6'd3,  // detailed state is in bios_st below
+        // 4..5 remain reserved for future diagnostics.
 
         // Transport failure decode states. The HUD prints ST in hexadecimal.
         BR_TRANSPORT_TIMEOUT    = 6'h06,
@@ -756,6 +785,70 @@ module eos_hd #(
         BR_XHD_MODE_FINISH         = 6'd63;
 
     reg [5:0]  br_st;
+
+    // BIOS-owned X-HD mode applicator. br_st remains six bits for the existing
+    // HUD; the detailed operation is carried by this private sub-state.
+    localparam [5:0]
+        BIOS_IDLE             = 6'd0,
+        BIOS_TMDS_DN_RD_WAIT  = 6'd1,
+        BIOS_TMDS_DN_WR_WAIT  = 6'd2,
+        BIOS_CSC_DIS_RD_WAIT  = 6'd3,
+        BIOS_CSC_DIS_WR_WAIT  = 6'd4,
+        BIOS_CSC_WRITE_WAIT   = 6'd5,
+        BIOS_WR35_WAIT        = 6'd6,
+        BIOS_WR36_WAIT        = 6'd7,
+        BIOS_RD37_WAIT        = 6'd8,
+        BIOS_WR37_WAIT        = 6'd9,
+        BIOS_WR38_WAIT        = 6'd10,
+        BIOS_WR39_WAIT        = 6'd11,
+        BIOS_WR3A_WAIT        = 6'd12,
+        BIOS_WRD7_WAIT        = 6'd13,
+        BIOS_WRD8_WAIT        = 6'd14,
+        BIOS_WRD9_WAIT        = 6'd15,
+        BIOS_WRDA_WAIT        = 6'd16,
+        BIOS_WRDB_WAIT        = 6'd17,
+        BIOS_RD41_WAIT        = 6'd18,
+        BIOS_WR41_WAIT        = 6'd19,
+        BIOS_WRDC_WAIT        = 6'd20,
+        BIOS_RDD0_WAIT        = 6'd21,
+        BIOS_WRD0_WAIT        = 6'd22,
+        BIOS_WR3C_WAIT        = 6'd23,
+        BIOS_AVI_RD4A_SET     = 6'd24,
+        BIOS_AVI_WR4A_SET     = 6'd25,
+        BIOS_AVI_RD55         = 6'd26,
+        BIOS_AVI_WR55         = 6'd27,
+        BIOS_AVI_WR56         = 6'd28,
+        BIOS_AVI_WR57         = 6'd29,
+        BIOS_AVI_WR58         = 6'd30,
+        BIOS_AVI_WR59         = 6'd31,
+        BIOS_AVI_RD4A_CLR     = 6'd32,
+        BIOS_AVI_WR4A_CLR     = 6'd33,
+        BIOS_TMDS_UP_RD_WAIT  = 6'd34,
+        BIOS_TMDS_UP_WR_WAIT  = 6'd35,
+        BIOS_RECOVER_RD       = 6'd36,
+        BIOS_RECOVER_RD_WAIT  = 6'd37,
+        BIOS_RECOVER_WR_WAIT  = 6'd38;
+
+    reg [5:0]  bios_st;
+    reg [4:0]  bios_csc_idx;
+    reg [31:0] bios_current_mode;
+    reg [31:0] bios_current_avinfo;
+    reg [31:0] bios_pending_mode;
+    reg [31:0] bios_pending_avinfo;
+    reg [15:0] bios_adv_delay_hs;
+    reg [15:0] bios_vs_delay;
+    reg [15:0] bios_h_active;
+    reg [15:0] bios_v_active;
+    reg [15:0] bios_hsync_placement;
+    reg [15:0] bios_hsync_duration;
+    reg [15:0] bios_vsync_placement;
+    reg [15:0] bios_vsync_duration;
+    reg [2:0]  bios_interlaced_offset;
+    reg [5:0]  bios_vic;
+    reg        bios_sync_adjust;
+    reg        bios_rgb;
+    reg        bios_use_709;
+    reg        bios_ws_infoframe;
     // True for every state that's part of init_adv() (BR_INIT_HPD_FULL
     // through BR_ENABLE_VIDEO, inclusive) -- used by the single, centralized
     // failure check below rather than adding a per-state NACK/timeout check
@@ -776,6 +869,8 @@ module eos_hd #(
         ((br_st >= BR_STANDALONE_CSC_DISABLE) &&
          (br_st <= BR_STANDALONE_INTERLACE_37)) ||
         (br_st == BR_XHD_MODE_FINISH);
+    wire in_bios_apply_main =
+        (br_st == BR_BIOS_APPLY) && (bios_st < BIOS_RECOVER_RD);
     reg [1:0]  boot_encoder_id;    // sampled once in BR_RESET from xbox_16_mode
     reg        boot_xcalibur;      // latched physical branch; never changes this boot
     reg        focus_detected;     // one-way pre-1.6 Conexant -> Focus transition
@@ -803,6 +898,185 @@ module eos_hd #(
     localparam [2:0] DR_NONE=3'd0, DR_ENC_CNXT=3'd1, DR_ENC_FOCUS=3'd2,
                       DR_GUARD=3'd3, DR_INIT=3'd4, DR_ENC_NOT_FOUND=3'd5;
     reg [2:0]  disable_reason;
+
+    // =========================================================================
+    // X-HD BIOS-owned mode tables and helpers.
+    //
+    // EOS keeps its own encoder-selection mechanism: the physical 1.6 strap
+    // selects Xcalibur, pre-1.6 starts Conexant, and only a BIOS-confirmed 0xD4
+    // report may transition that path to Focus. Once selected, the rows below
+    // are the exact 18-entry X-HD tables from xbox_video_bios.h.
+    //
+    // Packed row layout:
+    //   [160]     valid
+    //   [159:144] hs_delay
+    //   [143:128] vs_delay
+    //   [127:112] h_active
+    //   [111:96]  v_active
+    //   [95:80]   hsync_placement
+    //   [79:64]   hsync_duration
+    //   [63:48]   vsync_placement
+    //   [47:32]   vsync_duration
+    //   [31:16]   interlaced_offset
+    //   [15:0]    sync_adjust_enabled
+    // =========================================================================
+    function [160:0] bios_mode_row;
+        input [1:0] enc;
+        input [4:0] idx;
+        begin
+            case ({enc,idx})
+            {ENC_CONEXANT,5'd1}: bios_mode_row = {1'b1, 16'd123, 16'd34, 16'd640, 16'd480, 16'd13, 16'd32, 16'd10, 16'd3, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd2}: bios_mode_row = {1'b1, 16'd135, 16'd34, 16'd720, 16'd480, 16'd15, 16'd32, 16'd10, 16'd3, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd3}: bios_mode_row = {1'b1, 16'd255, 16'd36, 16'd640, 16'd480, 16'd55, 16'd32, 16'd8, 16'd3, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd4}: bios_mode_row = {1'b1, 16'd271, 16'd36, 16'd720, 16'd480, 16'd59, 16'd32, 16'd8, 16'd3, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd5}: bios_mode_row = {1'b1, 16'd133, 16'd39, 16'd640, 16'd576, 16'd15, 16'd32, 16'd9, 16'd3, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd6}: bios_mode_row = {1'b1, 16'd149, 16'd39, 16'd720, 16'd576, 16'd17, 16'd33, 16'd9, 16'd3, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd7}: bios_mode_row = {1'b1, 16'd120, 16'd36, 16'd720, 16'd480, 16'd17, 16'd63, 16'd8, 16'd6, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd8}: bios_mode_row = {1'b1, 16'd120, 16'd36, 16'd720, 16'd480, 16'd17, 16'd63, 16'd8, 16'd6, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd9}: bios_mode_row = {1'b1, 16'd301, 16'd25, 16'd960, 16'd720, 16'd69, 16'd80, 16'd4, 16'd5, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd10}: bios_mode_row = {1'b1, 16'd300, 16'd25, 16'd1280, 16'd720, 16'd69, 16'd80, 16'd4, 16'd5, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd11}: bios_mode_row = {1'b1, 16'd300, 16'd25, 16'd1280, 16'd720, 16'd69, 16'd80, 16'd4, 16'd5, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd12}: bios_mode_row = {1'b1, 16'd237, 16'd40, 16'd1440, 16'd1080, 16'd43, 16'd88, 16'd4, 16'd10, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd13}: bios_mode_row = {1'b1, 16'd237, 16'd40, 16'd1920, 16'd1080, 16'd43, 16'd88, 16'd4, 16'd10, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd14}: bios_mode_row = {1'b1, 16'd236, 16'd41, 16'd1920, 16'd1080, 16'd44, 16'd88, 16'd3, 16'd10, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd15}: bios_mode_row = {1'b1, 16'd166, 16'd34, 16'd640, 16'd480, 16'd48, 16'd32, 16'd10, 16'd3, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd16}: bios_mode_row = {1'b1, 16'd319, 16'd34, 16'd640, 16'd480, 16'd91, 16'd32, 16'd10, 16'd3, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd17}: bios_mode_row = {1'b1, 16'd121, 16'd36, 16'd720, 16'd480, 16'd17, 16'd63, 16'd8, 16'd6, 16'd0, 16'd1};
+            {ENC_CONEXANT,5'd18}: bios_mode_row = {1'b1, 16'd180, 16'd39, 16'd640, 16'd576, 16'd48, 16'd32, 16'd9, 16'd3, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd1}: bios_mode_row = {1'b1, 16'd180, 16'd26, 16'd640, 16'd480, 16'd115, 16'd64, 16'd18, 16'd2, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd2}: bios_mode_row = {1'b1, 16'd140, 16'd26, 16'd720, 16'd480, 16'd75, 16'd64, 16'd18, 16'd2, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd3}: bios_mode_row = {1'b1, 16'd144, 16'd24, 16'd640, 16'd480, 16'd79, 16'd64, 16'd20, 16'd2, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd4}: bios_mode_row = {1'b1, 16'd104, 16'd24, 16'd720, 16'd480, 16'd59, 16'd64, 16'd20, 16'd2, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd5}: bios_mode_row = {1'b1, 16'd144, 16'd26, 16'd640, 16'd576, 16'd79, 16'd64, 16'd22, 16'd2, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd6}: bios_mode_row = {1'b1, 16'd104, 16'd26, 16'd720, 16'd576, 16'd59, 16'd64, 16'd22, 16'd2, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd7}: bios_mode_row = {1'b1, 16'd120, 16'd38, 16'd720, 16'd480, 16'd17, 16'd63, 16'd8, 16'd6, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd8}: bios_mode_row = {1'b1, 16'd120, 16'd38, 16'd720, 16'd480, 16'd17, 16'd63, 16'd8, 16'd6, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd9}: bios_mode_row = {1'b1, 16'd300, 16'd25, 16'd960, 16'd720, 16'd69, 16'd80, 16'd4, 16'd5, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd10}: bios_mode_row = {1'b1, 16'd300, 16'd25, 16'd1280, 16'd720, 16'd69, 16'd80, 16'd4, 16'd5, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd11}: bios_mode_row = {1'b1, 16'd300, 16'd27, 16'd1280, 16'd720, 16'd69, 16'd80, 16'd4, 16'd5, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd12}: bios_mode_row = {1'b1, 16'd237, 16'd40, 16'd1440, 16'd1080, 16'd43, 16'd88, 16'd4, 16'd10, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd13}: bios_mode_row = {1'b1, 16'd237, 16'd40, 16'd1920, 16'd1080, 16'd43, 16'd88, 16'd4, 16'd10, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd14}: bios_mode_row = {1'b1, 16'd236, 16'd41, 16'd1920, 16'd1080, 16'd44, 16'd88, 16'd3, 16'd10, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd15}: bios_mode_row = {1'b1, 16'd180, 16'd26, 16'd640, 16'd480, 16'd115, 16'd64, 16'd18, 16'd2, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd16}: bios_mode_row = {1'b1, 16'd144, 16'd24, 16'd640, 16'd480, 16'd79, 16'd64, 16'd20, 16'd2, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd17}: bios_mode_row = {1'b1, 16'd120, 16'd36, 16'd720, 16'd480, 16'd17, 16'd63, 16'd8, 16'd6, 16'd0, 16'd1};
+            {ENC_FOCUS,5'd18}: bios_mode_row = {1'b1, 16'd144, 16'd26, 16'd640, 16'd576, 16'd79, 16'd64, 16'd22, 16'd2, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd1}: bios_mode_row = {1'b1, 16'd96, 16'd37, 16'd640, 16'd480, 16'd43, 16'd2, 16'd7, 16'd2, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd2}: bios_mode_row = {1'b1, 16'd96, 16'd37, 16'd720, 16'd480, 16'd41, 16'd6, 16'd7, 16'd6, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd3}: bios_mode_row = {1'b1, 16'd96, 16'd38, 16'd640, 16'd480, 16'd63, 16'd24, 16'd1, 16'd10, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd4}: bios_mode_row = {1'b1, 16'd138, 16'd38, 16'd720, 16'd480, 16'd41, 16'd50, 16'd1, 16'd10, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd5}: bios_mode_row = {1'b1, 16'd143, 16'd41, 16'd640, 16'd576, 16'd127, 16'd47, 16'd6, 16'd6, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd6}: bios_mode_row = {1'b1, 16'd138, 16'd42, 16'd720, 16'd576, 16'd5, 16'd45, 16'd6, 16'd6, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd7}: bios_mode_row = {1'b1, 16'd96, 16'd36, 16'd640, 16'd480, 16'd43, 16'd2, 16'd8, 16'd5, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd8}: bios_mode_row = {1'b1, 16'd96, 16'd36, 16'd720, 16'd480, 16'd41, 16'd6, 16'd8, 16'd5, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd9}: bios_mode_row = {1'b1, 16'd301, 16'd25, 16'd960, 16'd720, 16'd69, 16'd80, 16'd4, 16'd5, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd10}: bios_mode_row = {1'b1, 16'd260, 16'd25, 16'd1280, 16'd720, 16'd110, 16'd40, 16'd5, 16'd5, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd11}: bios_mode_row = {1'b1, 16'd260, 16'd25, 16'd1280, 16'd720, 16'd110, 16'd40, 16'd5, 16'd5, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd12}: bios_mode_row = {1'b1, 16'd237, 16'd40, 16'd1440, 16'd1080, 16'd43, 16'd88, 16'd4, 16'd10, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd13}: bios_mode_row = {1'b1, 16'd237, 16'd40, 16'd1920, 16'd1080, 16'd43, 16'd88, 16'd4, 16'd10, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd14}: bios_mode_row = {1'b1, 16'd188, 16'd41, 16'd1920, 16'd1080, 16'd92, 16'd40, 16'd3, 16'd10, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd15}: bios_mode_row = {1'b1, 16'd137, 16'd37, 16'd640, 16'd480, 16'd81, 16'd1, 16'd7, 16'd6, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd16}: bios_mode_row = {1'b1, 16'd178, 16'd38, 16'd640, 16'd480, 16'd81, 16'd42, 16'd1, 16'd10, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd17}: bios_mode_row = {1'b1, 16'd95, 16'd36, 16'd720, 16'd480, 16'd41, 16'd6, 16'd8, 16'd5, 16'd0, 16'd1};
+            {ENC_XCALIBUR,5'd18}: bios_mode_row = {1'b1, 16'd143, 16'd41, 16'd640, 16'd576, 16'd87, 16'd7, 16'd6, 16'd6, 16'd0, 16'd1};
+                default: bios_mode_row = 161'd0;
+            endcase
+        end
+    endfunction
+
+    // Exact X-HD CSC payloads written to ADV7511 registers 0x18-0x2F.
+    function [7:0] bios_csc_byte;
+        input       use_709;
+        input [4:0] idx;
+        begin
+            case (idx)
+            5'd0: bios_csc_byte = 8'h87;
+            5'd1: bios_csc_byte = 8'h06;
+            5'd2: bios_csc_byte = (use_709 ? 8'h19 : 8'h1A);
+            5'd3: bios_csc_byte = (use_709 ? 8'h9E : 8'h1E);
+            5'd4: bios_csc_byte = (use_709 ? 8'h1F : 8'h1E);
+            5'd5: bios_csc_byte = (use_709 ? 8'h5D : 8'hDE);
+            5'd6: bios_csc_byte = 8'h08;
+            5'd7: bios_csc_byte = 8'h00;
+            5'd8: bios_csc_byte = (use_709 ? 8'h02 : 8'h04);
+            5'd9: bios_csc_byte = (use_709 ? 8'hED : 8'h1C);
+            5'd10: bios_csc_byte = (use_709 ? 8'h09 : 8'h08);
+            5'd11: bios_csc_byte = (use_709 ? 8'hD2 : 8'h10);
+            5'd12: bios_csc_byte = (use_709 ? 8'h00 : 8'h01);
+            5'd13: bios_csc_byte = (use_709 ? 8'hFD : 8'h91);
+            5'd14: bios_csc_byte = 8'h01;
+            5'd15: bios_csc_byte = 8'h00;
+            5'd16: bios_csc_byte = (use_709 ? 8'h1E : 8'h1D);
+            5'd17: bios_csc_byte = (use_709 ? 8'h63 : 8'hA2);
+            5'd18: bios_csc_byte = (use_709 ? 8'h1A : 8'h1B);
+            5'd19: bios_csc_byte = (use_709 ? 8'h98 : 8'h59);
+            5'd20: bios_csc_byte = 8'h07;
+            5'd21: bios_csc_byte = 8'h06;
+            5'd22: bios_csc_byte = 8'h08;
+            5'd23: bios_csc_byte = 8'h00;
+                default: bios_csc_byte = 8'h00;
+            endcase
+        end
+    endfunction
+
+    // Exact get_vic_from_video_mode() mapping from xbox_video_bios.c.
+    function [5:0] bios_vic_from_dims;
+        input [15:0] h_active;
+        input [15:0] v_active;
+        input        widescreen;
+        begin
+            case (h_active)
+                16'd640, 16'd720:
+                    bios_vic_from_dims = (v_active == 16'd576)
+                                       ? (widescreen ? 6'd18 : 6'd17)
+                                       : (widescreen ? 6'd3  : 6'd2);
+                16'd1280: bios_vic_from_dims = 6'd4;
+                16'd1920: bios_vic_from_dims = 6'd5;
+                default:  bios_vic_from_dims = 6'd0;
+            endcase
+        end
+    endfunction
+
+    // Packed X-HD SMBusSettings fields (little-endian uint32_t members).
+    wire [31:0] live_mode   = {cfg_live[5],  cfg_live[4],  cfg_live[3],  cfg_live[2]};
+    wire [31:0] live_avinfo = {cfg_live[13], cfg_live[12], cfg_live[11], cfg_live[10]};
+    wire [7:0]  live_mode_index = live_mode[23:16];
+
+    wire [160:0] bios_row_wire =
+        bios_mode_row(last_encoder_id, live_mode_index[4:0]);
+    wire         bios_row_valid = bios_row_wire[160] &&
+                                  (live_mode_index >= 8'd1) &&
+                                  (live_mode_index <= 8'd18);
+    wire [15:0]  bios_row_hs_delay = bios_row_wire[159:144];
+    wire [15:0]  bios_row_vs_delay = bios_row_wire[143:128];
+    wire [15:0]  bios_row_h_active = bios_row_wire[127:112];
+    wire [15:0]  bios_row_v_active = bios_row_wire[111:96];
+    wire [15:0]  bios_row_hsync_placement = bios_row_wire[95:80];
+    wire [15:0]  bios_row_hsync_duration  = bios_row_wire[79:64];
+    wire [15:0]  bios_row_vsync_placement = bios_row_wire[63:48];
+    wire [15:0]  bios_row_vsync_duration  = bios_row_wire[47:32];
+    wire [2:0]   bios_row_interlaced_offset = bios_row_wire[18:16];
+    wire         bios_row_sync_adjust = bios_row_wire[0];
+
+    // X-HD currently hardcodes only table rows 0x0D/0x0E as interlaced.
+    wire bios_live_interlaced = (live_mode_index == 8'h0D) ||
+                                (live_mode_index == 8'h0E);
+    wire [15:0] bios_row_vs_adjusted = bios_live_interlaced
+                                     ? (bios_row_vs_delay >> 1)
+                                     : bios_row_vs_delay;
+    wire [15:0] bios_row_v_adjusted  = bios_live_interlaced
+                                     ? (bios_row_v_active >> 1)
+                                     : bios_row_v_active;
+    wire        bios_live_widescreen = live_mode[28];
+    wire        bios_live_rgb        = live_mode[29];
+    wire [5:0]  bios_live_vic =
+        bios_vic_from_dims(bios_row_h_active,
+                           bios_row_v_adjusted,
+                           bios_live_widescreen);
+    wire bios_live_ws_infoframe = bios_live_widescreen ||
+                                  (bios_live_vic == 6'd3) ||
+                                  (bios_live_vic == 6'd4) ||
+                                  (bios_live_vic == 6'd5);
     localparam MAX_ADV_PROBE_RETRIES = 2'd3;   // "two or three times" -- picked
                                                  // the more thorough end
     // DLY_30MS/DLY_50MS are module parameters (see port list above),
@@ -943,6 +1217,17 @@ module eos_hd #(
             diag_3d_raw<=8'h00; diag_9e_raw<=8'h00;
             transport_verified<=1'b0;
             transport_error_code<=3'd0;
+            bios_st<=BIOS_IDLE; bios_csc_idx<=5'd0;
+            bios_current_mode<=32'd0; bios_current_avinfo<=32'd0;
+            bios_pending_mode<=32'd0; bios_pending_avinfo<=32'd0;
+            bios_adv_delay_hs<=16'd0; bios_vs_delay<=16'd0;
+            bios_h_active<=16'd0; bios_v_active<=16'd0;
+            bios_hsync_placement<=16'd0; bios_hsync_duration<=16'd0;
+            bios_vsync_placement<=16'd0; bios_vsync_duration<=16'd0;
+            bios_interlaced_offset<=3'd0; bios_vic<=6'd0;
+            bios_sync_adjust<=1'b0;
+            bios_rgb<=1'b0; bios_use_709<=1'b0;
+            bios_ws_infoframe<=1'b0;
             cfg_ack<=1'b0;
         end else begin
             op_go<=1'b0;
@@ -959,8 +1244,8 @@ module eos_hd #(
             led_blue  <= FORCE_STANDALONE ? mode_applied_ok : bios_took_over;
 
             // The private ADV bus follows X-HD's source-order loop directly:
-            // PLL -> interrupt handler -> standalone VIC. No shared-bus pacing
-            // is required in this bring-up build.
+            // PLL -> interrupt handler -> standalone VIC or BIOS table engine.
+            // No shared-bus pacing is required on the dedicated ADV bus.
 
             // ---- source-call transport behavior ----
             // X-HD's ADV helpers are synchronous HAL calls. EOS snapshots
@@ -994,6 +1279,14 @@ module eos_hd #(
                 op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
                 adv_waddr<=8'h9E; op_go<=1'b1;
                 br_st<=BR_READY;
+            end else if (op_done && (op_nack || op_timeout) &&
+                         in_bios_apply_main) begin
+                // Do not let a failed read feed stale data into the next
+                // BIOS read-modify-write. Attempt to restore TMDS, then
+                // acknowledge this update and retain the last known-good mode.
+                bringup_i2c_error<=1'b1;
+                mode_applied_ok<=1'b0;
+                bios_st<=BIOS_RECOVER_RD;
             end else begin
             case (br_st)
                 BR_RESET: begin
@@ -1365,10 +1658,30 @@ module eos_hd #(
                             adv_waddr<=8'h96; op_go<=1'b1;
                             xhd_irq_phase<=IRQ_WAIT_FLAGS;
                             br_st<=BR_XHD_IRQ_HANDLER;
+                        end else if (!FORCE_STANDALONE && bios_took_over) begin
+                            // X-HD main.c calls bios_loop() here instead of
+                            // stand_alone_loop() after one-way takeover.
+                            if (cfg_pending && !cfg_ack) begin
+                                br_st<=BR_ENCODER_REPORT;
+                            end else begin
+                                op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'h9E; op_go<=1'b1;
+                            end
                         end else begin
                             // adv_handle_interrupts() returned immediately.
                             op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
                             adv_waddr<=8'h3E; op_go<=1'b1;
+                        end
+                    end else if (!FORCE_STANDALONE && bios_took_over) begin
+                        // BIOS ownership stops the standalone 0x3E applicator.
+                        // Any already-active transaction is allowed to finish;
+                        // subsequent work comes only from BIOS APPLY packets.
+                        if (cfg_pending && !cfg_ack &&
+                            !op_go && ops_st==OPS_IDLE) begin
+                            br_st<=BR_ENCODER_REPORT;
+                        end else if (!op_go && ops_st==OPS_IDLE) begin
+                            op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h9E; op_go<=1'b1;
                         end
                     end else if (op_done && op_kind==OP_READ &&
                                  adv_waddr==8'h3E) begin
@@ -1394,7 +1707,7 @@ module eos_hd #(
                             adv_waddr<=8'h9E; op_go<=1'b1;
                         end
                     end else if (cfg_pending && !cfg_ack &&
-                                        !op_go && ops_st==OPS_IDLE) begin
+                                 !op_go && ops_st==OPS_IDLE) begin
                         br_st<=BR_ENCODER_REPORT;
                     end else if (!op_go && ops_st==OPS_IDLE) begin
                         op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
@@ -1403,17 +1716,23 @@ module eos_hd #(
                 end
 
                 // Thin EOS detection layer around the proven X-HD branches.
-                // This state never writes timing values itself; it either
-                // retains the active branch or launches X-HD's exact Focus
-                // 0x48/0xBA/0xD0 sequence.
+                // EOS's physical/detected encoder remains authoritative; after
+                // that decision, FORCE_STANDALONE selects either the existing
+                // VIC-following path or the complete X-HD BIOS applicator.
                 BR_ENCODER_REPORT: begin
                     if (boot_xcalibur) begin
                         if (!live_encoder_is_xcalibur)
                             encoder_report_mismatch<=1'b1;
                         if (!live_encoder_valid)
                             encoder_report_invalid<=1'b1;
-                        cfg_ack<=1'b1;
-                        br_st<=BR_READY;
+
+                        if (FORCE_STANDALONE) begin
+                            cfg_ack<=1'b1;
+                            br_st<=BR_READY;
+                        end else begin
+                            bios_st<=BIOS_IDLE;
+                            br_st<=BR_BIOS_APPLY;
+                        end
                     end else if (focus_detected) begin
                         if (!live_encoder_is_focus) begin
                             if (live_encoder_valid)
@@ -1421,11 +1740,19 @@ module eos_hd #(
                             else
                                 encoder_report_invalid<=1'b1;
                         end
-                        cfg_ack<=1'b1;
-                        br_st<=BR_READY;
+
+                        if (FORCE_STANDALONE) begin
+                            cfg_ack<=1'b1;
+                            br_st<=BR_READY;
+                        end else begin
+                            bios_st<=BIOS_IDLE;
+                            br_st<=BR_BIOS_APPLY;
+                        end
                     end else if (live_encoder_is_focus) begin
                         enc_apply_id<=ENC_FOCUS;
-                        enc_tweak_return_st<=BR_READY;
+                        enc_tweak_return_st<=FORCE_STANDALONE
+                                           ? BR_READY : BR_BIOS_APPLY;
+                        bios_st<=BIOS_IDLE;
                         op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
                         adv_waddr<=8'h48; op_go<=1'b1;
                         br_st<=BR_ENC_TWEAK_WT;
@@ -1434,9 +1761,415 @@ module eos_hd #(
                             encoder_report_mismatch<=1'b1;
                         if (!live_encoder_valid)
                             encoder_report_invalid<=1'b1;
-                        cfg_ack<=1'b1;
-                        br_st<=BR_READY;
+
+                        if (FORCE_STANDALONE) begin
+                            cfg_ack<=1'b1;
+                            br_st<=BR_READY;
+                        end else begin
+                            bios_st<=BIOS_IDLE;
+                            br_st<=BR_BIOS_APPLY;
+                        end
                     end
+                end
+
+
+                // =========================================================
+                // X-HD BIOS-owned mode applicator.
+                //
+                // This is entered only when FORCE_STANDALONE=0. The default
+                // validated standalone path is therefore unchanged. EOS's
+                // own encoder selection remains authoritative; this engine
+                // ports xbox_video_bios.c after encoder selection.
+                // =========================================================
+                BR_BIOS_APPLY: begin
+                    case (bios_st)
+                        BIOS_IDLE: begin
+                            // X-HD bios_loop() changes the ADV only when mode
+                            // or avinfo changed. Encoder changes were handled
+                            // immediately before entering this state.
+                            if ((live_mode == bios_current_mode) &&
+                                (live_avinfo == bios_current_avinfo)) begin
+                                cfg_ack<=1'b1;
+                                op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'h9E; op_go<=1'b1;
+                                br_st<=BR_READY;
+                            end else if (!bios_row_valid) begin
+                                // X-HD records the new mode/avinfo before it
+                                // discovers that the table row is absent, then
+                                // leaves the current output untouched.
+                                bios_current_mode<=live_mode;
+                                bios_current_avinfo<=live_avinfo;
+                                cfg_ack<=1'b1;
+                                op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'h9E; op_go<=1'b1;
+                                br_st<=BR_READY;
+                            end else begin
+                                bios_pending_mode<=live_mode;
+                                bios_pending_avinfo<=live_avinfo;
+                                bios_adv_delay_hs<=bios_row_hs_delay-16'd1;
+                                bios_vs_delay<=bios_row_vs_adjusted;
+                                bios_h_active<=bios_row_h_active;
+                                bios_v_active<=bios_row_v_adjusted;
+                                bios_hsync_placement<=bios_row_hsync_placement;
+                                bios_hsync_duration<=bios_row_hsync_duration;
+                                bios_vsync_placement<=bios_row_vsync_placement;
+                                bios_vsync_duration<=bios_row_vsync_duration;
+                                bios_interlaced_offset<=bios_row_interlaced_offset;
+                                bios_sync_adjust<=bios_row_sync_adjust;
+                                bios_rgb<=bios_live_rgb;
+                                bios_use_709<=(bios_row_h_active >= 16'd1280);
+                                bios_vic<=bios_live_vic;
+                                bios_ws_infoframe<=bios_live_ws_infoframe;
+                                bios_csc_idx<=5'd0;
+                                mode_applied_ok<=1'b0;
+
+                                // adv7511_power_down_tmds(): update A1[5:2]=1.
+                                op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'hA1; op_go<=1'b1;
+                                bios_st<=BIOS_TMDS_DN_RD_WAIT;
+                            end
+                        end
+
+                        BIOS_TMDS_DN_RD_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'hA1;
+                            adv_wdata<=adv_rdata | 8'h3C;
+                            op_go<=1'b1;
+                            bios_st<=BIOS_TMDS_DN_WR_WAIT;
+                        end
+
+                        BIOS_TMDS_DN_WR_WAIT: if (op_done) begin
+                            if (bios_rgb) begin
+                                // adv7511_apply_csc(): full writes 0x18-0x2F.
+                                bios_csc_idx<=5'd0;
+                                op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'h18;
+                                adv_wdata<=bios_csc_byte(bios_use_709,5'd0);
+                                op_go<=1'b1;
+                                bios_st<=BIOS_CSC_WRITE_WAIT;
+                            end else begin
+                                // adv7511_disable_csc(): clear 0x18[7].
+                                op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'h18; op_go<=1'b1;
+                                bios_st<=BIOS_CSC_DIS_RD_WAIT;
+                            end
+                        end
+
+                        BIOS_CSC_DIS_RD_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h18;
+                            adv_wdata<=adv_rdata & ~8'h80;
+                            op_go<=1'b1;
+                            bios_st<=BIOS_CSC_DIS_WR_WAIT;
+                        end
+
+                        BIOS_CSC_DIS_WR_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h35;
+                            adv_wdata<=bios_adv_delay_hs[9:2];
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WR35_WAIT;
+                        end
+
+                        BIOS_CSC_WRITE_WAIT: if (op_done) begin
+                            if (bios_csc_idx == 5'd23) begin
+                                op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'h35;
+                                adv_wdata<=bios_adv_delay_hs[9:2];
+                                op_go<=1'b1;
+                                bios_st<=BIOS_WR35_WAIT;
+                            end else begin
+                                bios_csc_idx<=bios_csc_idx+5'd1;
+                                op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'h19 + {3'b000,bios_csc_idx};
+                                adv_wdata<=bios_csc_byte(
+                                    bios_use_709,bios_csc_idx+5'd1);
+                                op_go<=1'b1;
+                            end
+                        end
+
+                        BIOS_WR35_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h36;
+                            adv_wdata<={bios_adv_delay_hs[1:0],
+                                       bios_vs_delay[5:0]};
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WR36_WAIT;
+                        end
+
+                        BIOS_WR36_WAIT: if (op_done) begin
+                            op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h37; op_go<=1'b1;
+                            bios_st<=BIOS_RD37_WAIT;
+                        end
+
+                        BIOS_RD37_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h37;
+                            adv_wdata<=((adv_rdata & 8'hE0) |
+                                       {3'b000,bios_h_active[11:7]});
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WR37_WAIT;
+                        end
+
+                        BIOS_WR37_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h38;
+                            adv_wdata<={bios_h_active[6:0],1'b0};
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WR38_WAIT;
+                        end
+
+                        BIOS_WR38_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h39;
+                            adv_wdata<=bios_v_active[11:4];
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WR39_WAIT;
+                        end
+
+                        BIOS_WR39_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h3A;
+                            adv_wdata<={bios_v_active[3:0],4'b0000};
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WR3A_WAIT;
+                        end
+
+                        BIOS_WR3A_WAIT: if (op_done) begin
+                            if (bios_sync_adjust) begin
+                                op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'hD7;
+                                adv_wdata<=bios_hsync_placement[9:2];
+                                op_go<=1'b1;
+                                bios_st<=BIOS_WRD7_WAIT;
+                            end else begin
+                                op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'h41; op_go<=1'b1;
+                                bios_st<=BIOS_RD41_WAIT;
+                            end
+                        end
+
+                        BIOS_WRD7_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'hD8;
+                            adv_wdata<={bios_hsync_placement[1:0],
+                                       bios_hsync_duration[9:4]};
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WRD8_WAIT;
+                        end
+
+                        BIOS_WRD8_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'hD9;
+                            adv_wdata<={bios_hsync_duration[3:0],
+                                       bios_vsync_placement[9:6]};
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WRD9_WAIT;
+                        end
+
+                        BIOS_WRD9_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'hDA;
+                            adv_wdata<={bios_vsync_placement[5:0],
+                                       bios_vsync_duration[9:8]};
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WRDA_WAIT;
+                        end
+
+                        BIOS_WRDA_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'hDB;
+                            adv_wdata<=bios_vsync_duration[7:0];
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WRDB_WAIT;
+                        end
+
+                        BIOS_WRDB_WAIT: if (op_done) begin
+                            op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h41; op_go<=1'b1;
+                            bios_st<=BIOS_RD41_WAIT;
+                        end
+
+                        BIOS_RD41_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h41;
+                            adv_wdata<=bios_sync_adjust
+                                     ? (adv_rdata | 8'h02)
+                                     : (adv_rdata & ~8'h02);
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WR41_WAIT;
+                        end
+
+                        BIOS_WR41_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'hDC;
+                            adv_wdata<={bios_interlaced_offset,5'b00000};
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WRDC_WAIT;
+                        end
+
+                        BIOS_WRDC_WAIT: if (op_done) begin
+                            op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'hD0; op_go<=1'b1;
+                            bios_st<=BIOS_RDD0_WAIT;
+                        end
+
+                        BIOS_RDD0_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'hD0;
+                            adv_wdata<=adv_rdata | 8'h02;
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WRD0_WAIT;
+                        end
+
+                        BIOS_WRD0_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h3C;
+                            adv_wdata<={2'b00,bios_vic};
+                            op_go<=1'b1;
+                            bios_st<=BIOS_WR3C_WAIT;
+                        end
+
+                        BIOS_WR3C_WAIT: if (op_done) begin
+                            op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h4A; op_go<=1'b1;
+                            bios_st<=BIOS_AVI_RD4A_SET;
+                        end
+
+                        BIOS_AVI_RD4A_SET: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h4A;
+                            adv_wdata<=adv_rdata | 8'h40;
+                            op_go<=1'b1;
+                            bios_st<=BIOS_AVI_WR4A_SET;
+                        end
+
+                        BIOS_AVI_WR4A_SET: if (op_done) begin
+                            op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h55; op_go<=1'b1;
+                            bios_st<=BIOS_AVI_RD55;
+                        end
+
+                        BIOS_AVI_RD55: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h55;
+                            // CSC always presents YCbCr to the ADV output path.
+                            adv_wdata<=((adv_rdata & ~8'h73) | 8'h52);
+                            op_go<=1'b1;
+                            bios_st<=BIOS_AVI_WR55;
+                        end
+
+                        BIOS_AVI_WR55: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h56;
+                            adv_wdata<=((bios_vic==6'd4 || bios_vic==6'd5)
+                                      ? 8'h80 : 8'h40) |
+                                      (bios_ws_infoframe ? 8'h28 : 8'h18);
+                            op_go<=1'b1;
+                            bios_st<=BIOS_AVI_WR56;
+                        end
+
+                        BIOS_AVI_WR56: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h57; adv_wdata<=8'h80;
+                            op_go<=1'b1;
+                            bios_st<=BIOS_AVI_WR57;
+                        end
+
+                        BIOS_AVI_WR57: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h58;
+                            adv_wdata<={2'b00,bios_vic};
+                            op_go<=1'b1;
+                            bios_st<=BIOS_AVI_WR58;
+                        end
+
+                        BIOS_AVI_WR58: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h59; adv_wdata<=8'h30;
+                            op_go<=1'b1;
+                            bios_st<=BIOS_AVI_WR59;
+                        end
+
+                        BIOS_AVI_WR59: if (op_done) begin
+                            op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h4A; op_go<=1'b1;
+                            bios_st<=BIOS_AVI_RD4A_CLR;
+                        end
+
+                        BIOS_AVI_RD4A_CLR: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h4A;
+                            adv_wdata<=adv_rdata & ~8'h40;
+                            op_go<=1'b1;
+                            bios_st<=BIOS_AVI_WR4A_CLR;
+                        end
+
+                        BIOS_AVI_WR4A_CLR: if (op_done) begin
+                            // adv7511_power_up_tmds(): update A1[5:2]=0.
+                            op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'hA1; op_go<=1'b1;
+                            bios_st<=BIOS_TMDS_UP_RD_WAIT;
+                        end
+
+                        BIOS_TMDS_UP_RD_WAIT: if (op_done) begin
+                            op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'hA1;
+                            adv_wdata<=adv_rdata & ~8'h3C;
+                            op_go<=1'b1;
+                            bios_st<=BIOS_TMDS_UP_WR_WAIT;
+                        end
+
+                        BIOS_TMDS_UP_WR_WAIT: if (op_done) begin
+                            bios_current_mode<=bios_pending_mode;
+                            bios_current_avinfo<=bios_pending_avinfo;
+                            mode_applied_ok<=1'b1;
+                            xhd_sent_vic<=bios_vic[4:0];
+                            cfg_ack<=1'b1;
+                            bios_st<=BIOS_IDLE;
+                            op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h9E; op_go<=1'b1;
+                            br_st<=BR_READY;
+                        end
+
+                        // Runtime transport failure recovery: best-effort
+                        // re-enable TMDS, acknowledge this packet, and leave
+                        // the previous mode as the last known-good state.
+                        BIOS_RECOVER_RD: begin
+                            if (!op_go && ops_st==OPS_IDLE) begin
+                                op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'hA1; op_go<=1'b1;
+                                bios_st<=BIOS_RECOVER_RD_WAIT;
+                            end
+                        end
+
+                        BIOS_RECOVER_RD_WAIT: if (op_done) begin
+                            if (!op_nack && !op_timeout) begin
+                                op_kind<=OP_WRITE; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'hA1;
+                                adv_wdata<=adv_rdata & ~8'h3C;
+                                op_go<=1'b1;
+                                bios_st<=BIOS_RECOVER_WR_WAIT;
+                            end else begin
+                                cfg_ack<=1'b1;
+                                bios_st<=BIOS_IDLE;
+                                op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'h9E; op_go<=1'b1;
+                                br_st<=BR_READY;
+                            end
+                        end
+
+                        BIOS_RECOVER_WR_WAIT: if (op_done) begin
+                            cfg_ack<=1'b1;
+                            bios_st<=BIOS_IDLE;
+                            op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                            adv_waddr<=8'h9E; op_go<=1'b1;
+                            br_st<=BR_READY;
+                        end
+
+                        default: bios_st<=BIOS_IDLE;
+                    endcase
                 end
 
                 // Physical-INT-gated port of adv_handle_interrupts().
@@ -1446,9 +2179,13 @@ module eos_hd #(
                         IRQ_WAIT_FLAGS: if (op_done) begin
                             if (op_nack || op_timeout) begin
                                 bringup_i2c_error<=1'b1;
-                                op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
-                                adv_waddr<=8'h3E; op_go<=1'b1;
-                                br_st<=BR_READY;
+                                if (!FORCE_STANDALONE && bios_took_over) begin
+                                    br_st<=BR_READY;
+                                end else begin
+                                    op_kind<=OP_READ; op_target_addr<=ADV_ADDR;
+                                    adv_waddr<=8'h3E; op_go<=1'b1;
+                                    br_st<=BR_READY;
+                                end
                             end else begin
                                 xhd_irq_flags<=adv_rdata;
 
@@ -1582,11 +2319,15 @@ module eos_hd #(
                                 adv_irq_pending<=1'b0;
                             if (op_nack || op_timeout) begin
                                 bringup_i2c_error<=1'b1;
-                                op_kind<=OP_READ;
-                                op_target_addr<=ADV_ADDR;
-                                adv_waddr<=8'h3E;
-                                op_go<=1'b1;
-                                br_st<=BR_READY;
+                                if (!FORCE_STANDALONE && bios_took_over) begin
+                                    br_st<=BR_READY;
+                                end else begin
+                                    op_kind<=OP_READ;
+                                    op_target_addr<=ADV_ADDR;
+                                    adv_waddr<=8'h3E;
+                                    op_go<=1'b1;
+                                    br_st<=BR_READY;
+                                end
                             end else begin
                                 op_kind<=OP_WRITE;
                                 op_target_addr<=ADV_ADDR;
@@ -1600,21 +2341,29 @@ module eos_hd #(
                             if (op_nack || op_timeout)
                                 bringup_i2c_error<=1'b1;
                             xhd_irq_flags<=8'd0;
-                            op_kind<=OP_READ;
-                            op_target_addr<=ADV_ADDR;
-                            adv_waddr<=8'h3E;
-                            op_go<=1'b1;
-                            br_st<=BR_READY;
+                            if (!FORCE_STANDALONE && bios_took_over) begin
+                                br_st<=BR_READY;
+                            end else begin
+                                op_kind<=OP_READ;
+                                op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'h3E;
+                                op_go<=1'b1;
+                                br_st<=BR_READY;
+                            end
                         end
 
                         default: begin
                             xhd_irq_phase<=IRQ_WAIT_FLAGS;
                             xhd_irq_flags<=8'd0;
-                            op_kind<=OP_READ;
-                            op_target_addr<=ADV_ADDR;
-                            adv_waddr<=8'h3E;
-                            op_go<=1'b1;
-                            br_st<=BR_READY;
+                            if (!FORCE_STANDALONE && bios_took_over) begin
+                                br_st<=BR_READY;
+                            end else begin
+                                op_kind<=OP_READ;
+                                op_target_addr<=ADV_ADDR;
+                                adv_waddr<=8'h3E;
+                                op_go<=1'b1;
+                                br_st<=BR_READY;
+                            end
                         end
                     endcase
                 end
