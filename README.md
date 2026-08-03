@@ -212,12 +212,6 @@ serving · **blue** is up and idle. The write/sync purple is the project accent 
 
 ### Status RGB LED (pin 29)
 
-<<<<<<< Updated upstream
-The Status RGB LED is fully programmable per bank. Once a BIOS is flashed, you can set a color 
-via Bank Management or from the WebUI. Choose from 11 colors and OFF. 3 Banks have predetermined 
-colors that are not changeable via the Loader or the WebUI. Recovery = White, breathing, 
-XbDiag Lite = Purple, breathing, and SD Card = Magenta, breathing.
-=======
 The Status led is fully programable per bank. Once a BIOS is flashed you can set a color via Bank Management or from the WebUI. Choose from 11 colors and OFF. 3 Banks have pre determined colors that are not changable via the Loader or the WebUI. Recovery = White, breathing, XbDiag Lite = Purple, breathing, and SD Card = Magenta, breating.
 
 ### HD Status LED (pins 30, 31)
