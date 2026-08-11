@@ -14,6 +14,7 @@
 //
 // No CRT: this file uses only fixed-size buffers and the loader's flash driver.
 #include <xtl.h>
+#include "eos_bank.h"   // Bank_Ef for color slot mapping
 #include "eos_descriptor.h"
 #include "eos_flash.h"
 
@@ -26,6 +27,15 @@
 #define DESC_BYTES  64
 #define SLOT0_OFF   0x08
 #define SLOT_STRIDE 0x08
+
+// LED bank colors ride in the same descriptor page: a 4-byte sub-magic 'COLR'
+// at 0x2C, then 4 x 3-byte RGB at 0x30. Absent sub-magic => colors unset (OFF).
+#define COLR_MAGIC_OFF 0x2C
+#define COLR_DATA_OFF  0x30
+#define COLR_M0 0x43  // 'C'
+#define COLR_M1 0x4F  // 'O'
+#define COLR_M2 0x4C  // 'L'
+#define COLR_M3 0x52  // 'R'
 
 // New-region byte offset (relative to FLOOR) where oversized banks live. Matches
 // the FPGA NEWRGN_OFF parameter (phys 0x5C0000 = FLOOR 0x200000 + 0x3C0000).
@@ -49,6 +59,7 @@ static unsigned int get24le(const unsigned char* p)
 
 void Desc_InitEmpty(EosLayout* lay)
 {
+    { int _i; for (_i = 0; _i < EOS_DESC_SLOTS; ++_i) lay->color[_i] = 0xFFFFFFu; }
     int i;
     lay->valid = 1;
     for (i = 0; i < EOS_DESC_SLOTS; ++i) {
@@ -92,6 +103,15 @@ int Desc_Load(EosLayout* out)
         out->slot[i].sizeCode = (unsigned char)(e[1] & 0x03);
         out->slot[i].physBase = get24le(e + 4);
     }
+    // LED colors: only if the 'COLR' sub-magic is present (older descriptors
+    // won't have it -> leave the InitEmpty defaults of 0xFFFFFF = OFF).
+    if (pg[COLR_MAGIC_OFF + 0] == COLR_M0 && pg[COLR_MAGIC_OFF + 1] == COLR_M1 &&
+        pg[COLR_MAGIC_OFF + 2] == COLR_M2 && pg[COLR_MAGIC_OFF + 3] == COLR_M3) {
+        for (i = 0; i < EOS_DESC_SLOTS; ++i) {
+            const unsigned char* c = pg + COLR_DATA_OFF + i * 3;
+            out->color[i] = ((unsigned int)c[0] << 16) | ((unsigned int)c[1] << 8) | c[2];
+        }
+    }
     out->valid = 1;
     return 1;
 }
@@ -113,6 +133,16 @@ int Desc_Save(const EosLayout* lay)
         e[0] = lay->slot[i].state;
         e[1] = lay->slot[i].sizeCode;
         put24le(e + 4, lay->slot[i].physBase);
+    }
+
+    // LED bank colors: sub-magic + 4x RGB (0xFFFFFF = OFF/unset).
+    pg[COLR_MAGIC_OFF + 0] = COLR_M0; pg[COLR_MAGIC_OFF + 1] = COLR_M1;
+    pg[COLR_MAGIC_OFF + 2] = COLR_M2; pg[COLR_MAGIC_OFF + 3] = COLR_M3;
+    for (i = 0; i < EOS_DESC_SLOTS; ++i) {
+        unsigned char* c = pg + COLR_DATA_OFF + i * 3;
+        c[0] = (unsigned char)((lay->color[i] >> 16) & 0xFF);
+        c[1] = (unsigned char)((lay->color[i] >> 8) & 0xFF);
+        c[2] = (unsigned char)(lay->color[i] & 0xFF);
     }
 
     // Erase the descriptor bank, program the single page, sync.
@@ -318,4 +348,77 @@ int Desc_FreeFootprint(EosLayout* lay, int at, int need)
         }
     }
     return freed;
+}
+
+// ---- bank LED color palette + get/set --------------------------------------
+// Index 0 = OFF (0xFFFFFF sentinel; gateware treats FF,FF,FF as off). 1..11 are
+// selectable colors. Accent purple (168,85,247) included for brand consistency.
+const unsigned int Eos_LedPalette[EOS_LED_PALETTE_N] = {
+    0xFFFFFF, // 0  OFF (sentinel)
+    0xFF0000, // 1  Red
+    0xFF6000, // 2  Orange
+    0xFFD000, // 3  Amber
+    0x30FF00, // 4  Green
+    0x00FFC0, // 5  Teal
+    0x00C0FF, // 6  Cyan
+    0x0040FF, // 7  Blue
+    0xA855F7, // 8  Purple (accent 168,85,247)
+    0xFF00E0, // 9  Magenta
+    0xFF3080, // 10 Pink
+    0xFEFEFE  // 11 White  (0xFEFEFE, not FFFFFF, so it is not the OFF sentinel)
+};
+const char* const Eos_LedPaletteName[EOS_LED_PALETTE_N] = {
+    "Off","Red","Orange","Amber","Green","Teal","Cyan","Blue",
+    "Purple","Magenta","Pink","White"
+};
+
+// Bank LED color get/set. `bankIdx` is a BANK TABLE INDEX (not a raw slot); the
+// EF->slot mapping (0x3..0x6 -> 0..3) is done here so every caller can just pass a
+// bank index. Non-user banks (no slot) read as OFF / ignore writes.
+static int descColorSlot(int bankIdx)
+{
+    unsigned char ef = Bank_Ef(bankIdx);
+    if (ef >= 0x3 && ef <= 0x6) return (int)(ef - 0x3);
+    return -1;
+}
+
+unsigned int Desc_GetColor(int bankIdx)
+{
+    EosLayout lay;
+    int slot = descColorSlot(bankIdx);
+    if (slot < 0) return 0xFFFFFFu;
+    Desc_Load(&lay);                 // fills defaults (OFF) if no descriptor
+    return lay.color[slot];
+}
+
+int Desc_SetColor(int bankIdx, unsigned int rgb)
+{
+    EosLayout lay;
+    int slot = descColorSlot(bankIdx);
+    int i;
+    if (slot < 0) return -1;
+    Desc_Load(&lay);                 // preserve existing slots + other colors
+
+    // CRITICAL: writing this descriptor flips the FPGA to descriptor_valid=true,
+    // which makes it serve user banks from the descriptor's slot table. But native
+    // 256K banks were historically NEVER persisted (see reconcileDescriptor) -- the
+    // loaded descriptor may show them FREE while they actually hold a BIOS. If we
+    // saved that as-is, an occupied native bank would be recorded FREE with a valid
+    // descriptor -> the FPGA serves it empty -> reboot loop. So reconcile occupancy
+    // into the layout first: every occupied user bank that isn't already ANCHOR/
+    // SHADOW is marked NATIVE 256K with its correct base (slot N -> N*0x040000).
+    for (i = 0; i < Bank_Count(); ++i) {
+        unsigned char ef = Bank_Ef(i);
+        int s;
+        if (ef < 0x3 || ef > 0x6) continue;      // user banks only
+        s = (int)(ef - 0x3);
+        if (Bank_Occupied(i) && lay.slot[s].state == EOS_SLOT_FREE) {
+            lay.slot[s].state = EOS_SLOT_NATIVE;
+            lay.slot[s].sizeCode = EOS_SZC_256K;
+            lay.slot[s].physBase = 0;
+        }
+    }
+
+    lay.color[slot] = rgb & 0xFFFFFFu;
+    return Desc_Save(&lay);          // rewrites whole page (slots+colors), reloads
 }

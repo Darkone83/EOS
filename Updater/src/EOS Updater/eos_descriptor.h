@@ -45,8 +45,10 @@ typedef struct {
 
 // The in-memory layout (4 slots). Kept in sync with the descriptor block.
 typedef struct {
-    int     valid;                    // 1 = a valid descriptor was loaded
-    EosSlot slot[EOS_DESC_SLOTS];     // slots 0..3  == visible banks 1..4
+    int          valid;               // 1 = a valid descriptor was loaded
+    EosSlot      slot[EOS_DESC_SLOTS];// slots 0..3  == visible banks 1..4
+    unsigned int color[EOS_DESC_SLOTS];// bank LED color, packed 0x00RRGGBB.
+    // 0xFFFFFF = unset/OFF (blank NOR sentinel).
 } EosLayout;
 
 // ---- lifecycle ------------------------------------------------------------
@@ -111,3 +113,14 @@ int  Desc_CanPlaceAt(const EosLayout* lay, int slot, int sizeCode);
 
 // Initialize an empty (all-free) layout.
 void Desc_InitEmpty(EosLayout* lay);
+
+// ---- bank LED color palette ------------------------------------------------
+// 12 entries: index 0 = OFF (0xFFFFFF sentinel), 1..11 = selectable colors.
+#define EOS_LED_PALETTE_N  12
+extern const unsigned int Eos_LedPalette[EOS_LED_PALETTE_N];  // packed 0x00RRGGBB
+extern const char* const  Eos_LedPaletteName[EOS_LED_PALETTE_N];
+
+// Get/set a bank's LED color (idx = visible bank 0..3). Set persists to the
+// descriptor block and triggers an FPGA re-read. Returns EOS_FLASH_OK on set.
+unsigned int Desc_GetColor(int idx);
+int          Desc_SetColor(int idx, unsigned int rgb);

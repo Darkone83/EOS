@@ -17,6 +17,7 @@
 #include "eos_config.h"
 #include "eos_bank.h"
 #include "eos_descriptor.h"
+#include "eos_led.h"
 #include "eos_flash.h"
 #include "input.h"
 #include "eos_file.h"
@@ -46,7 +47,8 @@ enum {
     PH_WRITING,         /* renders 'Writing flash...' then does the blocking write */
     PH_RESULT,          /* done / failed / no-update message */
     PH_UTILITIES,       /* utilities: backup/restore, clear xbdiag/settings/names */
-    PH_UTIL_BANKPICK    /* pick a bank to backup/restore */
+    PH_UTIL_BANKPICK,   /* pick a bank to backup/restore */
+    PH_LEDCOLOR         /* bank LED color picker */
 };
 
 /* what the pending net fetch is for */
@@ -133,6 +135,14 @@ static const char* sizeStr(int code)
 static int sizeCodeForLen(int len)
 {
     if (len > 512 * 1024) return EOS_BANK_SIZE_1MB; if (len > 256 * 1024) return EOS_BANK_SIZE_512K; return EOS_BANK_SIZE_256K;
+}
+
+/* Map a bank-table index to descriptor slot 0..3; non-user banks return -1. */
+static int descSlotForBank(int idx)
+{
+    unsigned char ef = Bank_Ef(idx);
+    if (ef >= 0x3 && ef <= 0x6) return (int)(ef - 0x3);
+    return -1;
 }
 
 static void fileToBankName(char* nm, int cap, const char* leaf)
@@ -584,6 +594,29 @@ static void Ph_BankMgmt(WORD b)
         else { s_renameTarget = s_bankSel; Osk_Open(OSK_TEXT, Bank_Name(s_bankSel), EOS_BANK_NAMELEN - 1); GotoPhase(PH_RENAME); }
         return;
     }
+
+    /* Black = set this user bank's persistent LED color. Shadow slots inherit
+       the color of their oversized-bank anchor and cannot be set separately. */
+    if (Pressed(b, s_prev, BTN_BLACK)) {
+        int cslot = descSlotForBank(s_bankSel);
+        if (Bank_IsLocked(s_bankSel)) {
+            SetMgmtStatus("Cannot set color on locked bank");
+        }
+        else if (cslot < 0) {
+            SetMgmtStatus("Not a user bank");
+        }
+        else {
+            EosLayout lay;
+            if (Desc_Load(&lay) && lay.valid && lay.slot[cslot].state == EOS_SLOT_SHADOW) {
+                SetMgmtStatus("Slot is part of a large bank");
+            }
+            else {
+                LedPick_Open(s_bankSel, PH_BANKMGMT);
+                GotoPhase(PH_LEDCOLOR);
+                return;
+            }
+        }
+    }
 }
 
 static void Ph_Rename(WORD b)
@@ -864,7 +897,7 @@ static void DrawPhase(void)
         Ui_Menu3D(ptrs, cap, s_bankSel);
         if (s_statusMsg[0] && GetTickCount() < s_statusUntil)
             Font_DrawCentered(0, g_scrW, g_scrH - 94, s_statusMsg, EOS_PURPLE);
-        Ui_Footer("A Flash   X Delete   Y Rename   B Back");
+        Ui_Footer("A Flash   X Delete   Y Rename   Blk LED Color   B Back");
         break;
     }
     case PH_RENAME:
@@ -940,6 +973,7 @@ void __cdecl main(void)
 
     for (;;) {
         WORD b;
+        int selfDrawn = 0;
         PumpInput();
         Net_Poll();
         b = GetButtons();
@@ -961,10 +995,16 @@ void __cdecl main(void)
         case PH_RESULT:      Ph_Result(b);    break;
         case PH_UTILITIES:   Ph_Utilities(b); break;
         case PH_UTIL_BANKPICK: Ph_UtilBankPick(b); break;
+        case PH_LEDCOLOR: {
+            int nx = LedPick_Frame(b, s_prev);
+            if (nx >= 0) GotoPhase(nx);
+            selfDrawn = 1;  /* picker owns Gfx_Begin/Gfx_End */
+            break;
+        }
         case PH_NET_FETCH:   /* handled after draw */ break;
         }
 
-        DrawPhase();
+        if (!selfDrawn) DrawPhase();
 
         /* the network fetch is blocking; run it the frame AFTER its screen shows */
         if (s_phase == PH_NET_FETCH) {

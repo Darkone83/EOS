@@ -13,6 +13,10 @@ int   Font_DrawCentered(int x0, int width, int y, const char* s, DWORD color);
 
 int   Font_TextWidth(const char* s);   // pixels
 
+// Scaled 2D text (factor k, e.g. 0.72 for a smaller HUD). Same atlas.
+int   Font_DrawScaled(int x, int y, const char* s, DWORD color, float k);
+int   Font_TextWidthScaled(const char* s, float k);
+
 // Draw a string as real 3D geometry on a pill face centered at (cx,cy,cz),
 // tilted about world X by (ca=cos,sa=sin). k = world units per atlas pixel.
 // Each glyph is emitted via Gfx_Quad3DP so the label tilts/recedes with its

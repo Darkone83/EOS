@@ -6,6 +6,44 @@
 #include "dd_mount.h"   // Mount_HddPartitions
 
 static int  fLen(const char* s) { int n = 0; while (s[n]) n++; return n; }
+
+// Case-insensitive name compare (ASCII). Returns <0, 0, >0 like strcmp.
+static int  fICmp(const char* a, const char* b)
+{
+    int i = 0;
+    for (;;) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return (int)(unsigned char)ca - (int)(unsigned char)cb;
+        if (ca == 0)  return 0;
+        ++i;
+    }
+}
+
+// Browser sort order: directories first, then files; each group alphabetical
+// (case-insensitive). Returns 1 if entry a should come before entry b.
+static int  fEntryLess(const EosFileEntry* a, const EosFileEntry* b)
+{
+    if (a->is_dir != b->is_dir) return a->is_dir ? 1 : 0;   // dirs before files
+    return fICmp(a->name, b->name) < 0 ? 1 : 0;
+}
+
+// Heap-free, stable insertion sort of the entry list (n is small: a directory
+// listing). No CRT, no malloc -- matches the rest of eos_file.
+static void fSortEntries(EosFileEntry* e, int n)
+{
+    int i, j;
+    for (i = 1; i < n; ++i) {
+        EosFileEntry key = e[i];
+        j = i - 1;
+        while (j >= 0 && fEntryLess(&key, &e[j])) {
+            e[j + 1] = e[j];
+            --j;
+        }
+        e[j + 1] = key;
+    }
+}
 static void fCopy(char* d, int cap, const char* s)
 {
     int i = 0;
@@ -70,6 +108,8 @@ int File_ListDir(const char* path, EosFileEntry* out, int maxEntries)
         ++n;
     } while (FindNextFile(h, &fd));
     FindClose(h);
+
+    fSortEntries(out, n);   // directories first, then files; each alphabetical
     return n;
 }
 

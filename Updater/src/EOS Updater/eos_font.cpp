@@ -70,6 +70,32 @@ int Font_DrawCentered(int x0, int width, int y, const char* s, DWORD color)
     Font_Draw(sx, y, s, color);
     return sx;
 }
+// Scaled text: same atlas, glyph metrics multiplied by k (e.g. 0.72 for a
+// smaller HUD line). Position offsets, quad size, and advance all scale, so the
+// baseline stays at y and spacing stays proportional.
+int Font_DrawScaled(int x, int y, const char* s, DWORD color, float k)
+{
+    float cx = (float)x, aw = (float)FONT_ATLAS_W, ah = (float)FONT_ATLAS_H;
+    int i;
+    if (!s) return x;
+    for (i = 0; s[i]; ++i) {
+        const short* g = glyph((unsigned char)s[i]);
+        if (!g) { cx += (float)spaceAdv() * k; continue; }
+        if (g[2] > 0 && g[3] > 0) {
+            float u0 = (float)g[0] / aw, v0 = (float)g[1] / ah;
+            float u1 = (float)(g[0] + g[2]) / aw, v1 = (float)(g[1] + g[3]) / ah;
+            Gfx_DrawTex(s_atlas, cx + (float)g[4] * k, (float)y + (float)g[5] * k,
+                (float)g[2] * k, (float)g[3] * k, u0, v0, u1, v1, color);
+        }
+        cx += (float)g[6] * k;
+    }
+    return (int)(cx + 0.5f);
+}
+
+int Font_TextWidthScaled(const char* s, float k)
+{
+    return (int)((float)Font_TextWidth(s) * k + 0.5f);
+}
 // Emit a string as real 3D geometry on a tilted pill face. Glyphs are laid out
 // in the face's local space (centered about cx, vertically about cy), each one
 // emitted via Gfx_Quad3DP so it tilts/recedes with the pill. Screen-y-down atlas

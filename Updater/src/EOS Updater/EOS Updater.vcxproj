@@ -24,6 +24,7 @@
       <WholeProgramOptimization Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">false</WholeProgramOptimization>
     </ClCompile>
     <ClCompile Include="eos_gfx.cpp" />
+    <ClCompile Include="eos_led.cpp" />
     <ClCompile Include="eos_net.cpp" />
     <ClCompile Include="eos_osk.cpp" />
     <ClCompile Include="eos_smbus.cpp" />
@@ -50,6 +51,7 @@
     <ClInclude Include="eos_font.h" />
     <ClInclude Include="eos_font_data.h" />
     <ClInclude Include="eos_gfx.h" />
+    <ClInclude Include="eos_led.h" />
     <ClInclude Include="eos_logo_data.h" />
     <ClInclude Include="eos_net.h" />
     <ClInclude Include="eos_osk.h" />
