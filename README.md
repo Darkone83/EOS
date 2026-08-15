@@ -28,6 +28,7 @@ it's doing.
 | `Tools/` | Host tooling: recovery GUI, BIOS packer, HUD generator — see `Tools/readme.md` |
 | `Gerbers/` | PCB fab set (`EOS.zip`), `BOM.xlsx`, `PickAndPlace.xlsx` |
 | `Schematics/` | Board schematic |
+| `Editor/` | EOS Script Editor IDE |
 | `images/` | Logos and board renders |
 
 ---
@@ -75,6 +76,7 @@ needed.
   Uses a private I²C bus on the expansion header — see **Expansion header** in the pinmap (EXP1–EXP3
   are reserved for HD addon compatibility) and **Credits**.
 - **Status LEDs / WS2812** — tells you where a boot got to without needing a screen.
+- ** Expandable I/O ** - Allows you to program EXP 1 - 8 via the ESO script system
 
 ---
 
@@ -82,11 +84,11 @@ needed.
 
 ### V1
 
-The V1 carrier will preform all the basic functions EOS requires and is not FW dependant. V1 is missing the bank RGB led the HD Status LED and the expansion header along with the RTC
+The V1 carrier will perform all the basic functions EOS requires and is not FW dependent. V1 is missing the bank RGB led the HD Status LED and the expansion header and the RTC
 
 ### V2
 
-The V2 carrier offers easy accessability to all planed featurs and expansion options of EOS and includes the additional items: the RGB Bank LED, HD Status LED, Expansion header, and on-board RTC.
+The V2 carrier offers easy accessibility to all planned features and expansion options of EOS and includes the additional items: the RGB Bank LED, HD Status LED, Expansion header, and on-board RTC.
 
 ---
 
@@ -346,6 +348,66 @@ writes data. It shows up in an XbDiag SMBus scan as an EOS modchip.
 **STATUS (`0x04`) bits**, low to high: `preload_done`, `mode_16`, `d0_active`,
 `abort_active`, `slot1_ready`. Top three bits are zero.
 
+### Expansion mailbox
+
+Runtime interface to the expansion engine (runs in `clk_sd`). Registers live in the
+`0x40` window; there are **8 pin-def doorbells** selected by `SEL`.
+ 
+### Registers
+ 
+| Reg | R/W | Name | Meaning |
+|---|---|---|---|
+| `0x40` | R | STATUS | status bits (below) |
+| `0x41` | R | FAULT | fault code (below) |
+| `0x42` / `0x43` | R | PC_LO / PC_HI | program counter |
+| `0x44` | R | ABI_VER | `0x01` |
+| `0x45` | R | PINDEF_COUNT | number of pin-defs |
+| `0x46` | R/W | SEL | selected pin-def (0–7) |
+| `0x47` | R/W | PAGE | volatile-window page |
+| `0x48` | R/W | WINKIND | `0x00` = descriptor stream, else volatile window |
+| `0x49` | R/W | DOORBELL | R: `{OVERRUN[7], state[1:0]}`; W: request transition |
+| `0x4A` | R/W | CMD | selected pin-def's command byte (writable only while doorbell = IDLE) |
+| `0x4B` | R | RESULT | result byte (mirrors volatile `0xFF`) |
+| `0x50–0x6F` | R/(W) | WINDOW | descriptor capability stream (WINKIND `0x00`) or volatile RAM (`page*32 + offset`) |
+ 
+### STATUS (`0x40`) bits
+ 
+| Bit | Flag |
+|---|---|
+| 0 | RUNNING |
+| 1 | FAULT |
+| 2 | IMAGE_VALID |
+| 3 | BOOT_GATE |
+| 4 | BUSY |
+| 5–7 | reserved (0) |
+ 
+### Doorbell states (`0x49`, bits [1:0])
+ 
+| State | Name | Owner / transition |
+|---|---|---|
+| `0` | IDLE | host writes `1` (IDLE → PENDING) |
+| `1` | PENDING | host set; script picks it up |
+| `2` | BUSY | script |
+| `3` | READY | script set; host writes `0` (READY → IDLE) |
+ 
+Bit 7 = **OVERRUN** (sticky): set on an illegal ring (writing `1` when not IDLE, or
+`0` when not READY). Cleared on a §6c reload / `mbx_clr`. Writes to `0xF8..0xFF` are
+ignored.
+ 
+Handshake: host sets `SEL` → writes args to `CMD`/volatile window → rings
+(`0x49` = 1) → script runs (→ BUSY), writes `RESULT`, sets READY → host reads
+`RESULT` → clears (`0x49` = 0).
+ 
+### Fault codes (`0x41`)
+ 
+| Code | Meaning |
+|---|---|
+| `0x01` | BADCMD — unknown command line |
+| `0x02` | BADPIN — bad pin reference |
+| `0x03` | LOOP — loop stack over/underflow |
+| `0x04` | ARG — bad argument |
+| `0x05` | TIMEOUT |
+
 ### Commands you write (to `0x10`, args in `0x11`–`0x14`)
 
 | Opcode | Command | Effect |
@@ -484,11 +546,6 @@ engine, SDRAM preload, address-space serve map, serve log, stability.
 
 ---
 
-## Active Notes
-
-Work in progress and things that are wired up but not finished. Stated plainly so nobody trips
-over them.
-
 ### SMBus commands with no effect yet
 
 Some opcodes are decoded and latch cleanly, but their outputs aren't consumed by anything on
@@ -523,10 +580,12 @@ src/
   eos_boot_ctrl.v       1.6 LFRAME# abort (mode16_n-gated)
   eos_bank_ctrl.v       0xEF bank register + address map + flash write engine
   eos_bank_led.v        Bank and status LED framework and command set
+  eos_exp_engine.v      EOS expansion engine and plumbing for WS2812, GPIO, PWM and soft i2c master
+  eos_exp_pkg.vh        All expansion widths, offsets and opcodes
   eos_flash_cmd.v       flash command bridge (0xEC/0xED) + scratch staging
   eos_flash_reader.v    SPI flash read path (burst reads with backpressure)
   eos_sd_spi.v			SPI framework to allow raw LBA / byte access to the SD Card
-  eos_sd_precache.v		SD precaching framewrok for SDRAM precache
+  eos_sd_precache.v		SD precaching framework for SDRAM precache
   eos_sdram_backend.v   SDRAM serve + preload + scratch
   eos_sdram_pll.v       SDRAM PLL wrapper
   sdram.v               SDRAM controller
@@ -542,7 +601,7 @@ src/
   eos_video_timing.v    HDMI video timing
   eos_ws2812.v          WS2812 status LED
   *.hex                 memory inits (font / attr / logo / screen)
-  eos_hd.v              X-HD compatable compatability layer
+  eos_hd.v              X-HD compatible compatibility layer
   eos_hdmi.cst          pin + IO constraints
   eos_hdmi.sdc          timing constraints
 
