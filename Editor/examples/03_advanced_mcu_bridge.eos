@@ -1,0 +1,85 @@
+# =====================================================================
+#  EOS Script — ADVANCED example: Xbox <-> MCU command bridge
+# =====================================================================
+#
+#  What you'll learn here:
+#    - the full DOORBELL handshake ("Pattern B") for coherent commands
+#    - dispatching on a CMD code with IFMAIL
+#    - talking to real I2C devices (an MCU and a sensor)
+#    - reading the peripheral RESULT slot (0xFF) after an I2C op
+#    - laying out TWO pin-def banks by hand with DEF
+#
+#  The idea: the Xbox fills a payload and rings a doorbell; this script
+#  forwards the payload to an MCU, reads a status byte back from a
+#  sensor, and reports completion — all without corrupting a half-written
+#  command, because the doorbell guarantees the data is complete first.
+# ---------------------------------------------------------------------
+
+TARGET NOHD
+
+# ---- Pin-def 0: the I2C bus, plus a command mailbox --------------------
+# I2C uses TWO pins: SCL then SDA.
+USES EXP5 EXP6 AS I2C
+  REG cmdarg  WIDTH 4          # up to 4 argument bytes for a command
+#
+# Pin-def 0 bank (base 0x00):
+#     0x00 CMD        <- the Xbox writes a command CODE here
+#     0x01 DOORBELL   <- 0 IDLE / 1 PENDING / 2 BUSY / 3 READY
+#     0x02 cmdarg[0..3]
+DEF CMD0    0x00
+DEF DB0     0x01
+DEF CMDARG  0x02
+
+# ---- Some named constants ---------------------------------------------
+DEF MCU     0x50               # our microcontroller's I2C address
+DEF SENSOR  0x48               # a temperature sensor's I2C address
+DEF STATUS  0x40               # scratch offset to stash a status byte
+DEF RESULT  0xFF               # the engine's peripheral-result slot
+
+# Command codes the Xbox can send:
+DEF CMD_FORWARD 0x01           # forward cmdarg to the MCU
+DEF CMD_READ    0x02           # read the sensor into 'status'
+
+# ---- The program -------------------------------------------------------
+LOOP
+
+  # --- doorbell gate: only act when the Xbox has rung PENDING (1) ---
+  # IFMAIL skips the guarded block when the test is FALSE, so with EQ 1
+  # the block runs only while DOORBELL == PENDING. The skip count (9) is
+  # exactly the number of guarded lines below — the idle DELAY after the
+  # block runs every iteration. (Nested IFMAILs count toward this 9.)
+  IFMAIL DB0 EQ 1 9
+    SETMAIL DB0 2              # -> BUSY: we've taken ownership
+
+    # dispatch on the command code the Xbox left in CMD0
+    IFMAIL CMD0 EQ CMD_FORWARD 1
+      I2CW MCU VOL CMDARG 4    #   forward the 4 argument bytes to the MCU
+
+    IFMAIL CMD0 EQ CMD_READ 3
+      I2CR SENSOR 1 STATUS     #   read 1 byte from the sensor into 'status'
+      IFMAIL RESULT EQ 0 1     #   RESULT == 0 (OK)?  keep it; else leave stale
+        GETMAIL STATUS R0      #     (R0 now holds the reading if you need it)
+
+    SETMAIL DB0 3             # -> READY: Xbox reads any result, then sets IDLE
+    DELAY 2
+
+  DELAY 10                     # idle poll interval when nothing is pending
+
+ENDLOOP
+END
+
+# ---------------------------------------------------------------------
+#  WHAT YOUR XBOX APP DOES (the doorbell handshake):
+#    1. write the argument bytes into 'cmdarg' (volatile 0x02..0x05)
+#    2. write a command code into CMD    (volatile 0x00)
+#    3. write DOORBELL = 1 (PENDING)     (volatile 0x01)
+#    4. poll until DOORBELL = 3 (READY), read any result, write 0 (IDLE)
+#  If it rings while not IDLE, the command is dropped and a sticky
+#  OVERRUN flag is raised for the app to notice.
+#
+#  RESULT CODES (in slot 0xFF after an I2C op):
+#    0 OK · 1 NACK_ADDR · 2 NACK_DATA · 3 TIMEOUT · 4 STUCK
+#
+#  Tip: run "Export command-map" in the editor to hand your Xbox-side
+#  developer this exact contract.
+# =====================================================================

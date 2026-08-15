@@ -1,0 +1,165 @@
+"""
+eos_ledgen — pure logic for the LED Studio.
+
+A *frame* is a list of (r,g,b) tuples, one per LED. Effects produce lists of
+frames. `generate_script(...)` turns frames into a complete, in-bounds .eos
+script (WS2812 is GRB order and compact hex — handled here so the UI never has
+to think about it).
+
+Kept GUI-free so it can be unit-tested and its output fed straight back through
+the linter to prove it's in bounds.
+"""
+import eos_language as L
+
+RGB = tuple
+
+
+def clamp8(v):
+    return 0 if v < 0 else (255 if v > 255 else int(v))
+
+
+def scale_pixel(px, brightness):
+    if brightness >= 255:
+        return px
+    k = brightness / 255.0
+    return (clamp8(px[0] * k), clamp8(px[1] * k), clamp8(px[2] * k))
+
+
+def rgb_to_grb_hex(px):
+    """WS2812 wants G,R,B bytes. Return 6 hex chars."""
+    r, g, b = clamp8(px[0]), clamp8(px[1]), clamp8(px[2])
+    return f"{g:02X}{r:02X}{b:02X}"
+
+
+def frame_to_hex(frame, brightness=255):
+    return "".join(rgb_to_grb_hex(scale_pixel(px, brightness)) for px in frame)
+
+
+# --------------------------------------------------------------------------
+# colour helpers
+# --------------------------------------------------------------------------
+def hue_to_rgb(h):
+    """h in [0,1) -> full-sat/val RGB tuple."""
+    h = (h % 1.0) * 6.0
+    i = int(h)
+    f = h - i
+    q = 1.0 - f
+    if i == 0:   r, g, b = 1, f, 0
+    elif i == 1: r, g, b = q, 1, 0
+    elif i == 2: r, g, b = 0, 1, f
+    elif i == 3: r, g, b = 0, q, 1
+    elif i == 4: r, g, b = f, 0, 1
+    else:        r, g, b = 1, 0, q
+    return (clamp8(r * 255), clamp8(g * 255), clamp8(b * 255))
+
+
+def _lerp(a, b, t):
+    return (clamp8(a[0] + (b[0] - a[0]) * t),
+            clamp8(a[1] + (b[1] - a[1]) * t),
+            clamp8(a[2] + (b[2] - a[2]) * t))
+
+
+# --------------------------------------------------------------------------
+# effect generators — each returns list[frame]
+# --------------------------------------------------------------------------
+def solid(count, color):
+    return [[tuple(color)] * count]
+
+
+def gradient(count, c0, c1):
+    if count == 1:
+        return [[tuple(c0)]]
+    return [[_lerp(c0, c1, i / (count - 1)) for i in range(count)]]
+
+
+def rainbow_cycle(count, steps=12):
+    frames = []
+    for s in range(steps):
+        phase = s / steps
+        frames.append([hue_to_rgb(i / max(1, count) + phase) for i in range(count)])
+    return frames
+
+
+def chase(count, color, bg=(0, 0, 0)):
+    frames = []
+    for k in range(count):
+        frames.append([tuple(color) if i == k else tuple(bg) for i in range(count)])
+    return frames
+
+
+def color_wipe(count, color, bg=(0, 0, 0)):
+    frames = []
+    for k in range(count):
+        frames.append([tuple(color) if i <= k else tuple(bg) for i in range(count)])
+    return frames
+
+
+def breathe(count, color, steps=16):
+    frames = []
+    for s in range(steps):
+        # 0..1..0 triangle
+        t = s / (steps - 1) if steps > 1 else 1.0
+        level = 1.0 - abs(2.0 * t - 1.0)
+        px = (clamp8(color[0] * level), clamp8(color[1] * level),
+              clamp8(color[2] * level))
+        frames.append([px] * count)
+    return frames
+
+
+def theater_chase(count, color, bg=(0, 0, 0), steps=3):
+    frames = []
+    for s in range(steps):
+        frames.append([tuple(color) if (i % steps) == s else tuple(bg)
+                       for i in range(count)])
+    return frames
+
+
+EFFECTS = {  # name -> (needs_color, fn(count,color)->frames)
+    "Solid": (True, lambda c, col: solid(c, col)),
+    "Rainbow cycle": (False, lambda c, col: rainbow_cycle(c)),
+    "Chase": (True, lambda c, col: chase(c, col)),
+    "Color wipe": (True, lambda c, col: color_wipe(c, col)),
+    "Breathe": (True, lambda c, col: breathe(c, col)),
+    "Theater chase": (True, lambda c, col: theater_chase(c, col)),
+}
+
+
+# --------------------------------------------------------------------------
+# budget check + code emit
+# --------------------------------------------------------------------------
+def check_budget(count, n_frames):
+    """Return a list of human-readable problems (empty = fine)."""
+    problems = []
+    if not (1 <= count <= L.LIMITS["WS_MAX_COUNT"]):
+        problems.append(f"LED count must be 1..{L.LIMITS['WS_MAX_COUNT']}.")
+    frame_bytes = count * 3
+    if frame_bytes > L.LIMITS["WS_MAX_FRAME_BYTES"]:
+        problems.append(f"A frame is {frame_bytes} B; max {L.LIMITS['WS_MAX_FRAME_BYTES']}.")
+    if n_frames > L.LIMITS["MAX_DATA"]:
+        problems.append(f"{n_frames} frames exceeds the {L.LIMITS['MAX_DATA']}-DATA limit.")
+    total = frame_bytes * n_frames
+    if total > L.LIMITS["MAX_PAYLOAD_DECODED"]:
+        problems.append(f"Total frame data {total} B exceeds "
+                        f"{L.LIMITS['MAX_PAYLOAD_DECODED']} B.")
+    return problems
+
+
+def generate_script(pin, name, frames, delays, brightness=255, target="NOHD"):
+    """Full standalone .eos script that plays the frames in a forever loop."""
+    count = len(frames[0]) if frames else 1
+    name = (name or "anim")[:12]
+    out = ["# Generated by LED Studio — edit freely.",
+           f"TARGET {target}", "",
+           f"USES {pin} AS WS2812 COUNT {count}", "", "LOOP"]
+    for i in range(len(frames)):
+        out.append(f"  WS {pin} {name}{i}")
+        out.append(f"  DELAY {delays[i]}")
+    out += ["ENDLOOP", "END", ""]
+    for i, f in enumerate(frames):
+        out.append(f"DATA {name}{i} {_grouped(frame_to_hex(f, brightness))}")
+    return "\n".join(out) + "\n"
+
+
+def _grouped(hexstr):
+    """Group hex into per-LED 6-char chunks for readability."""
+    return " ".join(hexstr[i:i + 6] for i in range(0, len(hexstr), 6))

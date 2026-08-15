@@ -12,6 +12,8 @@
         <File path="src/eos_boot_ctrl.v" type="file.verilog" enable="1"/>
         <File path="src/eos_char_buffer.v" type="file.verilog" enable="1"/>
         <File path="src/eos_crc32.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_exp_engine.v" type="file.verilog" enable="1"/>
+        <File path="src/eos_exp_pkg.vh" type="file.verilog" enable="1"/>
         <File path="src/eos_flash_cmd.v" type="file.verilog" enable="1"/>
         <File path="src/eos_flash_reader.v" type="file.verilog" enable="1"/>
         <File path="src/eos_font_rom.v" type="file.verilog" enable="1"/>

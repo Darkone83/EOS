@@ -103,7 +103,7 @@ module eos_bank_ctrl #(
             4'h3: bank_base = 24'h000000; 4'h4: bank_base = 24'h040000;
             4'h5: bank_base = 24'h080000; 4'h6: bank_base = 24'h0C0000;
             4'h7: bank_base = 24'h000000; 4'h8: bank_base = 24'h080000;
-            4'h9: bank_base = 24'h000000; 4'hA: bank_base = 24'h1C0000;
+            4'h9: bank_base = 24'h4D0000; 4'hA: bank_base = 24'h1C0000;   // 0x9 = EOS script region (phys 0x6D0000, free gap)
             4'hB: bank_base = 24'h5F0000;            // CONFIG banks-table (phys 0x7F0000)
             4'hC: bank_base = 24'h5E0000;            // CONFIG settings   (phys 0x7E0000)
             4'hD: bank_base = 24'h200000;            // XbDiag Lite       (phys 0x400000, reserve)
@@ -116,7 +116,7 @@ module eos_bank_ctrl #(
     function [23:0] bank_size; input [3:0] b; begin
         case (b)
             4'h2,4'h7,4'h8: bank_size = 24'h080000;  // 512K
-            4'h9:          bank_size = 24'h100000;  // 1MB (user)
+            4'h9:          bank_size = 24'h020000;  // EOS script region: 128K (2x 64K blocks)
             4'hD:          bank_size = 24'h1C0000;  // XbDiag: full-image span (28x64K), 2nd slot
             4'hE:          bank_size = 24'h1C0000;  // LOADER: full-image span (28x64K), slot 0
             4'hB,4'hC:      bank_size = 24'h010000;  // CONFIG: one 64K block each
@@ -266,9 +266,12 @@ module eos_bank_ctrl #(
                S_DRD=5'd29,S_DCAP=5'd30,S_DFIN=5'd31,
                // ---- boot-time LED color-block load (after descriptor) ----
                S_LBOOT=6'd32,S_LCMD=6'd33,S_LA2=6'd34,S_LA1=6'd35,S_LA0=6'd36,
-               S_LRD=6'd37,S_LCAP=6'd38,S_LFIN=6'd39;
+               S_LRD=6'd37,S_LCAP=6'd38,S_LFIN=6'd39,
+               // ---- SPI transaction guard gaps (diagnostic) ----
+               S_WGAP=6'd40,S_PGAP=6'd41;
 
     reg [5:0]  st, ret; reg [1:0] op_l;
+    reg [3:0]  gap_cnt;   // CS-high guard counter between SPI transactions
     reg [23:0] addr_l; reg [8:0] blocks_left; reg [8:0] pbyte;
     reg [23:0] flashed_base, flashed_len;
     reg [8:0]  rd_idx;     // read-back byte counter (0..256)
@@ -297,6 +300,7 @@ module eos_bank_ctrl #(
             st<=S_DBOOT; busy<=0; done<=0; refused<=0; last_status<=8'hFF;
             flash_cs_n<=1; bus_req<=0; shift_go<=0; refresh_req<=0; refresh_base<=0; refresh_len<=0;
             addr_l<=0; blocks_left<=0; pbyte<=0; op_l<=0; flashed_base<=0; flashed_len<=0; ret<=S_IDLE;
+            gap_cnt<=4'd0;
             rd_we<=0; rd_waddr<=0; rd_wdata<=0; rd_idx<=0;
             db_idx<=0; desc_loaded<=0; descriptor_valid<=0; reload_pending<=0;
             bank1_rgb<=24'hFFFFFF; bank2_rgb<=24'hFFFFFF;
@@ -356,7 +360,18 @@ module eos_bank_ctrl #(
                 end
                 S_REQ:  begin bus_req<=1'b1; if (bus_gnt) st<=(op_l==OP_READ)?S_RCMD:S_WREN; end
                 S_WREN: begin flash_cs_n<=1'b0; tx_byte<=CMD_WREN; ret<=S_WREN2; st<=S_KICK; end
-                S_WREN2:begin flash_cs_n<=1'b1; st<=S_CMD; end
+                S_WREN2: begin
+                    flash_cs_n<=1'b1;
+                    gap_cnt<=4'd0;
+                    st<=S_WGAP;
+                end
+                // Hold /CS high for 8 clk cycles after WREN before ERASE/PROGRAM.
+                // Diagnostic guard only: isolates inter-command CS-high timing.
+                S_WGAP: begin
+                    flash_cs_n<=1'b1;
+                    if (gap_cnt==4'd7) st<=S_CMD;
+                    else gap_cnt<=gap_cnt+1'b1;
+                end
                 S_CMD:  begin flash_cs_n<=1'b0; tx_byte<=(op_l==OP_ERASE)?CMD_BE:CMD_PP; ret<=S_A2; st<=S_KICK; end
                 S_A2:   begin tx_byte<=addr_l[23:16]; ret<=S_A1; st<=S_KICK; end
                 S_A1:   begin tx_byte<=addr_l[15:8];  ret<=S_A0; st<=S_KICK; end
@@ -370,7 +385,17 @@ module eos_bank_ctrl #(
                     if (pbyte==9'd256) st<=S_CSUP;
                     else begin tx_byte<=pbuf[pbyte[7:0]]; ret<=S_PDATA; pbyte<=pbyte+1'b1; st<=S_KICK; end
                 end
-                S_CSUP:  begin flash_cs_n<=1'b1; st<=S_POLL0; end
+                S_CSUP: begin
+                    flash_cs_n<=1'b1;
+                    gap_cnt<=4'd0;
+                    st<=S_PGAP;
+                end
+                // Hold /CS high for 8 clk cycles after ERASE/PROGRAM before RDSR.
+                S_PGAP: begin
+                    flash_cs_n<=1'b1;
+                    if (gap_cnt==4'd7) st<=S_POLL0;
+                    else gap_cnt<=gap_cnt+1'b1;
+                end
                 S_POLL0: begin flash_cs_n<=1'b0; tx_byte<=CMD_RDSR; ret<=S_POLL1; st<=S_KICK; end
                 S_POLL1: begin tx_byte<=8'h00; ret<=S_POLLC; st<=S_KICK; end
                 S_POLLC: begin

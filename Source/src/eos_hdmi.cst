@@ -48,6 +48,19 @@ IO_LOC  "adv_sda" 52;  IO_PORT "adv_sda" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERE
 IO_LOC  "adv_scl" 53;  IO_PORT "adv_scl" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
 IO_LOC  "adv_int" 49;  IO_PORT "adv_int" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
 
+// EXP header pin constraints (Tang Nano 20K / GW2AR-18) -- EXP4..EXP8
+// EXP1=adv_sda, EXP2=adv_scl, EXP3=adv_int are already constrained (ADV7511 bus).
+// [DECISION] Confirm these physical pin numbers against the board (pin 75 was a
+// config pin). Match IO_TYPE/bank to the existing LVCMOS33 EXP1-3 lines.
+IO_LOC  "exp4" 55;   IO_PORT "exp4" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "exp5" 48;   IO_PORT "exp5" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "exp6" 51;   IO_PORT "exp6" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "exp7" 54;   IO_PORT "exp7" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "exp8" 56;   IO_PORT "exp8" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+// I2C on EXP pins wants external pull-ups on the header (open-drain in fabric);
+// if the board lacks them, set PULL_MODE=UP for the SCL/SDA pins in use.
+
+
 // ---- onboard LEDs ----
 IO_LOC  "led[0]" 15;  IO_PORT "led[0]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;
 IO_LOC  "led[1]" 16;  IO_PORT "led[1]" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=8;

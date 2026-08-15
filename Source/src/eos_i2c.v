@@ -71,7 +71,7 @@ module eos_i2c #(
     parameter [7:0] MAGIC     = 8'hD8,     // Darkone signature
     parameter [7:0] VER_MAJOR = 8'd1,
     parameter [7:0] VER_MINOR = 8'd0,
-    parameter [7:0] VER_PATCH = 8'd3
+    parameter [7:0] VER_PATCH = 8'd4
 )(
     input  wire        clk,
     input  wire        resetn,
@@ -131,7 +131,13 @@ module eos_i2c #(
     output reg         desc_reload,  // DESCRELOAD (0x39): 1-clk pulse -> FPGA re-reads descriptor
     output reg  [2:0]  set_color_bank, // SETBANKCOLOR (0x3A): target bank 1..4
     output reg  [23:0] set_color_rgb,  // packed {R,G,B}
-    output reg         set_color_stb   // 1-clk pulse when 0x3A is issued
+    output reg         set_color_stb,  // 1-clk pulse when 0x3A is issued
+    // ---- EXP expansion mailbox (regs 0x40-0x6F -> eos_exp_mailbox, top-level wire) ----
+    output wire [7:0]  mbx_rd_index,   // = current read command (rcmd)
+    input  wire [7:0]  mbx_rd_data,    // mailbox's combinational read data for rd_index
+    output reg         mbx_wr_stb,     // 1-clk pulse on a 0x40-0x6F write
+    output reg  [7:0]  mbx_wr_index,   // = wsub (0x40-0x6F)
+    output reg  [7:0]  mbx_wr_data     // = written byte
 );
     assign ver_major_out = VER_MAJOR;
     assign ver_minor_out = VER_MINOR;
@@ -193,7 +199,9 @@ module eos_i2c #(
     // what removes the readback race / version-misread on the contended bus.
     reg  [7:0] rcmd    = 8'h00;                    // command for THIS transaction
     reg        have_cmd= 1'b0;                     // command byte captured?
-    wire [7:0] rd_cur  = readmux(rcmd);            // response byte for rcmd
+    assign     mbx_rd_index = rcmd;               // mailbox read pointer follows the transaction command
+    wire [7:0] rd_cur  = (rcmd>=8'h40 && rcmd<=8'h6F) ? mbx_rd_data
+                                                      : readmux(rcmd);   // 0x40-0x6F -> EXP mailbox
     wire [7:0] resp_byte = hd_addr_match ? hd_read_data : rd_cur;  // whichever persona is live
 
     // ---- slave FSM -----------------------------------------------------------
@@ -225,12 +233,14 @@ module eos_i2c #(
     always @(posedge clk or negedge resetn) begin
         if (!resetn) begin
             st<=ST_IDLE; bcnt<=0; sh<=0; rw<=0; rcmd<=8'h00; have_cmd<=1'b0; acked<=0;
+            mbx_wr_stb<=1'b0; mbx_wr_index<=8'h00; mbx_wr_data<=8'h00;
             sda_oe<=0; scl_oe<=0; selected<=0; cmd_stb<=0; rx_count<=0;
             cmd<=0; arg0<=0; arg1<=0; arg2<=0; arg3<=0;
             hd_addr_match<=0; hd_byte_valid<=0; hd_byte<=0; hd_byte_first<=0;
             hd_first_pending<=0; hd_stretching<=0;
         end else begin
             cmd_stb <= 1'b0;
+            mbx_wr_stb <= 1'b0;   // 1-cycle strobe, default low
             hd_byte_valid <= 1'b0;   // 1-cycle strobe, default low every cycle
 
             if (hd_stretching) begin
@@ -345,7 +355,9 @@ module eos_i2c #(
                                 8'h12: arg1<=sh;
                                 8'h13: arg2<=sh;
                                 8'h14: arg3<=sh;
-                                default: ;
+                                default: if (wsub>=8'h40 && wsub<=8'h6F) begin  // EXP mailbox window
+                                    mbx_wr_stb<=1'b1; mbx_wr_index<=wsub; mbx_wr_data<=sh;
+                                end
                             endcase
                             wsub <= wsub + 8'd1;
                         end

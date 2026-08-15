@@ -1,0 +1,49 @@
+# =====================================================================
+#  EOS Script — BASIC example: blink an LED
+# =====================================================================
+#
+#  What you'll learn here:
+#    - the three parts of every script (declare, program, data)
+#    - how a pin is declared and why INIT/SAFE matter
+#    - the forever LOOP and DELAY
+#
+#  An .eos script is plain text. One command per line, like assembly.
+#  Anything after a '#' is a comment and is ignored.
+#
+#  It runs FOREVER, starting the moment the console powers on. There is
+#  no "main() returns" — the LOOP just keeps going.
+# ---------------------------------------------------------------------
+
+# ---- Part 1: DECLARE what hardware you use -----------------------------
+
+# TARGET tells EOS whether the HD addon is fitted.
+#   NOHD -> all of EXP1..EXP8 are free to use
+#   HD   -> EXP1..EXP3 are taken by the HD addon; use EXP4..EXP8
+TARGET NOHD
+
+# USES claims a pin and says what it is.
+#   EXP7 is a plain digital output (an LED, a relay coil, etc).
+#   GPIO_OUT and PWM MUST declare INIT and SAFE:
+#     INIT = the value driven the instant the script starts
+#     SAFE = the value driven if the script ever faults
+#   EXP pins have no guaranteed pull, so you must say what "off" is.
+#   Here both are 0 (LED off at startup, off on any fault).
+USES EXP7 AS GPIO_OUT INIT 0 SAFE 0
+
+# ---- Part 2: the PROGRAM ----------------------------------------------
+
+# LOOP ... ENDLOOP with no count means "repeat forever".
+LOOP
+  SET EXP7 1        # drive the pin HIGH -> LED on
+  DELAY 500         # wait 500 milliseconds (MS is the default unit)
+  SET EXP7 0        # drive the pin LOW  -> LED off
+  DELAY 500         # wait another 500 ms
+ENDLOOP
+
+# END marks where the forever-loop wraps back to the top.
+# (If you leave END off, it wraps at the last line anyway — but be tidy.)
+END
+
+# ---- Part 3: DATA -----------------------------------------------------
+# This simple script has no payloads (no LED frames, no I2C blocks),
+# so there is no DATA section. You'll see one in the next example.

@@ -490,6 +490,13 @@ module eos_sdram_backend #(
 
     // Post-flash reload bookkeeping
     localparam [22:0] SCRATCH_BASE = 23'h60_0000;  // SDRAM serve ceiling (6MB managed)
+    // §6 EOS script region: a dedicated 128 KB persistent flash block (first free,
+    // above the managed CONFIG top). Loaded once after preload into the scratch
+    // window the EXP engine reads (its base == SCRATCH_BASE, i.e. flash 0x800000
+    // mirrors scratch 0x600000). The engine sources the .eos from here every boot.
+    localparam [23:0] EOS_SCRIPT_FL  = 24'h6D_0000;                 // physical flash base (free gap, phys 0x6D0000)
+    localparam [23:0] EOS_SCRIPT_LEN = 24'h02_0000;                 // 128 KB (2 x 64 KB blocks)
+    localparam [23:0] EOS_SCRIPT_END = {1'b0, SCRATCH_BASE} + EOS_SCRIPT_LEN;  // scratch ceiling for this fill
     wire [23:0] rl_sd_next = reload_base - FLASH_OFF;   // 24b; [23] provably 0, see use
     reg         reload_pending;
     reg [23:0]  rl_fl_base;     // physical flash base
@@ -504,6 +511,8 @@ module eos_sdram_backend #(
     reg         newrgn_done;   // new-region preload STARTED (runs once)
     reg         newrgn_ready;  // new-region data RESIDENT in SDRAM (fill done)
     reg         nr_filling;    // the active reload is the new-region fill
+    reg         script_done;   // §6 script region loaded into scratch (runs once, post-preload)
+    reg         scr_filling;   // the active reload is the script -> scratch fill
     reg         sdcard_ready;  // SD-card-sourced bank 0x0 data RESIDENT in NRGN_SDCARD
                                 // (own flag, own lane -- NOT newrgn_ready/NRGN_SD)
     // does the just-captured probe byte match its expected 'XBEH' position?
@@ -524,7 +533,8 @@ module eos_sdram_backend #(
     // burst_active safe to clear on the last byte.
     reg [8:0]  rl_burst_left;                 // bytes remaining in the active burst
     wire [23:0] rl_remain = rl_len - rl_idx;                       // to region end
-    wire [23:0] rl_room   = {1'b0, SCRATCH_BASE} - ({1'b0, rl_sd_base} + rl_idx);
+    wire [23:0] rl_ceiling = scr_filling ? EOS_SCRIPT_END : {1'b0, SCRATCH_BASE};
+    wire [23:0] rl_room   = rl_ceiling - ({1'b0, rl_sd_base} + rl_idx);
     wire [23:0] rl_cap    = (rl_remain < rl_room) ? rl_remain : rl_room;
     wire [8:0]  rl_blen   = (rl_cap >= 24'd256) ? 9'd256 : rl_cap[8:0];
 
@@ -607,6 +617,8 @@ module eos_sdram_backend #(
             slot1_ready    <= 1'b0;
             slot1_done     <= 1'b0;
             newrgn_done    <= 1'b0;
+            script_done    <= 1'b0;
+            scr_filling    <= 1'b0;
             newrgn_ready   <= 1'b0;
             sdcard_ready   <= 1'b0;
             nr_filling     <= 1'b0;
@@ -677,7 +689,8 @@ module eos_sdram_backend #(
             // already in flight -- a second request mid-reload would otherwise
             // overwrite rl_* and corrupt the copy in progress.
             if (reload_req && !reload_pending && (reload_base >= FLASH_OFF) &&
-                ((reload_base - FLASH_OFF) < {1'b0, SCRATCH_BASE})) begin
+                (((reload_base - FLASH_OFF) < {1'b0, SCRATCH_BASE}) ||
+                 (reload_base == EOS_SCRIPT_FL))) begin
                 reload_pending <= 1'b1;
                 rl_fl_base     <= reload_base;
                 // The NEW REGION (flash NRGN_FL) is served from SDRAM NRGN_SD, which
@@ -686,6 +699,12 @@ module eos_sdram_backend #(
                 if (reload_base == NRGN_FL) begin
                     rl_sd_base <= NRGN_SD;
                     nr_filling <= 1'b1;           // completion sets newrgn_ready
+                end else if (reload_base == EOS_SCRIPT_FL) begin
+                    // §6c live replacement: after the loader commits a fresh .eos,
+                    // a sync of the script region re-pages it into the scratch
+                    // window (base == SCRATCH_BASE) so the engine revalidates it.
+                    rl_sd_base  <= SCRATCH_BASE;
+                    scr_filling <= 1'b1;
                 end else begin
                     // reload_base >= FLASH_OFF is checked by the guard above, and
                     // the difference is < SCRATCH_BASE, so bit 23 is always 0.
@@ -857,6 +876,21 @@ module eos_sdram_backend #(
                             nr_filling   <= 1'b1;
                             burst_active <= 1'b0;
                             st           <= S_RL_REQ;
+                        end else if (preload_done && slot1_done && newrgn_done
+                                     && !script_done && flash_free && !reload_pending) begin
+                            // §6: page the persistent .eos script region (flash
+                            // EOS_SCRIPT_FL) into the scratch window the EXP engine
+                            // reads (base == SCRATCH_BASE), once, after preload. The
+                            // boot gate (first served BIOS byte) only opens after
+                            // this, so the frame is resident when the engine validates.
+                            script_done  <= 1'b1;
+                            rl_fl_base   <= EOS_SCRIPT_FL;
+                            rl_sd_base   <= SCRATCH_BASE;
+                            rl_len       <= EOS_SCRIPT_LEN;
+                            rl_idx       <= 24'd0;
+                            scr_filling  <= 1'b1;
+                            burst_active <= 1'b0;
+                            st           <= S_RL_REQ;
                         end else if (reload_pending && flash_free) begin
                             // freshly-flashed region: re-read flash -> SDRAM in
                             // place so it serves without a cold boot. Only once
@@ -896,7 +930,7 @@ module eos_sdram_backend #(
                 // completion > refresh > LPC serve > next flash byte.
                 S_RL_REQ: begin
                     if (rl_idx >= rl_len ||
-                        (rl_sd_base + rl_idx[22:0]) >= SCRATCH_BASE) begin
+                        (rl_sd_base + rl_idx[22:0]) >= (scr_filling ? EOS_SCRIPT_END[22:0] : SCRATCH_BASE)) begin
                         if (s1_filling) begin
                             slot1_ready <= 1'b1;   // XbDiag window now resident
                             s1_filling  <= 1'b0;
@@ -904,6 +938,9 @@ module eos_sdram_backend #(
                             nr_filling     <= 1'b0;   // new region now resident
                             newrgn_ready   <= 1'b1;
                             reload_pending <= 1'b0;   // also clear if this came via a sync
+                        end else if (scr_filling) begin
+                            scr_filling    <= 1'b0;   // §6 .eos script now resident in scratch
+                            reload_pending <= 1'b0;   // clear if this came via a host re-sync
                         end else begin
                             reload_pending <= 1'b0;
                         end

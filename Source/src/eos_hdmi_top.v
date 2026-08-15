@@ -24,7 +24,12 @@ module eos_hdmi_top (
                                         // sole master; open-drain via RTL Hi-Z +
                                         // external pull-up. NOT the Xbox SMBus.
     inout              adv_scl,       // PRIVATE ADV7511 I2C SCL (EXP2)
-    input              adv_int,       // ADV7511 INT -> FPGA pin 49
+    inout              adv_int,       // ADV7511 INT / EXP3 when TARGET NOHD
+    inout              exp4,          // EXP4 (idx3)  user GPIO/PWM/WS2812/I2C  TODO[board]: .cst IO_LOC
+    inout              exp5,          // EXP5 (idx4)
+    inout              exp6,          // EXP6 (idx5)
+    inout              exp7,          // EXP7 (idx6)
+    inout              exp8,          // EXP8 (idx7)
     output              hd_led_green,  // on-board HD status LED (GPIO
                                         // 30/31) -- self-contained in
                                         // eos_hd.v, no path through
@@ -331,8 +336,7 @@ module eos_hdmi_top (
 
     // scratch READ port: CRC owns it during VALIDATE, bank_ctrl during COMMIT
     // (i2c sequences them, never simultaneous).
-    assign be_scr_rd    = crc_busy ? crc_scr_rd    : bank_scr_rd;
-    assign be_scr_raddr = crc_busy ? crc_scr_raddr : bank_scr_raddr;
+    // (be_scr arbiter extended to 3-way inside the EXP ENGINE block below)
 
     eos_sdram_backend u_be (
         .lclk          (clk_lpc),
@@ -691,7 +695,8 @@ module eos_hdmi_top (
     wire       i2c_sda_oe, i2c_scl_oe, i2c_cmd_stb, i2c_sel;
     wire [7:0] i2c_cmd, i2c_a0, i2c_a1, i2c_a2, i2c_a3, i2c_rxcnt;
     // HD transport enable -- now driven for real by eos_hd.v's own
-    // hd_addr_en OUTPUT (its collision guard clearing), not tied to 0.
+    // hd_addr_en OUTPUT (raised when ADV init completes; the old collision
+    // guard is gone), not tied to 0.
     wire       hd_transport_en;
     // eos_hd.v's HD/ADV master now drives a SEPARATE, private bus (adv_sda/
     // adv_scl on EXP1/EXP2), NOT the Xbox SMBus. This is the whole fix: the
@@ -744,7 +749,9 @@ module eos_hdmi_top (
         .desc_reload(i2c_desc_reload),
         .set_color_bank(i2c_set_color_bank),
         .set_color_rgb(i2c_set_color_rgb),
-        .set_color_stb(i2c_set_color_stb)
+        .set_color_stb(i2c_set_color_stb),
+        .mbx_rd_index(mbx_rd_index), .mbx_rd_data(mbx_rd_data),
+        .mbx_wr_stb  (mbx_wr_stb),   .mbx_wr_index(mbx_wr_index), .mbx_wr_data(mbx_wr_data)
     );
 
     // ---- EOS-native HD (ADV7511) controller -------------------------------
@@ -1213,4 +1220,247 @@ module eos_hdmi_top (
         .ws_out (ws2812_bank)
     );
 
+
+
+    // =====================================================================
+    //  EXP EXPANSION ENGINE  (spec: eos_expansion_spec.md)  --  clk_sd domain
+    //  Inlined subsystem: header reader + framechk + lexer + layout + volatile
+    //  + mailbox + exec + pinmux(PWM/WS2812) + soft-I2C master + loader, plus a
+    //  dedicated eos_crc32 (u_exp_crc). Presents ONE scratch reader, arbitrated
+    //  behind the updater (crc/bank) on the be_scr port.
+    //  TODO[board] items are marked -- confirm against the real NOR/pins.
+    // =====================================================================
+    // §6: the .eos validity frame is resident at the base of the scratch window,
+    // which the SDRAM backend pages from the persistent flash script region
+    // (EOS_SCRIPT_FL = 0x800000) once after preload. Frame @ base, text @ +16.
+    localparam [20:0] EXP_FRAME_BASE = 21'h00_0000;    // scratch base == flash 0x800000 mirror
+    localparam [20:0] EXP_TEXT_BASE  = EXP_FRAME_BASE + 21'd16;
+    wire clk = clk_sd;  wire resetn = sd_rstn;
+    wire exp_sys_target = hd_transport_en;             // HD build -> EXP1-3 reserved
+    // boot gate: first served BIOS byte (mem_req @clk_lpc) -> sticky -> 2FF -> clk_sd
+    reg  exp_served_lclk = 1'b0;
+    always @(posedge clk_lpc or negedge lpc_lreset_n)
+        if (!lpc_lreset_n) exp_served_lclk<=1'b0; else if (mem_req) exp_served_lclk<=1'b1;
+    reg [1:0] exp_fbb = 2'b00;
+    always @(posedge clk_sd or negedge sd_rstn)
+        if (!sd_rstn) exp_fbb<=2'b00; else exp_fbb<={exp_fbb[0], exp_served_lclk};
+    wire exp_first_bios = exp_fbb[1];
+    // §6c live replacement: hold the expansion engine in its ordered stop
+    // (halt -> SAFE -> release I2C -> mailbox reset -> erase permit) whenever the
+    // flash engine is programming/erasing OR a scratch re-page is in flight, then
+    // revalidate once both clear (MAGIC re-checked -> run, blank -> idle). This is
+    // conservative: it also stops during unrelated bank flashes, which is safe --
+    // the engine simply re-reads its resident .eos and restarts from instr 0.
+    wire exp_reload_req     = eng_busy | dbg_reload;
+    wire exp_reload_disable = 1'b0;    // SAFE hold; an erased/blank region -> Hi-Z via revalidation (§5.5)
+    wire exp_erase_permit;             // -> gate your .eos erase/program until this is high
+    wire exp_scr_rd; wire [20:0] exp_scr_raddr;
+    wire upd_scr_active = crc_busy | bank_scr_rd;      // updater owns the scratch port
+    wire [7:0] exp_scr_rdata  = be_scr_rdata;
+    wire       exp_scr_rvalid = be_scr_rvalid & ~upd_scr_active;
+    wire       exp_scr_busy   = be_scr_busy   | upd_scr_active;
+    wire [7:0] mbx_rd_index, mbx_rd_data, mbx_wr_index, mbx_wr_data; wire mbx_wr_stb;
+    wire [7:0] exp_out, exp_oe;
+    wire [7:0] exp_in = {exp8, exp7, exp6, exp5, exp4, adv_int, adv_scl, adv_sda}; // idx7..0
+    wire exp_st_running, exp_st_fault, exp_st_image_valid, exp_st_gate, exp_st_busy;
+
+
+        // ---- shared CRC (framechk drives it) --------------------------------
+    wire        exp_crc_go, exp_crc_busy, exp_crc_done; wire [20:0] exp_crc_len; wire [31:0] exp_crc_result;
+    wire        exp_crc_scr_rd; wire [20:0] exp_crc_scr_raddr;
+    eos_crc32 u_exp_crc(.clk(clk),.resetn(resetn),.go(exp_crc_go),.len(exp_crc_len),
+        .busy(exp_crc_busy),.done(exp_crc_done),.crc(exp_crc_result),
+        .scr_rd(exp_crc_scr_rd),.scr_raddr(exp_crc_scr_raddr),
+        .scr_rdata(exp_scr_rdata),.scr_rvalid(exp_scr_rvalid),.scr_busy(exp_scr_busy));
+
+    // ---- framechk -------------------------------------------------------
+    reg         fc_start_i; wire fc_done_c, fc_valid_c; wire [2:0] fc_reason;
+    reg  [31:0] h_tlen, h_crc; reg [7:0] h_tgt;
+    eos_exp_framechk u_fc(.clk(clk),.resetn(resetn),.start(fc_start_i),
+        .text_len(h_tlen[20:0]),.expected_crc(h_crc),.frame_target(h_tgt[0]),.sys_target(exp_sys_target),
+        .crc_go(exp_crc_go),.crc_len(exp_crc_len),.crc_busy(exp_crc_busy),.crc_done(exp_crc_done),.crc_result(exp_crc_result),
+        .done(fc_done_c),.valid(fc_valid_c),.reason(fc_reason));
+
+    // ---- header reader (frame @ EXP_FRAME_BASE -> h_tlen/h_crc/h_tgt) --------
+    localparam HR_IDLE=3'd0, HR_ISS=3'd1, HR_CON=3'd2, HR_CHK=3'd3, HR_WFC=3'd4, HR_BAD=3'd5;
+    reg  [2:0]  hr_st; reg [4:0] hr_idx; reg hr_rd; reg [20:0] hr_raddr;
+    reg  [31:0] h_magic; reg [7:0] h_fmt;
+    reg         hr_done_p;                 // 1-cyc "invalid frame" done pulse
+    wire        hdr_ok = (h_magic==32'h454F5358) && (h_fmt==8'd1);   // 'EOSX', FMT_VER 1
+    wire        ldr_fc_start;
+    always @(posedge clk or negedge resetn) begin
+        if (!resetn) begin hr_st<=HR_IDLE; hr_idx<=5'd0; hr_rd<=1'b0; fc_start_i<=1'b0; hr_done_p<=1'b0; end
+        else begin
+            fc_start_i<=1'b0; hr_done_p<=1'b0; hr_rd<=1'b0;
+            case (hr_st)
+            HR_IDLE: if (ldr_fc_start) begin hr_idx<=5'd0; hr_st<=HR_ISS; end
+            HR_ISS:  begin hr_rd<=1'b1; hr_raddr<=EXP_FRAME_BASE + {16'd0,hr_idx}; hr_st<=HR_CON; end
+            HR_CON:  if (exp_scr_rvalid) begin
+                        case (hr_idx)
+                          5'd0: h_magic[31:24]<=exp_scr_rdata; 5'd1: h_magic[23:16]<=exp_scr_rdata;
+                          5'd2: h_magic[15:8]<=exp_scr_rdata;  5'd3: h_magic[7:0]<=exp_scr_rdata;
+                          5'd4: h_fmt<=exp_scr_rdata;          5'd5: h_tgt<=exp_scr_rdata;
+                          5'd8: h_tlen[7:0]<=exp_scr_rdata;    5'd9: h_tlen[15:8]<=exp_scr_rdata;
+                          5'd10:h_tlen[23:16]<=exp_scr_rdata;  5'd11:h_tlen[31:24]<=exp_scr_rdata;
+                          5'd12:h_crc[7:0]<=exp_scr_rdata;     5'd13:h_crc[15:8]<=exp_scr_rdata;
+                          5'd14:h_crc[23:16]<=exp_scr_rdata;   5'd15:h_crc[31:24]<=exp_scr_rdata;
+                          default: ;
+                        endcase
+                        if (hr_idx==5'd15) hr_st<=HR_CHK; else begin hr_idx<=hr_idx+5'd1; hr_st<=HR_ISS; end
+                     end
+            HR_CHK:  if (hdr_ok) begin fc_start_i<=1'b1; hr_st<=HR_WFC; end   // MAGIC/FMT ok -> CRC/target/len check
+                     else        begin hr_done_p<=1'b1; hr_st<=HR_BAD; end    // blank/invalid frame
+            HR_WFC:  if (fc_done_c) hr_st<=HR_IDLE;
+            HR_BAD:  hr_st<=HR_IDLE;
+            default: hr_st<=HR_IDLE;
+            endcase
+        end
+    end
+    // to loader: done from framechk OR bad-frame pulse; valid only if framechk ran and passed
+    wire fc_done_ldr  = fc_done_c | hr_done_p;
+    wire fc_valid_ldr = hdr_ok ? fc_valid_c : 1'b0;
+
+    // ---- lexer ----------------------------------------------------------
+    wire        lex_scr_rd; wire [20:0] lex_scr_raddr;
+    wire        tok_stb,tok_first,line_stb,lex_done,lbusy,lheld; wire [20:0] tok_off,line_off;
+    wire [15:0] tok_len,ord,tcount,lno,icount,lcount; wire [1:0] kcl; wire [7:0] kcode;
+    wire [127:0] tword; wire [5:0] ttag; wire [31:0] tnum; wire tisnum;
+    wire        e_lxs,e_lxack; wire [20:0] e_lxoff; wire [15:0] e_lxord;
+    wire [3:0]  ldr_dbg;
+    wire        pass2 = (ldr_dbg==4'd5)||(ldr_dbg==4'd6)||(ldr_dbg==4'd7)||(ldr_dbg==4'd8);
+    wire        ldr_lay_start;
+    wire        lx_start = pass2 ? e_lxs   : ldr_lay_start;
+    wire [20:0] lx_off   = pass2 ? e_lxoff : 21'd0;
+    wire [15:0] lx_ord   = pass2 ? e_lxord : 16'd0;
+    wire        lx_ack   = pass2 ? e_lxack : 1'b1;
+    eos_exp_lex u_lex(.clk(clk),.rst_n(resetn),.start(lx_start),.text_base(21'd0),.text_len(h_tlen[20:0]),
+        .start_off(lx_off),.start_ord(lx_ord),.lx_ack(lx_ack),.held(lheld),
+        .scr_rd(lex_scr_rd),.scr_raddr(lex_scr_raddr),.scr_rdata(exp_scr_rdata),.scr_rvalid(exp_scr_rvalid),.scr_busy(exp_scr_busy),
+        .tok_stb(tok_stb),.tok_off(tok_off),.tok_len(tok_len),.tok_is_first(tok_first),
+        .tok_word(tword),.tok_tag(ttag),.tok_num(tnum),.tok_isnum(tisnum),
+        .line_stb(line_stb),.kw_class(kcl),.kw_code(kcode),.instr_ordinal(ord),.tok_count(tcount),
+        .line_off(line_off),.line_no(lno),.done(lex_done),.instr_count(icount),.line_count(lcount),.busy(lbusy));
+
+    // ---- layout ---------------------------------------------------------
+    wire        lay_done,lay_ok; wire [2:0] lerr; wire [3:0] pdc; wire [7:0] volu;
+    wire [7:0]  q_bo,q_do; wire [63:0] ptf,pif,psf;
+    wire [2:0]  cnt_sel; wire [15:0] cnt_val; wire [2:0] i2c_sclp,i2c_sdap; wire i2c_pres;
+    wire [6:0]  def_ridx,def_cnt; wire [127:0] def_rword; wire [31:0] def_rval;
+    wire [5:0]  dat_ridx,dat_cnt; wire [127:0] dat_rword; wire [20:0] dat_rdoff; wire [31:0] dat_rdlen;
+    wire [3:0]  q_sel_mbx; wire [63:0] db_off_flat;
+    wire [9:0] desc_raddr, desc_len; wire [7:0] desc_rdata;
+    eos_exp_layout u_lay(.clk(clk),.resetn(resetn),.start(ldr_lay_start),
+        .tok_stb(tok_stb),.tok_off(tok_off),.tok_len(tok_len),.tok_is_first(tok_first),
+        .tok_word(tword),.tok_tag(ttag),.tok_num(tnum),.tok_isnum(tisnum),
+        .line_stb(line_stb),.kw_class(kcl),.kw_code(kcode),.lex_done(lex_done),
+        .frame_target(h_tgt[0]),.instr_count(icount),
+        .done(lay_done),.ok(lay_ok),.err(lerr),.pindef_count(pdc),.volatile_used(volu),
+        .q_sel(q_sel_mbx),.q_bankoff(q_bo),.q_dboff(q_do),.db_off_flat(db_off_flat),
+        .desc_raddr(desc_raddr),.desc_rdata(desc_rdata),.desc_len(desc_len),
+        .pin_type_flat(ptf),.pin_init_flat(pif),.pin_safe_flat(psf),
+        .cnt_sel(cnt_sel),.cnt_val(cnt_val),.i2c_scl_pin(i2c_sclp),.i2c_sda_pin(i2c_sdap),.i2c_present(i2c_pres),
+        .def_ridx(def_ridx),.def_rword(def_rword),.def_rval(def_rval),.def_cnt(def_cnt),
+        .dat_ridx(dat_ridx),.dat_rword(dat_rword),.dat_rdoff(dat_rdoff),.dat_rdlen(dat_rdlen),.dat_cnt(dat_cnt));
+
+    // ---- volatile (host=mailbox, script=exec) ---------------------------
+    wire        v_zero,v_zbusy;
+    wire        mv_wr; wire [7:0] mv_waddr,mv_wdata,mv_raddr,mv_rdata;
+    wire        se_wr; wire [7:0] se_raddr,se_rdata,se_waddr,se_wdata;
+    eos_exp_volatile u_vol(.clk(clk),.resetn(resetn),.zero(v_zero),.zbusy(v_zbusy),
+        .h_wr(mv_wr),.h_waddr(mv_waddr),.h_wdata(mv_wdata),.h_raddr(mv_raddr),.h_rdata(mv_rdata),
+        .s_wr(se_wr),.s_waddr(se_waddr),.s_wdata(se_wdata),.s_raddr(se_raddr),.s_rdata(se_rdata));
+
+    // ---- mailbox (0x6E 0x40-0x6F) ---------------------------------------
+    wire mbx_clr;
+    eos_exp_mailbox u_mbx(.clk(clk),.resetn(resetn),
+        .st_running(exp_st_running),.st_fault(exp_st_fault),.st_image_valid(exp_st_image_valid),
+        .st_boot_gate(exp_st_gate),.st_busy(exp_st_busy),.mbx_clr(mbx_clr),
+        .fault_code(fcode),.pc(pc),.pindef_count(pdc),
+        .rd_index(mbx_rd_index),.rd_data(mbx_rd_data),
+        .wr_stb(mbx_wr_stb),.wr_index(mbx_wr_index),.wr_data(mbx_wr_data),
+        .q_sel(q_sel_mbx),.q_bankoff(q_bo),.q_dboff(q_do),.db_off_flat(db_off_flat),
+        .desc_raddr(desc_raddr),.desc_rdata(desc_rdata),.desc_len(desc_len),
+        .script_wr(se_wr),.script_waddr(se_waddr),.script_wdata(se_wdata),
+        .v_wr(mv_wr),.v_waddr(mv_waddr),.v_wdata(mv_wdata),.v_raddr(mv_raddr),.v_rdata(mv_rdata));
+
+    // ---- exec -----------------------------------------------------------
+    wire        exec_start,exec_halt,exec_running,exec_fault; wire [7:0] fcode; wire [15:0] pc;
+    wire        p_start; wire [7:0] p_op,p_result,p_a0; wire [2:0] p_pin3; wire [16:0] p_a1; wire p_done;
+    wire        ws_wr; wire [11:0] ws_waddr; wire [7:0] ws_wdata; wire ws_send; wire [12:0] ws_len; wire ws_zero; wire [2:0] ws_pin; wire ws_busy;
+    wire        iw_wr; wire [8:0] iw_waddr; wire [7:0] iw_wdata; wire i2c_go,i2c_read; wire [6:0] i2c_addr; wire [8:0] i2c_len,ir_raddr; wire [7:0] ir_rdata;
+    wire        i2c_busy,i2c_done; wire [2:0] i2c_result;
+    wire        x_scr_rd; wire [20:0] x_scr_raddr;
+    eos_exp_exec #(.CYCLES_PER_MS(32'd64800),.WATCHDOG_CYC(32'd32400000)) u_exe(.clk(clk),.resetn(resetn),
+        .start(exec_start),.halt(exec_halt),.text_len(h_tlen[20:0]),
+        .pin_type_flat(ptf),.i2c_present(i2c_pres),
+        .line_stb(line_stb),.kw_class(kcl),.kw_code(kcode),.line_off(line_off),.instr_ordinal(ord),
+        .tok_stb(tok_stb),.tok_len(tok_len),.tok_is_first(tok_first),.tok_word(tword),.tok_tag(ttag),.tok_num(tnum),.tok_isnum(tisnum),
+        .lex_held(lheld),.lex_done(lex_done),
+        .lx_start(e_lxs),.lx_off(e_lxoff),.lx_ord(e_lxord),.lx_ack(e_lxack),
+        .s_raddr(se_raddr),.s_rdata(se_rdata),.s_wr(se_wr),.s_waddr(se_waddr),.s_wdata(se_wdata),
+        .v_zero(v_zero),.v_zbusy(v_zbusy),
+        .p_start(p_start),.p_op(p_op),.p_pin(p_pin3),.p_arg0(p_a0),.p_arg1(p_a1),
+        .p_busy(1'b0),.p_done(p_done),.p_result(p_result),
+        .ws_wr(ws_wr),.ws_waddr(ws_waddr),.ws_wdata(ws_wdata),.ws_send(ws_send),.ws_len(ws_len),
+        .ws_zero(ws_zero),.ws_pin(ws_pin),.ws_busy(ws_busy),.cnt_sel(cnt_sel),.cnt_val(cnt_val),
+        .iw_wr(iw_wr),.iw_waddr(iw_waddr),.iw_wdata(iw_wdata),.i2c_go(i2c_go),.i2c_read(i2c_read),
+        .i2c_addr(i2c_addr),.i2c_len(i2c_len),.ir_raddr(ir_raddr),.ir_rdata(ir_rdata),
+        .i2c_busy(i2c_busy),.i2c_done(i2c_done),.i2c_result(i2c_result),
+        .def_ridx(def_ridx),.def_rword(def_rword),.def_rval(def_rval),.def_cnt(def_cnt),
+        .dat_ridx(dat_ridx),.dat_rword(dat_rword),.dat_rdoff(dat_rdoff),.dat_rdlen(dat_rdlen),.dat_cnt(dat_cnt),
+        .x_scr_rd(x_scr_rd),.x_scr_raddr(x_scr_raddr),.x_scr_rdata(exp_scr_rdata),.x_scr_rvalid(exp_scr_rvalid),.x_scr_busy(exp_scr_busy),
+        .running(exec_running),.fault(exec_fault),.fault_code(fcode),.pc(pc));
+
+    // ---- pins (pinmux + PWM + WS2812) -----------------------------------
+    wire        pins_active,safe_out;
+    wire        i2c_m_scl_oe,i2c_m_sda_oe,i2c_m_scl_in,i2c_m_sda_in;
+    eos_exp_pins #(.CLK_HZ(32'd64800000)) u_pins(.clk(clk),.resetn(resetn),.boot_gate(pins_active),.safe_mode(safe_out),
+        .pin_type_flat(ptf),.pin_init_flat(pif),.pin_safe_flat(psf),
+        .p_start(p_start),.p_op(p_op),.p_pin(p_pin3),.p_val0(p_a0),.p_val1(p_a1),
+        .p_done(p_done),.p_result(p_result),
+        .ws_wr(ws_wr),.ws_waddr(ws_waddr),.ws_wdata(ws_wdata),.ws_send(ws_send),.ws_len(ws_len),
+        .ws_zero(ws_zero),.ws_pin(ws_pin),.ws_busy(ws_busy),
+        .i2c_scl_pin(i2c_sclp),.i2c_sda_pin(i2c_sdap),.i2c_present(i2c_pres),
+        .i2c_scl_oe(i2c_m_scl_oe),.i2c_sda_oe(i2c_m_sda_oe),.i2c_scl_in(i2c_m_scl_in),.i2c_sda_in(i2c_m_sda_in),
+        .exp_out(exp_out),.exp_oe(exp_oe),.exp_in(exp_in));
+
+    // ---- soft I2C master (script I2CW/I2CR) -----------------------------
+    eos_exp_i2c #(.SCL_LOW_CYCLES(324),.SCL_HIGH_CYCLES(324)) u_i2cm(.clk(clk),.resetn(resetn),
+        .sda_in(i2c_m_sda_in),.scl_in(i2c_m_scl_in),.sda_oe(i2c_m_sda_oe),.scl_oe(i2c_m_scl_oe),
+        .iw_wr(iw_wr),.iw_waddr(iw_waddr),.iw_wdata(iw_wdata),.ir_raddr(ir_raddr),.ir_rdata(ir_rdata),
+        .i2c_go(i2c_go),.i2c_read(i2c_read),.i2c_addr(i2c_addr),.i2c_len(i2c_len),
+        .i2c_busy(i2c_busy),.i2c_done(i2c_done),.i2c_result(i2c_result));
+
+    // ---- loader (lifecycle orchestrator) --------------------------------
+    eos_exp_loader u_ldr(.clk(clk),.resetn(resetn),
+        .first_bios_byte(exp_first_bios),.reload_req(exp_reload_req),.reload_disable(exp_reload_disable),
+        .fc_done(fc_done_ldr),.fc_valid(fc_valid_ldr),.lay_done(lay_done),.lay_ok(lay_ok),
+        .exec_running(exec_running),.exec_fault(exec_fault),
+        .fc_start(ldr_fc_start),.lay_start(ldr_lay_start),.exec_start(exec_start),.exec_halt(exec_halt),
+        .pins_active(pins_active),.safe_out(safe_out),.mbx_reset(mbx_clr),.erase_permit(exp_erase_permit),
+        .st_running(exp_st_running),.st_fault(exp_st_fault),.st_image_valid(exp_st_image_valid),
+        .st_gate_open(exp_st_gate),.st_busy(exp_st_busy),.dbg_state(ldr_dbg));
+
+    // ---- scratch READ arbiter (hdr > crc > exec-x > lexer; EXP_TEXT_BASE add)
+    assign exp_scr_rd    = hr_rd ? 1'b1 : exp_crc_scr_rd ? 1'b1 : x_scr_rd ? 1'b1 : lex_scr_rd;
+    assign exp_scr_raddr = hr_rd     ? hr_raddr :
+                       exp_crc_scr_rd ? (EXP_TEXT_BASE + exp_crc_scr_raddr) :
+                       x_scr_rd   ? (EXP_TEXT_BASE + x_scr_raddr) :
+                                    (EXP_TEXT_BASE + lex_scr_raddr);
+
+    // ---- scratch arbiter: updater (crc VALIDATE / bank COMMIT) first, EXP behind ----
+    assign be_scr_rd    = crc_busy ? crc_scr_rd    : bank_scr_rd ? bank_scr_rd    : exp_scr_rd;
+    assign be_scr_raddr = crc_busy ? crc_scr_raddr : bank_scr_rd ? bank_scr_raddr : exp_scr_raddr;
+    // ---- EXP4..EXP8 open-drain (idx3..7). EXP1..3 (idx0..2)=ADV bus, reserved under HD ----
+    // Under NOHD the editor/spec exposes all eight EXP pins. The ADV private
+    // bus remains authoritative under HD; expansion only adds a driver when
+    // hd_transport_en is false.
+    assign adv_sda = (!hd_transport_en && exp_oe[0]) ? exp_out[0] : 1'bz; // EXP1
+    assign adv_scl = (!hd_transport_en && exp_oe[1]) ? exp_out[1] : 1'bz; // EXP2
+    assign adv_int = (!hd_transport_en && exp_oe[2]) ? exp_out[2] : 1'bz; // EXP3
+    assign exp4 = exp_oe[3] ? exp_out[3] : 1'bz;
+    assign exp5 = exp_oe[4] ? exp_out[4] : 1'bz;
+    assign exp6 = exp_oe[5] ? exp_out[5] : 1'bz;
+    assign exp7 = exp_oe[6] ? exp_out[6] : 1'bz;
+    assign exp8 = exp_oe[7] ? exp_out[7] : 1'bz;
 endmodule

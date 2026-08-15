@@ -106,8 +106,10 @@ module eos_hd #(
     input  wire          adv_int,
 
     // ---- eos_i2c.v's HD relay interface (dual-address slave transport) ----
-    output reg          hd_addr_en,     // gates HD_ADDR (0x69) live -- only
-                                         // raised once the collision guard clears
+    output reg          hd_addr_en,     // gates HD_ADDR (0x69) live -- raised
+                                         // once ADV init completes (BR_ENABLE_
+                                         // VIDEO); the old collision guard is
+                                         // gone, so init completion is the gate
     input  wire          hd_addr_match,
     input  wire           hd_byte_valid,
     input  wire  [7:0]     hd_byte,
@@ -182,7 +184,7 @@ module eos_hd #(
 
     reg  [2:0] op_kind;
     reg        op_go;
-    reg  [6:0] op_target_addr;   // which I2C address this op is against (ADV or the collision-guard probe)
+    reg  [6:0] op_target_addr;   // which I2C address this op is against (always the ADV now; the old collision-guard probe target is gone)
     reg  [7:0] adv_waddr, adv_wdata;
     reg  [7:0] adv_rdata;
     reg        op_done;
@@ -339,7 +341,9 @@ module eos_hd #(
                     op_done<=1'b1; ops_st<=OPS_IDLE;
                 end
                 OPS_ARB_BACKOFF: begin
-                    // Arbitration was lost to the Xbox/SMC master. Do not emit
+                    // Retained defensive path (arbitration is not expected on
+                    // the private ADV bus, where EOS is sole master). If it
+                    // ever did lose arbitration to another master, do not emit
                     // STOP -- the winning master owns the transaction. Yield,
                     // then restart the whole ADV register operation.
                     if (ops_arb_backoff_ctr < DLY_RETRY) begin
@@ -1086,9 +1090,10 @@ module eos_hd #(
     // Countdown timers are deliberately independent. The previous free-running
     // counters started at zero together, so PLL polling always won the priority
     // chain and the VIC poll was starved forever.
-    // X-HD can poll continuously because its ADV bus is dedicated. EOS is
-    // sharing the Xbox SMBus, so polling must be sparse enough to leave the
-    // SMC and temperature devices unimpeded.
+    // EOS's ADV bus is now dedicated/private, exactly like X-HD's, so
+    // continuous polling would be harmless. These reloads are kept only as a
+    // sensible cadence (they no longer exist to spare a shared Xbox SMBus --
+    // there is no SMC/temperature traffic to leave unimpeded on this bus).
     localparam [24:0] PLL_POLL_RELOAD        = 25'd16_199_999; // ~250 ms
     localparam [24:0] STANDALONE_POLL_RELOAD = 25'd6_479_999;  // ~100 ms
     reg [24:0] pll_poll_ctr;
@@ -1249,7 +1254,7 @@ module eos_hd #(
 
             // ---- source-call transport behavior ----
             // X-HD's ADV helpers are synchronous HAL calls. EOS snapshots
-            // each call and retries shared-bus delivery failures before
+            // each call and retries transient delivery failures before
             // returning op_done to this source-order FSM.
 
             // X-HD's C helpers ignore HAL return values, but EOS must not
@@ -2618,8 +2623,9 @@ module eos_hd #(
                 end
 
                 // Terminal: gave up after exhausting retries somewhere
-                // (encoder probe, collision guard, ADV presence, or init
-                // itself). hd_addr_en stays/goes low, PLL status clears,
+                // (ADV presence or init itself; the old encoder probe and
+                // collision guard no longer exist as failure sources).
+                // hd_addr_en stays/goes low, PLL status clears,
                 // stays inert for the rest of this power cycle. EOS itself
                 // is completely unaffected -- this module going inert
                 // doesn't touch or block anything else in the design.

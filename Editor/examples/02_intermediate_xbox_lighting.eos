@@ -1,0 +1,64 @@
+# =====================================================================
+#  EOS Script — INTERMEDIATE example: Xbox-controlled RGB lighting
+# =====================================================================
+#
+#  What you'll learn here:
+#    - addressable WS2812 strips (COUNT, GRB frames)
+#    - the MAILBOX: how Xbox software hands data to your script
+#    - REG (registers), the volatile RAM map, and DEF constants
+#    - "Pattern A" level polling, and when it can tear
+#
+#  The idea: a game continuously writes an R/G/B colour into a mailbox
+#  register; this script pushes that colour to the strip every frame.
+# ---------------------------------------------------------------------
+
+TARGET NOHD
+
+# ---- Declare the strip AND a mailbox register --------------------------
+#
+# One WS2812 pin-def on EXP4. WS2812 REQUIRES a COUNT (how many LEDs).
+# Here COUNT 1 keeps the example tiny; bump it and widen the frame to
+# light a real strip.
+USES EXP4 AS WS2812 COUNT 1
+  REG color WIDTH 3            # a 3-byte slot (G, R, B) the Xbox writes
+#
+# WHERE does 'color' live?  Each pin-def gets a small bank in the 256-byte
+# volatile RAM, laid out deterministically:
+#
+#     offset 0x00 : CMD       (a command code — unused in Pattern A)
+#     offset 0x01 : DOORBELL  (handshake state — unused in Pattern A)
+#     offset 0x02 : color[0]  (G)   <-- first REG always starts at +2
+#     offset 0x03 : color[1]  (R)
+#     offset 0x04 : color[2]  (B)
+#
+# So 'color' is at volatile offset 0x02. We give that a name with DEF so
+# the program reads clearly:
+DEF COLOR 0x02
+
+# ---- The program -------------------------------------------------------
+LOOP
+  # WS ... VOL <offset> <length> pushes a live frame straight from
+  # volatile RAM. length MUST equal COUNT x 3  (here 1 x 3 = 3).
+  WS EXP4 VOL COLOR 3
+  DELAY 25                    # ~40 fps; smooth to the eye
+ENDLOOP
+END
+
+# ---------------------------------------------------------------------
+#  A NOTE ON TEARING (important):
+#
+#  The Xbox writes 'color' as three separate SMBus bytes. If it happens
+#  to update mid-frame, this loop can read new-G with old-R/old-B for a
+#  single frame. For a smoothly-changing glow that one-frame glitch is
+#  invisible, so Pattern A (just poll it) is fine here.
+#
+#  If a colour MUST land exactly (a discrete "flash red now" command),
+#  use the DOORBELL handshake instead — see the advanced example.
+# ---------------------------------------------------------------------
+#
+#  WHAT YOUR XBOX APP DOES (the contract):
+#    - talk to the device over SMBus at 0x6E
+#    - write G,R,B into the 'color' register (volatile 0x02..0x04)
+#    That's it — this script does the rest. The editor's "Export
+#    command-map" writes this contract out for you.
+# =====================================================================

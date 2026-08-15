@@ -1,17 +1,27 @@
 // eos_i2c_master.v -- generic I2C/SMBus MASTER byte engine.
-// Built for eos_hd.v to talk outbound to the ADV7511 (0x72) and to probe
-// 0x69 for the HD collision guard -- there was no existing master primitive
-// anywhere in the gateware (eos_i2c.v is slave-only), so this is genuinely
-// new, unlike the transport-layer reuse on the slave side.
+// Built for eos_hd.v to talk outbound to the ADV7511 (0x72) on its own
+// dedicated two-wire bus. There was no existing master primitive anywhere in
+// the gateware (eos_i2c.v is slave-only), so this is genuinely new, unlike
+// the transport-layer reuse on the slave side.
 //
-// SHARED-BUS ARBITRATION / YIELDING:
-// The ADV7511 shares the Xbox's own SMBus (see eos_hd_integration_spec.md
-// §3), which the Xbox BIOS is also actively mastering. True I2C multi-master
-// This engine now requires a continuous bus-free window before START and
-// checks SDA during transmitted '1' bits. If another master drives SDA low,
-// EOS immediately releases both lines, reports arbitration loss, and the
-// caller retries the complete register operation after backoff. No STOP is
-// emitted after arbitration loss because the Xbox master owns the bus.
+// BUS TOPOLOGY (current EOS design): the ADV7511 lives on a PRIVATE bus
+// (EXP1/EXP2 -- adv_sda/adv_scl at the top level), where EOS is the SOLE
+// master. This is NOT the Xbox SMBus, and this engine no longer probes 0x69
+// or touches the console bus at all -- the old HD collision guard is gone
+// (see eos_hd.v's BR_RESET and eos_hd_integration_spec.md). Nothing else
+// arbitrates on the ADV bus, so the yielding behavior below is never actually
+// exercised in normal operation.
+//
+// SHARED-BUS ARBITRATION / YIELDING (retained defensive capability):
+// The multi-master logic is deliberately kept even though the ADV bus is
+// private, so the engine stays correct if it is ever placed on a contended
+// bus. Gated by WAIT_BUS_FREE / SINGLE_MASTER: it requires a continuous
+// bus-free window before START and checks SDA during transmitted '1' bits. If
+// another master drives SDA low, EOS releases both lines, reports arbitration
+// loss, and the caller retries the whole register operation after backoff. No
+// STOP is emitted after an arbitration loss (a competing master would own the
+// bus). On the private ADV bus these paths simply never trigger -- the bus is
+// always free and never contended -- but they cost nothing to keep.
 //
 // CLOCK STRETCHING (as master, respecting a slave that stretches): every bit
 // clock releases SCL (scl_oe<=0) and then WAITS for scl_in to actually read
@@ -183,10 +193,12 @@ module eos_i2c_master #(
 
                 // ---- bus-idle check + fresh START ----
                 // Previously had NO timeout at all -- a genuine hard stop if
-                // the bus never read idle (e.g. probed too early, before the
-                // Xbox's own boot/POST-time SMBus activity has settled, or
-                // before EOS's own loader has finished whatever it's doing
-                // on the bus). Now bounded by IDLE_WAIT_TIMEOUT, reported via
+                // the bus never read idle. On the private ADV bus this is not
+                // expected (EOS is the sole master), but the bound is retained
+                // as a safety net; it also mattered historically, back when
+                // this master shared the Xbox SMBus and could be started
+                // before the console's boot/POST-time SMBus activity settled.
+                // Now bounded by IDLE_WAIT_TIMEOUT, reported via
                 // start_timeout so the caller's existing retry/timeout
                 // handling picks this up the same way it already handles
                 // every other kind of failure -- not a new failure mode to
@@ -196,11 +208,13 @@ module eos_i2c_master #(
                     //
                     // IMPORTANT: stretch_ctr is a TOTAL elapsed-time counter
                     // for this state. The previous implementation reset it
-                    // whenever the bus was briefly idle. On a periodically
-                    // active Xbox SMBus, the bus could be idle too briefly to
-                    // satisfy the old 1ms quiet-window requirement, while each
-                    // short idle gap also reset the timeout. Neither counter
-                    // could ever finish, so the master livelocked here.
+                    // whenever the bus was briefly idle. That livelocked back
+                    // when this master shared a periodically active Xbox
+                    // SMBus: the bus could be idle too briefly to satisfy the
+                    // old 1ms quiet-window requirement, while each short idle
+                    // gap also reset the timeout, so neither counter could
+                    // ever finish. The private ADV bus never sees that
+                    // contention, but the total-elapsed counter is kept.
                     if (stretch_ctr >= IDLE_WAIT_TIMEOUT-1) begin
                         sda_oe<=1'b0; scl_oe<=1'b0; bus_owned<=1'b0;
                         idle_high_ctr<=32'd0;
