@@ -156,7 +156,8 @@ module eos_sdram_backend #(
     output wire [22:0] dbg_filled_lo,
     output wire [3:0]  dbg_bank,        // live bank_l (served/selected bank)
     output wire        dbg_reload,      // reload (flash->SDRAM) in progress
-    output wire        dbg_newrgn_ready // ext-region resident in SDRAM
+    output wire        dbg_newrgn_ready, // ext-region resident in SDRAM
+    output reg         script_ready     // .eos bank-9 image is fully resident in scratch
 );
 
     // Width-clean derived constants (no behavioural change; these exist purely so
@@ -619,6 +620,7 @@ module eos_sdram_backend #(
             newrgn_done    <= 1'b0;
             script_done    <= 1'b0;
             scr_filling    <= 1'b0;
+            script_ready   <= 1'b0;
             newrgn_ready   <= 1'b0;
             sdcard_ready   <= 1'b0;
             nr_filling     <= 1'b0;
@@ -705,6 +707,7 @@ module eos_sdram_backend #(
                     // window (base == SCRATCH_BASE) so the engine revalidates it.
                     rl_sd_base  <= SCRATCH_BASE;
                     scr_filling <= 1'b1;
+                    script_ready<= 1'b0;
                 end else begin
                     // reload_base >= FLASH_OFF is checked by the guard above, and
                     // the difference is < SCRATCH_BASE, so bit 23 is always 0.
@@ -889,6 +892,7 @@ module eos_sdram_backend #(
                             rl_len       <= EOS_SCRIPT_LEN;
                             rl_idx       <= 24'd0;
                             scr_filling  <= 1'b1;
+                            script_ready <= 1'b0;
                             burst_active <= 1'b0;
                             st           <= S_RL_REQ;
                         end else if (reload_pending && flash_free) begin
@@ -940,6 +944,7 @@ module eos_sdram_backend #(
                             reload_pending <= 1'b0;   // also clear if this came via a sync
                         end else if (scr_filling) begin
                             scr_filling    <= 1'b0;   // §6 .eos script now resident in scratch
+                            script_ready   <= 1'b1;   // complete frame is now safe to validate
                             reload_pending <= 1'b0;   // clear if this came via a host re-sync
                         end else begin
                             reload_pending <= 1'b0;

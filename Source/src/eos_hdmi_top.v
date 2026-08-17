@@ -261,6 +261,7 @@ module eos_hdmi_top (
     wire        sd_dr;
     wire        sd_busy;
     wire        preload_done;
+    wire        dbg_script_ready;
     wire        slot1_ready;      // XbDiag slot-1 window resident (clk_sd)
     wire [22:0] dbg_filled_lo;
     wire [3:0]  dbg_bank;          // live served/selected bank (lclk)
@@ -380,6 +381,7 @@ module eos_hdmi_top (
         .dbg_bank      (dbg_bank),
         .dbg_reload    (dbg_reload),
         .dbg_newrgn_ready (dbg_newrgn_ready),
+        .script_ready  (dbg_script_ready),
         .scr_wr        (stg_scr_wr),      // STAGE writes from flash_cmd
         .scr_waddr     (stg_scr_waddr),
         .scr_wdata     (stg_scr_wdata),
@@ -1236,7 +1238,11 @@ module eos_hdmi_top (
     localparam [20:0] EXP_FRAME_BASE = 21'h00_0000;    // scratch base == flash 0x800000 mirror
     localparam [20:0] EXP_TEXT_BASE  = EXP_FRAME_BASE + 21'd16;
     wire clk = clk_sd;  wire resetn = sd_rstn;
-    wire exp_sys_target = hd_transport_en;             // HD build -> EXP1-3 reserved
+    // Keep the original, proven target source.  The completed 128K script preload
+    // now delays validation long enough that we no longer validate against empty
+    // scratch at boot, without introducing a second HD-presence state machine.
+    wire exp_sys_target = hd_transport_en;             // HD transport active -> EXP1-3 reserved
+    wire exp_boot_ready = dbg_script_ready;
     // boot gate: first served BIOS byte (mem_req @clk_lpc) -> sticky -> 2FF -> clk_sd
     reg  exp_served_lclk = 1'b0;
     always @(posedge clk_lpc or negedge lpc_lreset_n)
@@ -1251,7 +1257,7 @@ module eos_hdmi_top (
     // revalidate once both clear (MAGIC re-checked -> run, blank -> idle). This is
     // conservative: it also stops during unrelated bank flashes, which is safe --
     // the engine simply re-reads its resident .eos and restarts from instr 0.
-    wire exp_reload_req     = eng_busy | dbg_reload;
+    wire exp_reload_req     = eng_busy | bank_commit_busy | dbg_reload;
     wire exp_reload_disable = 1'b0;    // SAFE hold; an erased/blank region -> Hi-Z via revalidation (§5.5)
     wire exp_erase_permit;             // -> gate your .eos erase/program until this is high
     wire exp_scr_rd; wire [20:0] exp_scr_raddr;
@@ -1433,7 +1439,7 @@ module eos_hdmi_top (
 
     // ---- loader (lifecycle orchestrator) --------------------------------
     eos_exp_loader u_ldr(.clk(clk),.resetn(resetn),
-        .first_bios_byte(exp_first_bios),.reload_req(exp_reload_req),.reload_disable(exp_reload_disable),
+        .first_bios_byte(exp_first_bios & exp_boot_ready),.reload_req(exp_reload_req),.reload_disable(exp_reload_disable),
         .fc_done(fc_done_ldr),.fc_valid(fc_valid_ldr),.lay_done(lay_done),.lay_ok(lay_ok),
         .exec_running(exec_running),.exec_fault(exec_fault),
         .fc_start(ldr_fc_start),.lay_start(ldr_lay_start),.exec_start(exec_start),.exec_halt(exec_halt),

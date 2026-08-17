@@ -695,6 +695,8 @@ class MainWindow(QMainWindow):
             mi.addAction(a)
         mt = mb.addMenu("&Tools")
         self._act(mt, "LED Studio\u2026", self.open_led_studio)
+        self._act(mt, "GPIO / PWM Studio\u2026", self.open_gpio_studio)
+        self._act(mt, "I\u00b2C Studio\u2026", self.open_i2c_studio)
         mv = mb.addMenu("&View")
         for d in self._docks.values(): mv.addAction(d.toggleViewAction())
         mv.addSeparator()
@@ -726,6 +728,16 @@ class MainWindow(QMainWindow):
         tab = self.current_tab()
         target = tab.model.target if (tab and tab.model and tab.model.target) else "NOHD"
         LedStudioDialog(self, target=target).exec()
+    def open_gpio_studio(self):
+        from eos_gpio_studio import GpioPwmStudioDialog
+        tab = self.current_tab()
+        target = tab.model.target if (tab and tab.model and tab.model.target) else "NOHD"
+        GpioPwmStudioDialog(self, target=target).exec()
+    def open_i2c_studio(self):
+        from eos_i2c_studio import I2cStudioDialog
+        tab = self.current_tab()
+        target = tab.model.target if (tab and tab.model and tab.model.target) else "NOHD"
+        I2cStudioDialog(self, target=target).exec()
     def _about(self):
         QMessageBox.information(self, "About",
             f"{APP_NAME}\nWrites .eos scripts and validates them against the frozen "

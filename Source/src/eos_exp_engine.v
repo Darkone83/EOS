@@ -791,8 +791,10 @@ endmodule
 //
 //  Validates a script staged in SDRAM scratch by DRIVING the top's single
 //  shared eos_crc32 (CRC over scratch[0 .. text_len-1]) and comparing to the
-//  host-computed CRC, plus the running-mode TARGET match and the TEXT_LEN
-//  bound. Header fields (text_len / expected_crc / frame_target) come from the
+//  host-computed CRC, plus the TEXT_LEN bound. TARGET is authoring metadata:
+//  the Editor/linter uses it to expose the legal expansion-pin set, but the
+//  FPGA does not compare it against transient live HD state before execution.
+//  Header fields (text_len / expected_crc / frame_target) come from the
 //  loader's header parse, where MAGIC/FMT_VER are checked. Never instantiates a
 //  second CRC; runs in clk_sd.
 // ---------------------------------------------------------------------------
@@ -814,13 +816,15 @@ module eos_exp_framechk (
 
     output reg          done,
     output reg          valid,
-    output reg  [2:0]   reason          // 0 OK / 1 TARGET / 2 LEN / 3 CRC
+    output reg  [2:0]   reason          // 0 OK / 2 LEN / 3 CRC; TARGET is authoring-only
 );
     localparam R_OK=3'd0, R_TARGET=3'd1, R_LEN=3'd2, R_CRC=3'd3;
     localparam S_IDLE=2'd0, S_GO=2'd1, S_WAIT=2'd2, S_DONE=2'd3;
     reg [1:0] state;
 
-    wire target_ok = (frame_target == sys_target);
+    // frame_target/sys_target remain on the interface for compatibility.
+    // Runtime execution is target-agnostic; TARGET remains a script/editor
+    // pin-budget profile and is still checked by the layout pass.
     wire len_ok    = (text_len != 21'd0) && (text_len <= `EOS_MAX_TEXT_LEN);
 
     always @(posedge clk or negedge resetn) begin
@@ -832,8 +836,7 @@ module eos_exp_framechk (
             case (state)
             S_IDLE: if (start) begin
                         valid<=1'b0; reason<=R_OK;
-                        if (!target_ok)   begin reason<=R_TARGET; state<=S_DONE; end
-                        else if (!len_ok) begin reason<=R_LEN;    state<=S_DONE; end
+                        if (!len_ok) begin reason<=R_LEN; state<=S_DONE; end
                         else begin crc_len<=text_len; crc_go<=1'b1; state<=S_GO; end
                     end
             S_GO:   state<=S_WAIT;                 // crc_go pulsed; crc asserts busy

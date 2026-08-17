@@ -130,10 +130,12 @@ module eos_hd #(
                                             // real diagnostic resolution --
                                             // the flags above can't tell
                                             // "stuck early" from "stuck late"
-    output wire [2:0]        hd_disable_reason_out  // WHY BR_HD_DISABLED was
+    output wire [2:0]        hd_disable_reason_out, // WHY BR_HD_DISABLED was
                                             // reached -- ST alone can't tell
                                             // apart the 4 different exhausted-
                                             // retry paths that land there
+    output wire              hd_target_known, // ADV presence probe has completed
+    output wire              hd_target_hd     // stable expansion target: 1=HD, 0=NOHD
 );
 
     // =========================================================================
@@ -1166,6 +1168,16 @@ module eos_hd #(
                                  : bios_took_over;
     assign hd_guard_blocked_out  = xhd_hpd && xhd_monitor_sense;
 
+    // Expansion TARGET must be based on stable physical ADV presence, not
+    // hd_addr_en. hd_addr_en intentionally stays low until the full ADV init
+    // completes and is therefore a transient runtime signal that can reject a
+    // valid TARGET HD script during boot. These latches become valid as soon
+    // as the presence probe resolves and remain stable for the rest of boot.
+    reg adv_presence_known_r;
+    reg adv_present_r;
+    assign hd_target_known = adv_presence_known_r;
+    assign hd_target_hd    = adv_present_r;
+
     // ADV INT crosses into clk_sd asynchronously. X-HD uses both-edge EXTI,
     // so detect either synchronized transition. The arming pipeline prevents
     // reset release from manufacturing a fake edge solely because the idle
@@ -1195,6 +1207,7 @@ module eos_hd #(
     always @(posedge clk or negedge resetn) begin
         if (!resetn) begin
             br_st<=BR_RESET; hd_addr_en<=1'b0; op_go<=1'b0; op_kind<=OP_NONE;
+            adv_presence_known_r<=1'b0; adv_present_r<=1'b0;
             op_target_addr<=7'd0; adv_waddr<=8'd0; adv_wdata<=8'd0;
             delay_ctr<=24'd0;
             boot_encoder_id<=ENC_CONEXANT;
@@ -1363,6 +1376,7 @@ module eos_hd #(
                 end
                 BR_ADV_PROBE_WT: if (op_done) begin
                     if (!op_nack) begin
+                        adv_presence_known_r<=1'b1; adv_present_r<=1'b1;
                         hd_addr_en<=1'b0;   // NOT yet -- ADV is present, but not
                                               // initialized. Raised for real once
                                               // init_adv() actually completes, at
@@ -1376,6 +1390,7 @@ module eos_hd #(
                         adv_probe_retry_cnt<=adv_probe_retry_cnt+2'd1;
                         delay_ctr<=24'd0; br_st<=BR_ADV_PROBE_RETRY_DLY;
                     end else begin
+                        adv_presence_known_r<=1'b1; adv_present_r<=1'b0;
                         br_st<=BR_ADV_ABSENT;
                     end
                 end
