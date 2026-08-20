@@ -617,12 +617,15 @@ Eos firmware © Team Resurgent / Darkone83.
 The **`0xEF` banking convention** is Xenium-style and long-established in the OG Xbox scene;
 Eos's bank system is a clean-room implementation of it and is **not** derived from OpenXenium.
 
+Thanks to **Ander-Zero** for the X-RTC project
+
+- **X-RTC** - by **Adner-Zero** - <https://github.com/Andr-Zero/X-RTC>
+
 The **1.6 LFRAME# transaction-abort + LPC-rebuild approach** follows two community references,
 credited with thanks:
 
 - **ModXo** — by **Team Resurgent** — <https://github.com/Team-Resurgent/Modxo>
 - **OpenXenium** — by **Ryzee119** — <https://github.com/Ryzee119/OpenXenium>
-- **X-RTC** - by **Adner-Zero** - <https://github.com/Andr-Zero/X-RTC>
 
 Builders Note
 
