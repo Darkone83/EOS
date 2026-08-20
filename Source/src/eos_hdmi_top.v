@@ -298,6 +298,17 @@ module eos_hdmi_top (
     wire [7:0]  sdp_br_rdata;
     wire        sdp_br_busy, sdp_br_done, sdp_br_err;
     wire [3:0]  sdp_br_err_code;
+    // ---- SD single-sector write (FatFs/WebUI support) ----
+    wire [31:0] fc_sd_bw_lba;
+    wire        fc_sd_bw_go;
+    wire        fc_sd_bw_we;
+    wire [8:0]  fc_sd_bw_waddr;
+    wire [7:0]  fc_sd_bw_wdata;
+    wire        sdp_bw_busy, sdp_bw_done, sdp_bw_err;
+    wire [3:0]  sdp_bw_err_code;
+    wire        sdp_sd_write_start;
+    wire [8:0]  sds_waddr;
+    wire [7:0]  sdp_sd_wdata;
 
     // Flash SPI bus, muxed between the backend reader (preload, default owner)
     // and the flash engine (bank erase/program). One driver at a time, selected
@@ -406,13 +417,16 @@ module eos_hdmi_top (
     // connects directly with no CDC (same pattern as scr_wr from flash_cmd).
     // -------------------------------------------------------------------------
     eos_sd_spi u_sdspi (
-        .clk        (clk_sd), .rstn (sd_rstn),
-        .start      (sdp_sd_start), .lba (sdp_sd_lba), .stall (sdp_sd_stall),
-        .busy       (sds_busy), .done (sds_done),
-        .dvalid     (sds_dvalid), .dout (sds_dout),
-        .card_ready (sds_card_ready), .card_err (sds_card_err), .err_code (sds_err_code),
-        .card_sck   (card_sck), .card_mosi (card_mosi),
-        .card_miso  (card_miso), .card_cs_n (card_cs_n)
+        .clk         (clk_sd), .rstn (sd_rstn),
+        .start       (sdp_sd_start),
+        .write_start (sdp_sd_write_start),
+        .lba         (sdp_sd_lba), .stall (sdp_sd_stall),
+        .busy        (sds_busy), .done (sds_done),
+        .dvalid      (sds_dvalid), .dout (sds_dout),
+        .waddr       (sds_waddr), .wdata (sdp_sd_wdata),
+        .card_ready  (sds_card_ready), .card_err (sds_card_err), .err_code (sds_err_code),
+        .card_sck    (card_sck), .card_mosi (card_mosi),
+        .card_miso   (card_miso), .card_cs_n (card_cs_n)
     );
 
     eos_sd_precache u_sdprecache (
@@ -450,7 +464,21 @@ module eos_hdmi_top (
         .browse_err       (sdp_br_err),
         .browse_err_code  (sdp_br_err_code),
         .browse_raddr     (fc_sd_br_raddr),
-        .browse_rdata     (sdp_br_rdata)
+        .browse_rdata     (sdp_br_rdata),
+
+        .write_buf_we     (fc_sd_bw_we),
+        .write_buf_addr   (fc_sd_bw_waddr),
+        .write_buf_data   (fc_sd_bw_wdata),
+        .write_go         (fc_sd_bw_go),
+        .write_lba        (fc_sd_bw_lba),
+        .write_busy       (sdp_bw_busy),
+        .write_done       (sdp_bw_done),
+        .write_err        (sdp_bw_err),
+        .write_err_code   (sdp_bw_err_code),
+
+        .sd_write_start   (sdp_sd_write_start),
+        .sd_waddr         (sds_waddr),
+        .sd_wdata         (sdp_sd_wdata)
     );
 
     // -------------------------------------------------------------------------
@@ -562,7 +590,17 @@ module eos_hdmi_top (
         .sd_br_busy     (sdp_br_busy),
         .sd_br_done     (sdp_br_done),
         .sd_br_err      (sdp_br_err),
-        .sd_br_err_code (sdp_br_err_code)
+        .sd_br_err_code (sdp_br_err_code),
+
+        .sd_bw_lba      (fc_sd_bw_lba),
+        .sd_bw_stb      (fc_sd_bw_go),
+        .sd_bw_we       (fc_sd_bw_we),
+        .sd_bw_waddr    (fc_sd_bw_waddr),
+        .sd_bw_wdata    (fc_sd_bw_wdata),
+        .sd_bw_busy     (sdp_bw_busy),
+        .sd_bw_done     (sdp_bw_done),
+        .sd_bw_err      (sdp_bw_err),
+        .sd_bw_err_code (sdp_bw_err_code)
     );
 
     // --- engine (clk_sd): floor-guarded erase/program/poll ---
