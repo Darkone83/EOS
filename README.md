@@ -622,7 +622,7 @@ credited with thanks:
 
 - **ModXo** — by **Team Resurgent** — <https://github.com/Team-Resurgent/Modxo>
 - **OpenXenium** — by **Ryzee119** — <https://github.com/Ryzee119/OpenXenium>
-- **X-RTC** - By **Adner-Zero** - <https://github.com/Andr-Zero/X-RTC>
+- **X-RTC** - by **Adner-Zero** - <https://github.com/Andr-Zero/X-RTC>
 
 Builders Note
 
