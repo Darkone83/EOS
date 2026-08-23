@@ -21,6 +21,8 @@
 #define EOS_BANK_SIZE_1MB  2
 
 void          Bank_ResetToFactory(void);  // reset live table to factory defaults
+void          Bank_ResetUserBanks(void);   // clear only user BIOS banks 1-4
+void          Bank_ResetUserNames(void);   // reset only user-bank labels; preserve occupancy/layout
 int           Bank_Count(void);
 const char* Bank_Name(int idx);
 unsigned char Bank_Ef(int idx);            // 0xEF value for this bank (low nibble = bank)

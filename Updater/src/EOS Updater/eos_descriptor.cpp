@@ -412,10 +412,11 @@ int Desc_SetColor(int bankIdx, unsigned int rgb)
         int s;
         if (ef < 0x3 || ef > 0x6) continue;      // user banks only
         s = (int)(ef - 0x3);
-        if (Bank_Occupied(i) && lay.slot[s].state == EOS_SLOT_FREE) {
+        if (lay.slot[s].state == EOS_SLOT_NATIVE ||
+            (Bank_Occupied(i) && lay.slot[s].state == EOS_SLOT_FREE)) {
             lay.slot[s].state = EOS_SLOT_NATIVE;
             lay.slot[s].sizeCode = EOS_SZC_256K;
-            lay.slot[s].physBase = 0;
+            lay.slot[s].physBase = (unsigned int)(s * 0x040000);
         }
     }
 

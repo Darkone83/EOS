@@ -13,6 +13,7 @@
   <ItemGroup>
     <ClCompile Include="dd_mount.cpp" />
     <ClCompile Include="dd_net.cpp" />
+    <ClCompile Include="eos_backup.cpp" />
     <ClCompile Include="eos_bank.cpp" />
     <ClCompile Include="eos_config.cpp" />
     <ClCompile Include="eos_crc.cpp" />
@@ -27,9 +28,11 @@
     <ClCompile Include="eos_led.cpp" />
     <ClCompile Include="eos_net.cpp" />
     <ClCompile Include="eos_osk.cpp" />
+    <ClCompile Include="eos_script.cpp" />
     <ClCompile Include="eos_smbus.cpp" />
     <ClCompile Include="eos_splash.cpp" />
     <ClCompile Include="eos_stage.cpp" />
+    <ClCompile Include="eos_status.cpp" />
     <ClCompile Include="eos_theme.cpp" />
     <ClCompile Include="eos_ui.cpp" />
     <ClCompile Include="eos_update.cpp" />
@@ -42,6 +45,7 @@
   <ItemGroup>
     <ClInclude Include="dd_mount.h" />
     <ClInclude Include="dd_net.h" />
+    <ClInclude Include="eos_backup.h" />
     <ClInclude Include="eos_bank.h" />
     <ClInclude Include="eos_config.h" />
     <ClInclude Include="eos_crc.h" />
@@ -55,9 +59,11 @@
     <ClInclude Include="eos_logo_data.h" />
     <ClInclude Include="eos_net.h" />
     <ClInclude Include="eos_osk.h" />
+    <ClInclude Include="eos_script.h" />
     <ClInclude Include="eos_smbus.h" />
     <ClInclude Include="eos_splash.h" />
     <ClInclude Include="eos_stage.h" />
+    <ClInclude Include="eos_status.h" />
     <ClInclude Include="eos_theme.h" />
     <ClInclude Include="eos_ui.h" />
     <ClInclude Include="eos_update.h" />

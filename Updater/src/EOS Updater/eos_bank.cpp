@@ -64,6 +64,29 @@ void Bank_ResetToFactory(void)
     ensureInit();
 }
 
+void Bank_ResetUserBanks(void)
+{
+    int i;
+    ensureInit();
+    for (i = 0; i < s_count; ++i) {
+        if (s_banks[i].ef >= 0x3 && s_banks[i].ef <= 0x6) {
+            s_banks[i].occupied = 0;
+            s_banks[i].size_code = EOS_BANK_SIZE_256K;
+            copyName(s_banks[i].name, s_banks[i].defname);
+        }
+    }
+}
+
+void Bank_ResetUserNames(void)
+{
+    int i;
+    ensureInit();
+    for (i = 0; i < s_count; ++i) {
+        if (s_banks[i].ef >= 0x3 && s_banks[i].ef <= 0x6)
+            copyName(s_banks[i].name, s_banks[i].defname);
+    }
+}
+
 int Bank_Count(void) { ensureInit(); return s_count; }
 
 const char* Bank_Name(int idx)

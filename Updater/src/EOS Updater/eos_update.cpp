@@ -243,40 +243,145 @@ static int ext_slot_for_index(int idx)
     return -1;
 }
 
-/* Commit a large (512K/1MB) BANK image into the ext region with descriptor
-   auto-placement -- the same model the loader uses. The user's selected bank is
-   only a hint; the image lands in the first free, correctly-aligned slot run.
-   Returns EOS_FLASH_OK, or EOS_FLASH_VERIFY (no room) / EOS_FLASH_REFUSED
-   (descriptor write failed) / EOS_FLASH_TIMEOUT (ext-region flash failed). */
-int Update_ExtBankFlash(const unsigned char* image, int len)
+/* Build a descriptor view that includes any occupied legacy/native 256K banks.
+   A blank/older descriptor can legitimately coexist with occupied user banks;
+   treating those slots as FREE would let a large-bank auto-placement overwrite
+   a real BIOS. This mirrors the Loader reconciliation, with the correct native
+   physical base for each slot. */
+static void reconciled_layout(EosLayout* lay)
+{
+    int i;
+    if (!Desc_Load(lay) || !lay->valid) Desc_InitEmpty(lay);
+    for (i = 0; i < Bank_Count(); ++i) {
+        unsigned char ef = Bank_Ef(i);
+        int slot;
+        if (ef < 0x3 || ef > 0x6) continue;
+        slot = (int)(ef - 0x3);
+        if (lay->slot[slot].state == EOS_SLOT_NATIVE ||
+            (Bank_Occupied(i) && lay->slot[slot].state == EOS_SLOT_FREE)) {
+            lay->slot[slot].state = EOS_SLOT_NATIVE;
+            lay->slot[slot].sizeCode = EOS_SZC_256K;
+            lay->slot[slot].physBase = (unsigned int)(slot * 0x040000);
+        }
+    }
+}
+
+/* Native 256K BIOS writes use bank E as a descriptor-independent physical
+   window. The flash control plane's dynamic slot numbering is not the same as
+   the serve path's EF 0x3..0x6 numbering, so direct EF writes become ambiguous
+   once a descriptor is valid. */
+#define NATIVE_PHYS_BANK  0x0E
+#define NATIVE_SLOT_PAGES 1024
+
+static int verify_native_direct(int slot, const unsigned char* image, int len)
+{
+    unsigned char rb[256];
+    int startPage, pages, pg, off, i;
+    if (slot < 0 || slot >= 4 || !image || len <= 0 || len > 256 * 1024) return 0;
+    startPage = slot * NATIVE_SLOT_PAGES;
+    pages = (len + 255) / 256;
+    for (pg = 0; pg < pages; ++pg) {
+        off = pg * 256;
+        if (Flash_ReadPage(NATIVE_PHYS_BANK, startPage + pg, rb) != EOS_FLASH_OK) return 0;
+        for (i = 0; i < 256; ++i) {
+            unsigned char want = (off + i < len) ? image[off + i] : 0xFF;
+            if (rb[i] != want) return 0;
+        }
+    }
+    return 1;
+}
+
+static int write_native_direct(int slot, const unsigned char* image, int len)
+{
+    int startPage, rc;
+    if (slot < 0 || slot >= 4) return EOS_FLASH_REFUSED;
+    startPage = slot * NATIVE_SLOT_PAGES;
+    rc = Flash_WriteImageAtNoSync(NATIVE_PHYS_BANK, startPage, image, len);
+    if (rc != EOS_FLASH_OK) return rc;
+    if (!verify_native_direct(slot, image, len)) return EOS_FLASH_VERIFY;
+    return Flash_Sync(NATIVE_PHYS_BANK);
+}
+
+int Update_PlanBankFlash(int targetIndex, int len, EosBankFlashPlan* out)
 {
     EosLayout lay;
-    int  szc = (len > 0x80000) ? EOS_SZC_1MB : EOS_SZC_512K;
-    int  need = Desc_SlotsFor(szc);
-    int  slot = -1, cand, anchorTbl, i;
-    unsigned int nrbase;
-    int  startPage, rc;
+    EosBankFlashPlan p;
+    int slot, i;
 
-    if (!Desc_Load(&lay) || !lay.valid) Desc_InitEmpty(&lay);
+    p.valid = 0; p.targetIndex = targetIndex; p.sizeCode = EOS_BANK_SIZE_256K;
+    p.anchorSlot = -1; p.slots = 1;
+    if (out) *out = p;
 
-    /* auto-place: 1MB needs all four slots free; 512K takes the first free even
-       pair (0-1 or 2-3), matching the two physical new-region halves. */
-    if (szc == EOS_SZC_1MB) {
-        int allFree = 1;
-        for (i = 0; i < EOS_DESC_SLOTS; ++i)
-            if (lay.slot[i].state != EOS_SLOT_FREE) { allFree = 0; break; }
-        if (allFree) slot = 0;
+    if (targetIndex < 0 || targetIndex >= Bank_Count() || len <= 0 || len > 1024 * 1024)
+        return EOS_BANKPLAN_BADTARGET;
+    slot = ext_slot_for_index(targetIndex);
+    if (slot < 0) return EOS_BANKPLAN_BADTARGET;
+
+    reconciled_layout(&lay);
+
+    if (len <= 256 * 1024) {
+        if (lay.slot[slot].state == EOS_SLOT_ANCHOR || lay.slot[slot].state == EOS_SLOT_SHADOW)
+            return EOS_BANKPLAN_USED_BY_LARGE;
+        p.sizeCode = EOS_BANK_SIZE_256K;
+        p.anchorSlot = slot; p.slots = 1; p.valid = 1;
+        if (out) *out = p;
+        return EOS_BANKPLAN_OK;
+    }
+
+    if (len <= 512 * 1024) {
+        p.sizeCode = EOS_BANK_SIZE_512K; p.slots = 2;
+        p.anchorSlot = -1;
+        for (i = 0; i <= 2; i += 2) {
+            if (lay.slot[i].state == EOS_SLOT_FREE && lay.slot[i + 1].state == EOS_SLOT_FREE) {
+                p.anchorSlot = i; break;
+            }
+        }
     }
     else {
-        for (cand = 0; cand <= 2; cand += 2)
-            if (lay.slot[cand].state == EOS_SLOT_FREE &&
-                lay.slot[cand + 1].state == EOS_SLOT_FREE) {
-                slot = cand; break;
-            }
+        p.sizeCode = EOS_BANK_SIZE_1MB; p.slots = 4; p.anchorSlot = 0;
+        for (i = 0; i < EOS_DESC_SLOTS; ++i)
+            if (lay.slot[i].state != EOS_SLOT_FREE) { p.anchorSlot = -1; break; }
     }
-    if (slot < 0) return EOS_FLASH_VERIFY;   /* no room -> mapped to a clear msg */
 
-    /* new-region offset: slots 0/1 -> +0, slots 2/3 -> +512K; 1MB -> +0 */
+    if (p.anchorSlot < 0) return EOS_BANKPLAN_NOROOM;
+    p.valid = 1;
+    if (out) *out = p;
+    return EOS_BANKPLAN_OK;
+}
+
+static int verify_ext_image(int startPage, const unsigned char* image, int len)
+{
+    unsigned char rb[256];
+    int pages = (len + 255) / 256, pg, i, off;
+    for (pg = 0; pg < pages; ++pg) {
+        off = pg * 256;
+        if (Flash_ReadPage(EOS_BANK_NEWREGION, startPage + pg, rb) != EOS_FLASH_OK) return 0;
+        for (i = 0; i < 256; ++i) {
+            unsigned char want = (off + i < len) ? image[off + i] : 0xFF;
+            if (rb[i] != want) return 0;
+        }
+    }
+    return 1;
+}
+
+/* Commit a large BANK image at the placement already shown to the user. */
+int Update_ExtBankFlashAt(const unsigned char* image, int len, int slot)
+{
+    EosLayout lay;
+    int szc, need, anchorTbl, i, startPage, rc;
+    unsigned int nrbase;
+
+    if (!image || len <= 256 * 1024 || len > 1024 * 1024) return EOS_FLASH_REFUSED;
+    szc = (len > 512 * 1024) ? EOS_SZC_1MB : EOS_SZC_512K;
+    need = Desc_SlotsFor(szc);
+    if (slot < 0 || slot + need > EOS_DESC_SLOTS) return EOS_FLASH_REFUSED;
+    if (szc == EOS_SZC_512K && (slot & 1)) return EOS_FLASH_REFUSED;
+    if (szc == EOS_SZC_1MB && slot != 0) return EOS_FLASH_REFUSED;
+
+    reconciled_layout(&lay);
+    for (i = 0; i < need; ++i)
+        if (lay.slot[slot + i].state != EOS_SLOT_FREE) return EOS_FLASH_REFUSED;
+
     nrbase = (szc == EOS_SZC_1MB) ? EOS_NEWRGN_BASE
         : (slot >= 2) ? (EOS_NEWRGN_BASE + EOS_NEWRGN_HALF)
         : EOS_NEWRGN_BASE;
@@ -284,11 +389,9 @@ int Update_ExtBankFlash(const unsigned char* image, int len)
 
     rc = Flash_WriteImageAtNoSync(EOS_BANK_NEWREGION, startPage, image, len);
     if (rc != EOS_FLASH_OK) return EOS_FLASH_TIMEOUT;
+    if (!verify_ext_image(startPage, image, len)) return EOS_FLASH_VERIFY;
+    if (Flash_SyncNewRegion() != EOS_FLASH_OK) return EOS_FLASH_TIMEOUT;
 
-    /* page it into SDRAM so the bank is launchable without a cold boot */
-    Flash_SyncNewRegion();
-
-    /* descriptor: anchor + shadows */
     lay.slot[slot].state = EOS_SLOT_ANCHOR;
     lay.slot[slot].sizeCode = (unsigned char)szc;
     lay.slot[slot].physBase = nrbase;
@@ -299,13 +402,35 @@ int Update_ExtBankFlash(const unsigned char* image, int len)
     }
     if (Desc_Save(&lay) != EOS_FLASH_OK) return EOS_FLASH_REFUSED;
 
-    /* mark the ACTUAL anchor bank occupied (the auto-chosen slot, not the
-       bank the user selected). anchor bank EF = 0x3 + slot. */
+    // Keep the bank table consistent: shadows are not independent BIOS entries.
+    for (i = 0; i < need; ++i) {
+        int tbl = Bank_IndexForEf((unsigned char)(0x3 + slot + i));
+        if (tbl >= 0) {
+            if (i == 0)
+                Bank_SetOccupied(tbl, 1, (szc == EOS_SZC_1MB) ? EOS_BANK_SIZE_1MB : EOS_BANK_SIZE_512K);
+            else
+                Bank_ClearEntry(tbl);
+        }
+    }
     anchorTbl = Bank_IndexForEf((unsigned char)(0x3 + slot));
-    if (anchorTbl >= 0)
-        Bank_SetOccupied(anchorTbl, 1, (szc == EOS_SZC_1MB) ? EOS_BANK_SIZE_1MB : EOS_BANK_SIZE_512K);
-
+    (void)anchorTbl;
     return EOS_FLASH_OK;
+}
+
+int Update_ExtBankFlash(const unsigned char* image, int len)
+{
+    EosBankFlashPlan plan;
+    int i, rc;
+    // Compatibility path: find the first manageable user bank merely to seed the
+    // target-independent large-bank planner.
+    for (i = 0; i < Bank_Count(); ++i) {
+        if (ext_slot_for_index(i) >= 0) {
+            rc = Update_PlanBankFlash(i, len, &plan);
+            if (rc != EOS_BANKPLAN_OK) return (rc == EOS_BANKPLAN_NOROOM) ? EOS_FLASH_VERIFY : EOS_FLASH_REFUSED;
+            return Update_ExtBankFlashAt(image, len, plan.anchorSlot);
+        }
+    }
+    return EOS_FLASH_REFUSED;
 }
 
 /* Job-pump wrapper: the committing state calls this with the staged image. */
@@ -359,7 +484,15 @@ int Update_Pump(UpdateJob* j)
             break;
         }
 
-        rc = Flash_WriteImageVerified(ef, j->image, j->len);
+        if (j->region == EOS_RGN_BANK) {
+            int di = Bank_IndexForEf((BYTE)ef);
+            int dslot = ext_slot_for_index(di);
+            if (dslot < 0) { j->state = UPD_FAILED; j->msg = "Bad native BIOS target."; break; }
+            rc = write_native_direct(dslot, j->image, j->len);
+        }
+        else {
+            rc = Flash_WriteImageVerified(ef, j->image, j->len);
+        }
         if (rc == EOS_FLASH_OK) {
             /* record a native 256K in the descriptor so a later large-bank
                auto-place will not overwrite this slot. */
@@ -368,18 +501,26 @@ int Update_Pump(UpdateJob* j)
             if (dslot >= 0) {
                 EosLayout lay;
                 if (!Desc_Load(&lay) || !lay.valid) Desc_InitEmpty(&lay);
+                reconciled_layout(&lay);
                 lay.slot[dslot].state = EOS_SLOT_NATIVE;
                 lay.slot[dslot].sizeCode = EOS_SZC_256K;
-                lay.slot[dslot].physBase = 0;
-                Desc_Save(&lay);
+                lay.slot[dslot].physBase = (unsigned int)(dslot * 0x040000);
+                if (Desc_Save(&lay) != EOS_FLASH_OK) {
+                    j->state = UPD_FAILED; j->msg = "BIOS written; descriptor save failed."; break;
+                }
             }
             j->state = UPD_DONE; j->msg = "Done. Flash updated.";
         }
         else if (rc == EOS_FLASH_VERIFY) {
-            int p = 0;
-            p = msg_append(s_msgbuf, p, "Verify failed at page ");
-            p = msg_append_int(s_msgbuf, p, Flash_LastFailPage());
-            j->state = UPD_FAILED; j->msg = s_msgbuf;
+            if (j->region == EOS_RGN_BANK) {
+                j->state = UPD_FAILED; j->msg = "Native BIOS physical verify failed.";
+            }
+            else {
+                int p = 0;
+                p = msg_append(s_msgbuf, p, "Verify failed at page ");
+                p = msg_append_int(s_msgbuf, p, Flash_LastFailPage());
+                j->state = UPD_FAILED; j->msg = s_msgbuf;
+            }
         }
         else if (rc == EOS_FLASH_REFUSED) { j->state = UPD_FAILED; j->msg = "Flash refused (bad target)."; }
         else { j->state = UPD_FAILED; j->msg = "Flash timeout (bus/FPGA)."; }

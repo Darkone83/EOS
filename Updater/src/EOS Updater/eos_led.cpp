@@ -19,6 +19,7 @@
 static int s_bank = 0;    // target visible bank (0..3)
 static int s_return = 0;    // AppPhase (int) to return to
 static int s_sel = 0;    // highlighted palette index (0..11)
+static DWORD s_errorUntil = 0;
 
 // charcoal text on all pills (uniform; no per-pill light/dark switching)
 #define LED_TEXT_CHARCOAL EOS_ARGB(0xFF,0x1A,0x1A,0x1A)
@@ -44,6 +45,7 @@ void LedPick_Open(int bankIdx, int returnPhase)
     s_return = returnPhase;
     // open ON the bank's current color
     s_sel = PaletteIndexOf(Desc_GetColor(bankIdx));
+    s_errorUntil = 0;
 }
 
 // local edge-detect (module doesn't use main.cpp's static Pressed())
@@ -67,8 +69,12 @@ int LedPick_Frame(unsigned short b, unsigned short prev)
     s_sel = row * LED_COLS + col;
 
     if (Edge(b, prev, BTN_A)) {
-        Desc_SetColor(s_bank, Eos_LedPalette[s_sel]);   // commit -> descriptor + reload
-        return s_return;                                // leave to caller's return phase
+        // Mirror the Loader palette/descriptor semantics, but do not pretend a
+        // failed descriptor write succeeded. Stay in the picker so the user can
+        // retry or back out without losing context.
+        if (Desc_SetColor(s_bank, Eos_LedPalette[s_sel]) == 0)
+            return s_return;
+        s_errorUntil = GetTickCount() + 2500;
     }
     if (Edge(b, prev, BTN_B)) {
         return s_return;                                // back out, no change
@@ -121,6 +127,10 @@ int LedPick_Frame(unsigned short b, unsigned short prev)
             Font_DrawScaled(tx, ty, nm, LED_TEXT_CHARCOAL, k);
         }
     }
+
+    if (s_errorUntil && GetTickCount() < s_errorUntil)
+        Font_DrawCentered(0, g_scrW, g_scrH - 88,
+            "LED color save failed - retry or go back", EOS_PURPLE);
 
     // helper line (real functions only)
     Font_DrawCentered(0, g_scrW, g_scrH - 60,

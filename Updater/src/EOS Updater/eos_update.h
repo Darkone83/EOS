@@ -72,10 +72,27 @@ BOOL Update_BeginLoader(UpdateJob* j, const unsigned char* img, int len, DWORD c
 BOOL Update_BeginBios(UpdateJob* j, int bankEf, const unsigned char* img, int len);
 BOOL Update_BeginXbDiag(UpdateJob* j, const unsigned char* img, int len, DWORD crc);
 
-/* Flash a large (512K/1MB) BIOS into the ext region with descriptor auto-place.
-   Used by both the job pump and the direct bank-management flash path. Returns
-   EOS_FLASH_OK, or EOS_FLASH_VERIFY (no free slot) / EOS_FLASH_REFUSED
-   (descriptor write failed) / EOS_FLASH_TIMEOUT (ext-region flash failed). */
+/* BIOS placement preflight. This is deliberately side-effect free so the UI can
+   show the exact target/slot footprint BEFORE any erase occurs. */
+enum {
+    EOS_BANKPLAN_OK = 1,
+    EOS_BANKPLAN_BADTARGET = -1,
+    EOS_BANKPLAN_USED_BY_LARGE = -2,
+    EOS_BANKPLAN_NOROOM = -3
+};
+typedef struct EosBankFlashPlan {
+    int valid;
+    int targetIndex;          /* requested bank table index */
+    int sizeCode;             /* EOS_BANK_SIZE_* */
+    int anchorSlot;           /* descriptor slot 0..3 */
+    int slots;                /* visible slots consumed */
+} EosBankFlashPlan;
+
+int  Update_PlanBankFlash(int targetIndex, int len, EosBankFlashPlan* out);
+
+/* Flash a large (512K/1MB) BIOS into the ext region. The At variant uses the
+   already-confirmed placement; the compatibility wrapper auto-plans. */
+int  Update_ExtBankFlashAt(const unsigned char* image, int len, int anchorSlot);
 int  Update_ExtBankFlash(const unsigned char* image, int len);
 
 /* Advance one step; returns the new state. Idempotent once terminal. */
