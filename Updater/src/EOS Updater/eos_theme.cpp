@@ -20,7 +20,9 @@ static const EosTheme k_themes[] = {
     { "Crimson",    THEME_ARGB(0xFF,18, 6, 8), THEME_ARGB(0xFF, 9, 3, 4), THEME_ARGB(0xFF,36,10,15), THEME_ARGB(0xFF,244, 63, 94), THEME_ARGB(0xFF,251,113,133), THEME_ARGB(0xFF,255,241,242), THEME_ARGB(0xFF,153, 84, 94) },
     { "Ice Blue",   THEME_ARGB(0xFF, 6,10,18), THEME_ARGB(0xFF, 2, 5,10), THEME_ARGB(0xFF,14,26,42), THEME_ARGB(0xFF, 96,165,250), THEME_ARGB(0xFF,147,197,253), THEME_ARGB(0xFF,239,246,255), THEME_ARGB(0xFF, 94,116,143) },
     { "Synthwave",  THEME_ARGB(0xFF,14, 6,24), THEME_ARGB(0xFF, 7, 3,12), THEME_ARGB(0xFF,30,14,46), THEME_ARGB(0xFF,255,106,213), THEME_ARGB(0xFF,255,156,230), THEME_ARGB(0xFF,253,240,255), THEME_ARGB(0xFF,156,106,168) },
-    { "Slate",      THEME_ARGB(0xFF,12,14,18), THEME_ARGB(0xFF, 6, 7, 9), THEME_ARGB(0xFF,26,30,38), THEME_ARGB(0xFF,148,163,184), THEME_ARGB(0xFF,203,213,225), THEME_ARGB(0xFF,248,250,252), THEME_ARGB(0xFF,100,116,139) }
+    { "Slate",      THEME_ARGB(0xFF,12,14,18), THEME_ARGB(0xFF, 6, 7, 9), THEME_ARGB(0xFF,26,30,38), THEME_ARGB(0xFF,148,163,184), THEME_ARGB(0xFF,203,213,225), THEME_ARGB(0xFF,248,250,252), THEME_ARGB(0xFF,100,116,139) },
+    // Darkone 83 must stay LAST: Theme_BgIsModel() keys on the final index.
+    { "Darkone 83", THEME_ARGB(0xFF,10, 8,18), THEME_ARGB(0xFF, 4, 3, 8), THEME_ARGB(0xFF,26,22,40), THEME_ARGB(0xFF,168,85,247), THEME_ARGB(0xFF,199,125,255), THEME_ARGB(0xFF,245,243,255), THEME_ARGB(0xFF,139,127,168) }
 };
 #define THEME_COUNT ((int)(sizeof(k_themes) / sizeof(k_themes[0])))
 
@@ -53,6 +55,9 @@ const char* Theme_Name(int idx)
 }
 
 int Theme_Index(void) { return s_idx; }
+
+// Darkone 83 is the final built-in theme, matching the loader theme index.
+int Theme_BgIsModel(void) { return s_idx == THEME_COUNT - 1; }
 
 void Theme_Set(int idx)
 {

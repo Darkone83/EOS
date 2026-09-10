@@ -8,7 +8,6 @@
 
 module eos_hdmi_top (
     input              sys_clk,
-    input              rst_btn,
 
     input              lpc_lclk,
     inout              lpc_lframe_n,    // 1.6: driven low to abort; else released (input)
@@ -74,10 +73,6 @@ module eos_hdmi_top (
     output     [3:0]   O_sdram_dqm
 );
 
-    // rst_btn is a real pad in the CST but nothing uses it. Tie it off rather
-    // than removing the port (which would also mean editing the .cst).
-    wire _unused_rst_btn = rst_btn;
-
     // -------------------------------------------------------------------------
     // HDMI clocks
     // -------------------------------------------------------------------------
@@ -86,22 +81,32 @@ module eos_hdmi_top (
     wire pix_clk;
     wire hpll_lock;
 
+    // Runtime control for the dedicated onboard HUD HDMI engine. The request
+    // comes from the native EOS 0x6E command engine (clk_sd) and is synchronized
+    // into sys_clk before it can stop/restart the 371.25 MHz HDMI PLL.
+    wire i2c_hud_enable;
+    reg [1:0] hud_enable_sync = 2'b11;
+    always @(posedge sys_clk)
+        hud_enable_sync <= {hud_enable_sync[0], i2c_hud_enable};
+    wire hud_enable_sys = hud_enable_sync[1];
+
     Gowin_rPLL u_hpll (
         .clkin  (sys_clk),
         .clkout (serial_clk),
-        .lock   (hpll_lock)
+        .lock   (hpll_lock),
+        .reset  (~hud_enable_sys)
     );
 
     reg [7:0] por = 8'd0;
 
     always @(posedge sys_clk) begin
-        if (!hpll_lock)
+        if (!hud_enable_sys || !hpll_lock)
             por <= 8'd0;
         else if (~&por)
             por <= por + 1'b1;
     end
 
-    wire hdmi_rst_n = &por;
+    wire hdmi_rst_n = hud_enable_sys & (&por);
 
     CLKDIV u_clkdiv (
         .RESETN (hdmi_rst_n),
@@ -160,6 +165,7 @@ module eos_hdmi_top (
     wire        mem_valid;
     wire [20:0] mem_addr;
     wire        ef_wr;
+    wire        pfifo_fix_enable;
     wire [7:0]  ef_data;
     wire [7:0]  mem_data;
 
@@ -172,12 +178,13 @@ module eos_hdmi_top (
     wire [7:0]  cmd_rd_data_l;     // clk_lpc: status/pbuf byte synced back to loader
 
     wire [3:0]  lst;
-    wire        lad_oe_c;
+    wire [3:0]  lad_oe_c;
     wire [3:0]  lad_out_c;
 
     eos_lpc_loader u_loader (
         .clk          (clk_lpc),
         .lreset_n     (lpc_lreset_n),
+        .pfifo_fix_enable (pfifo_fix_enable),
 
         .lclk_pin     (lpc_lclk),
         .lframe_n_pin (lpc_lframe_n),
@@ -205,7 +212,12 @@ module eos_hdmi_top (
         .serving_mem  (serving_mem_w)
     );
 
-    assign lpc_lad = lad_oe_c ? lad_out_c : 4'bzzzz;
+    // Independent LAD output-enable lanes let each preserved OE register pack
+    // with its corresponding bidirectional I/O cell.
+    assign lpc_lad[0] = lad_oe_c[0] ? lad_out_c[0] : 1'bz;
+    assign lpc_lad[1] = lad_oe_c[1] ? lad_out_c[1] : 1'bz;
+    assign lpc_lad[2] = lad_oe_c[2] ? lad_out_c[2] : 1'bz;
+    assign lpc_lad[3] = lad_oe_c[3] ? lad_out_c[3] : 1'bz;
 
     // -------------------------------------------------------------------------
     // D0 / LFRAME# boot control
@@ -323,6 +335,11 @@ module eos_hdmi_top (
     wire        stg_scr_wr;    wire [20:0] stg_scr_waddr;  wire [7:0] stg_scr_wdata;
     wire        be_scr_rd, be_scr_rvalid, be_scr_busy;
     wire [20:0] be_scr_raddr;  wire [7:0] be_scr_rdata;
+    // Dedicated X-HD memory lane in the otherwise-unused 0x5C0000..0x5FFFFF
+    // SDRAM gap. This does NOT share updater/EXP scratch at 0x600000+.
+    wire        xhd_mem_rd, xhd_mem_wr, xhd_mem_rvalid, xhd_mem_busy;
+    wire [15:0] xhd_mem_addr;
+    wire [7:0]  xhd_mem_wdata, xhd_mem_rdata;
     wire        crc_scr_rd;    wire [20:0] crc_scr_raddr;
     wire        bank_scr_rd;   wire [20:0] bank_scr_raddr;
     wire        crc_go, crc_busy, crc_done;  wire [20:0] crc_len;  wire [31:0] crc_result;
@@ -401,6 +418,14 @@ module eos_hdmi_top (
         .scr_rdata     (be_scr_rdata),
         .scr_rvalid    (be_scr_rvalid),
         .scr_busy      (be_scr_busy),
+
+        .xhd_mem_wr    (xhd_mem_wr),
+        .xhd_mem_rd    (xhd_mem_rd),
+        .xhd_mem_addr  (xhd_mem_addr),
+        .xhd_mem_wdata (xhd_mem_wdata),
+        .xhd_mem_rdata (xhd_mem_rdata),
+        .xhd_mem_rvalid(xhd_mem_rvalid),
+        .xhd_mem_busy  (xhd_mem_busy),
 
         .nr_wr         (sdp_nr_wr),       // SD precache -> NRGN_SD (eos_sd_precache.v)
         .nr_waddr      (sdp_nr_waddr),
@@ -738,11 +763,13 @@ module eos_hdmi_top (
     // hd_addr_en OUTPUT (raised when ADV init completes; the old collision
     // guard is gone), not tied to 0.
     wire       hd_transport_en;
-    // eos_hd.v's HD/ADV master now drives a SEPARATE, private bus (adv_sda/
-    // adv_scl on EXP1/EXP2), NOT the Xbox SMBus. This is the whole fix: the
-    // ADV master and the console's own SMBus master are no longer on the same
-    // wire, so there is nothing to collide with -- video bring-up can't be
-    // NAKed/blocked and the console can't be fragged by our traffic.
+    wire       hd_target_known, hd_target_hd;
+    // EXP1-3 physical ownership is intentionally separate from the 0x69
+    // responder gate. Reserve the pins while ADV presence is unresolved and
+    // for the entire boot whenever an ADV7511 is physically present.
+    wire       hd_pins_reserved = !hd_target_known || hd_target_hd;
+    // eos_hd.v's HD/ADV master drives the same separate private ADV bus model
+    // used by X-HD: ADV transactions never share the Xbox SMBus wires.
     wire       hd_sda_oe, hd_scl_oe;
 
     // Xbox SMBus: SLAVE drive only (eos_i2c.v). No HD master term anymore.
@@ -756,17 +783,37 @@ module eos_hdmi_top (
     // eos_i2c.v <-> eos_hd.v relay interface (see eos_i2c.v's dual-address
     // note) -- real wires now, eos_hd.v is both ends' other side.
     wire        hd_addr_match, hd_byte_valid, hd_byte_first;
+    wire        hd_txn_done, hd_txn_abort;
     wire [7:0]  hd_byte;
     wire [7:0]  hd_read_data;
     wire        hd_read_ready;
 
+    // Native 0x6E read-only ADV diagnostic bridge. Command 0x3B uses ARG0 as
+    // the ADV register index; eos_hd.v services it between X-HD loop iterations.
+    wire        hd_diag_adv_req, hd_diag_trace_req;
+    wire        hd_diag_adv_busy, hd_diag_adv_valid, hd_diag_adv_nack;
+    wire [7:0]  hd_diag_adv_data, hd_diag_adv_reg_echo;
+    assign hd_diag_adv_req   = i2c_cmd_stb && (i2c_cmd == 8'h3B);
+    assign hd_diag_trace_req = i2c_cmd_stb && (i2c_cmd == 8'h3C);
+
     // eos_hd.v -> serve HUD status (see gen_hud.py's HD STATUS panel)
     wire [3:0]  hd_encoder_status;
     wire        hd_pll_lock_status, hd_bios_active_status, hd_guard_blocked_status;
+
+    // Arm the transparent PFIFO reset trampoline only for the exact historical
+    // target: an installed HD path on a pre-1.6 Conexant Xbox. The loader then
+    // further requires a user-bank 0xEF launch (0x03..0x09) before arming it.
+    assign pfifo_fix_enable = hd_target_hd && !mode_16 &&
+                              (hd_encoder_status[1:0] == 2'd0);
+
     wire [5:0]  hd_brst_status;
     wire [2:0]  hd_disable_reason_status;
-
+    wire [7:0]  hd_diag_status;
     wire [7:0] i2c_ver_major, i2c_ver_minor, i2c_ver_patch;
+    // Mailbox relay wires -- declared before u_i2c so the port map sees
+    // the full 8-bit width (previously implicitly 1-bit at point of use).
+    wire [7:0] mbx_rd_index, mbx_rd_data, mbx_wr_index, mbx_wr_data;
+    wire       mbx_wr_stb;
     eos_i2c u_i2c (
         .clk      (clk_sd),  .resetn (sd_rstn),
         .sda_in   (i2c_sda), .scl_in (i2c_scl), .sda_oe (i2c_sda_oe), .scl_oe (i2c_scl_oe),
@@ -777,7 +824,12 @@ module eos_hdmi_top (
         // these (was tied off before it existed).
         .hd_addr_en(hd_transport_en), .hd_addr_match(hd_addr_match),
         .hd_byte_valid(hd_byte_valid), .hd_byte(hd_byte), .hd_byte_first(hd_byte_first),
+        .hd_txn_done(hd_txn_done), .hd_txn_abort(hd_txn_abort),
         .hd_read_data(hd_read_data), .hd_read_ready(hd_read_ready),
+        .hd_diag_adv_busy(hd_diag_adv_busy), .hd_diag_adv_valid(hd_diag_adv_valid),
+        .hd_diag_adv_nack(hd_diag_adv_nack), .hd_diag_adv_data(hd_diag_adv_data),
+        .hd_diag_adv_reg_echo(hd_diag_adv_reg_echo),
+        .hd_abort_reason_out(),   // intentionally unused: bank LED reflects loader state only
 
         .cmd      (i2c_cmd), .arg0(i2c_a0), .arg1(i2c_a1), .arg2(i2c_a2), .arg3(i2c_a3),
         .cmd_stb  (i2c_cmd_stb), .rx_count(i2c_rxcnt), .selected(i2c_sel),
@@ -786,6 +838,7 @@ module eos_hdmi_top (
         .commit_busy(bank_commit_busy), .commit_done(bank_commit_done), .commit_err(bank_commit_err),
         .scr_clear(i2c_scr_clear), .sel_bank(i2c_sel_bank), .boot_mode(i2c_boot_mode), .lock_mask(i2c_lock_mask),
         .led_mode(i2c_led_mode),
+        .hud_enable(i2c_hud_enable),
         .desc_reload(i2c_desc_reload),
         .set_color_bank(i2c_set_color_bank),
         .set_color_rgb(i2c_set_color_rgb),
@@ -794,14 +847,21 @@ module eos_hdmi_top (
         .mbx_wr_stb  (mbx_wr_stb),   .mbx_wr_index(mbx_wr_index), .mbx_wr_data(mbx_wr_data)
     );
 
-    // ---- EOS-native HD (ADV7511) controller -------------------------------
-    // See eos_hd_integration_spec.md. Masters the ADV on the PRIVATE adv_*
-    // bus (EXP1/EXP2): ADV presence check, full base init, encoder tweak,
-    // standalone (pre-BIOS) video bring-up. The existing physical 1.6 strap
-    // selects Xcalibur at boot; otherwise the validated Conexant branch starts
-    // and only a BIOS 0xD4 report may transition it to Focus. There is no
-    // runtime Xcalibur detection or active encoder probe.
-    eos_hd u_hd (
+    // ---- X-HD application-compatible ADV7511 controller -------------------
+    // The local X-HD source selects Conexant/Focus/Xcalibur before init_adv().
+    // EOS can identify the 1.6/Xcalibur physical path directly. For pre-1.6,
+    // this build flag selects the same initial profile X-HD would have been
+    // compiled with: 0=Conexant, 1=Focus.
+    localparam XHD_PRE16_FOCUS = 1'b0;
+
+    eos_hd #(
+        //.XHD_PRE16_FOCUS(XHD_PRE16_FOCUS),
+        // Normal X-HD application behavior: once CerBIOS completes a 0x69
+        // CONFIG_APPLY transaction, bios_took_over becomes authoritative and
+        // BR_READY enters the BIOS-owned table/mode applicator.  Do not leave
+        // the diagnostic standalone override enabled in production builds.
+        .FORCE_STANDALONE(1'b0)
+    ) u_hd (
         .clk (clk_sd), .resetn (sd_rstn),
         .xbox_16_mode (mode_16),
         .adv_sda_in (adv_sda), .adv_scl_in (adv_scl),
@@ -809,12 +869,26 @@ module eos_hdmi_top (
         .adv_int (adv_int),
         .hd_addr_en (hd_transport_en), .hd_addr_match (hd_addr_match),
         .hd_byte_valid (hd_byte_valid), .hd_byte (hd_byte), .hd_byte_first (hd_byte_first),
+        .hd_txn_done (hd_txn_done), .hd_txn_abort (hd_txn_abort),
         .hd_read_data (hd_read_data), .hd_read_ready (hd_read_ready),
+        .xhd_mem_rd (xhd_mem_rd), .xhd_mem_wr (xhd_mem_wr),
+        .xhd_mem_addr (xhd_mem_addr), .xhd_mem_wdata (xhd_mem_wdata),
+        .xhd_mem_rdata (xhd_mem_rdata), .xhd_mem_rvalid (xhd_mem_rvalid),
+        .xhd_mem_busy (xhd_mem_busy),
+        .diag_adv_req (hd_diag_adv_req), .diag_adv_reg (i2c_a0),
+        .diag_trace_req (hd_diag_trace_req), .diag_trace_index (i2c_a0),
+        .diag_trace_field (i2c_a1[2:0]),
+        .diag_adv_busy (hd_diag_adv_busy), .diag_adv_valid (hd_diag_adv_valid),
+        .diag_adv_nack (hd_diag_adv_nack), .diag_adv_data (hd_diag_adv_data),
+        .diag_adv_reg_echo (hd_diag_adv_reg_echo),
         .led_green (hd_led_green), .led_blue (hd_led_blue),
         .hd_encoder_out (hd_encoder_status), .hd_pll_lock_out (hd_pll_lock_status),
         .hd_bios_active_out (hd_bios_active_status), .hd_guard_blocked_out (hd_guard_blocked_status),
         .hd_brst_out (hd_brst_status),
-        .hd_disable_reason_out (hd_disable_reason_status)
+        .hd_disable_reason_out (hd_disable_reason_status),
+        .hd_diag_out (hd_diag_status),
+        .hd_target_known (hd_target_known),
+        .hd_target_hd (hd_target_hd)
     );
 
     // ---- CRC32 over scratch (drives VALIDATE) ----
@@ -827,7 +901,7 @@ module eos_hdmi_top (
 
     eos_serve_hud u_hud (
         .lclk         (clk_lpc),
-        .lreset_n     (lpc_lreset_n),
+        .lreset_n     (lpc_lreset_n & hud_enable_sys),
         .vclk         (pix_clk),
 
         .state        (lst),
@@ -860,7 +934,8 @@ module eos_hdmi_top (
         .hd_guard_blocked (hd_guard_blocked_status),
         .hd_transport_en  (hd_transport_en),
         .hd_brst          ({2'b00, hd_brst_status}),
-        .hd_dr            ({5'b00000, hd_disable_reason_status}),
+        // Patch 5 diagnostic byte: T N A R | live OPS state.
+        .hd_dr            (hd_diag_status),
 
         .wr_en        (wr_en),
         .wr_addr      (wr_addr),
@@ -1036,7 +1111,7 @@ module eos_hdmi_top (
             b_serv   <= 1'b0;
             serv_tog <= 1'b0;
         end else begin
-            if (lad_oe_c)
+            if (|lad_oe_c)
                 b_drive <= 1'b1;
 
             if (mem_valid) begin
@@ -1235,12 +1310,150 @@ module eos_hdmi_top (
     // change only on menu navigation so a 2-flop sync is sufficient.
     reg [2:0]  led_mode_s1, led_mode_s2;
     reg [23:0] led_rgb_s1, led_rgb_s2;
+
+    // Bank LED mode/color CDC only. The temporary passive Xbox-SMBus/
+    // I2C hang diagnostic overlay used during X-HD deadlock bring-up has
+    // been removed; the external bank LED now reflects loader state only.
     always @(posedge sys_clk) begin
-        led_mode_s1<=fc_led_mode; led_mode_s2<=led_mode_s1;
-        led_rgb_s1 <=fc_led_rgb;  led_rgb_s2 <=led_rgb_s1;
+        led_mode_s1 <= fc_led_mode;
+        led_mode_s2 <= led_mode_s1;
+        led_rgb_s1  <= fc_led_rgb;
+        led_rgb_s2  <= led_rgb_s1;
     end
 
-    wire [23:0] bank_led_grb;
+    // ---------------------------------------------------------------------
+    // TEMP HD-LOCK DIAGNOSTIC: SDRAM PLL/reset sticky fault -> solid RED
+    // bank LED override.
+    //
+    // This monitor intentionally lives in sys_clk, not clk_sd.  The sticky
+    // latches have FPGA-configuration initial values and take NO runtime reset,
+    // so an SDRAM PLL/reset disturbance remains visible after the Xbox locks.
+    // Startup is ignored until both synchronized signals have first been seen
+    // healthy, preventing normal PLL acquisition from latching a false fault.
+    //
+    //   normal bank LED : no SDRAM clock/reset fault observed
+    //   SOLID RED       : spll_lock OR sd_rstn was healthy, then dropped
+    //
+    // Remove this block after HD lock isolation is complete.
+    // ---------------------------------------------------------------------
+    reg [1:0] spll_lock_sys = 2'b00;
+    reg [1:0] sd_rstn_sys   = 2'b00;
+    reg       hdclk_diag_armed = 1'b0;
+    reg       spll_fault_sticky = 1'b0;
+    reg       sdrst_fault_sticky = 1'b0;
+
+    always @(posedge sys_clk) begin
+        spll_lock_sys <= {spll_lock_sys[0], spll_lock};
+        sd_rstn_sys   <= {sd_rstn_sys[0],   sd_rstn};
+
+        if (!hdclk_diag_armed) begin
+            if (spll_lock_sys[1] && sd_rstn_sys[1])
+                hdclk_diag_armed <= 1'b1;
+        end else begin
+            if (!spll_lock_sys[1])
+                spll_fault_sticky <= 1'b1;
+            if (!sd_rstn_sys[1])
+                sdrst_fault_sticky <= 1'b1;
+        end
+    end
+
+    wire hdclk_fault_sticky = spll_fault_sticky | sdrst_fault_sticky;
+
+    // ---------------------------------------------------------------------
+    // TEMP HD-LOCK DIAGNOSTIC: LPC LAD ownership violation sticky.
+    //
+    // The loader's LAD OEs are registered on LCLK, so the CURRENT state/ODE
+    // pairing on the wire is deterministic:
+    //   TAR1 is still Hi-Z; TAR2 through the response/data/exit phases drive.
+    // Any LAD drive outside those phases, or any partial 4-bit OE pattern, is
+    // an EOS-side bus-ownership violation capable of fighting the MCPX.
+    // This latch intentionally has no runtime reset.
+    // ---------------------------------------------------------------------
+    wire lpc_drive_phase = (lst == 4'd4)  || // TAR2
+                           (lst == 4'd5)  || // SYNCING
+                           (lst == 4'd6)  || // SYNC_COMPLETE
+                           (lst == 4'd7)  || // READ_DATA0
+                           (lst == 4'd8)  || // READ_DATA1
+                           (lst == 4'd9)  || // TAR_EXIT (OE releases on exit edge)
+                           (lst == 4'd12);    // SYNC_ABORT
+    wire lpc_oe_any = |lad_oe_c;
+    wire lpc_oe_all = &lad_oe_c;
+    wire lpc_drive_violation = lpc_oe_any && (!lpc_oe_all || !lpc_drive_phase);
+
+    reg lpc_drive_fault_sticky = 1'b0;
+    always @(posedge clk_lpc) begin
+        if (lpc_lreset_n && lpc_drive_violation)
+            lpc_drive_fault_sticky <= 1'b1;
+    end
+
+    reg [1:0] lpc_drive_fault_sys = 2'b00;
+    always @(posedge sys_clk)
+        lpc_drive_fault_sys <= {lpc_drive_fault_sys[0], lpc_drive_fault_sticky};
+
+    // ---------------------------------------------------------------------
+    // TEMP HD-LOCK DIAGNOSTIC: Xbox SMBus EOS-drive violation sticky.
+    //
+    // With the tightened eos_i2c.v, SCL is NEVER driven by EOS. SDA may only
+    // be pulled low while either the native 0x6E persona or X-HD 0x69 persona
+    // owns the transaction. Also flag a continuously asserted EOS SMBus drive
+    // lasting ~1 ms (65535 clk_sd clocks @ 64.8 MHz), far longer than a legal
+    // ACK/data-bit drive interval. The sticky survives runtime resets.
+    // ---------------------------------------------------------------------
+    wire smbus_owner = i2c_sel | hd_addr_match;
+    wire smbus_illegal_drive = i2c_scl_oe | (i2c_sda_oe && !smbus_owner);
+
+    reg [15:0] smbus_drive_ctr = 16'd0;
+    reg        smbus_diag_armed = 1'b0;
+    reg        smbus_drive_fault_sticky = 1'b0;
+    always @(posedge clk_sd) begin
+        if (!sd_rstn) begin
+            smbus_drive_ctr <= 16'd0;
+            smbus_diag_armed <= 1'b0;
+        end else if (!smbus_diag_armed) begin
+            smbus_drive_ctr <= 16'd0;
+            smbus_diag_armed <= 1'b1;
+        end else begin
+            if (smbus_illegal_drive)
+                smbus_drive_fault_sticky <= 1'b1;
+
+            if (i2c_sda_oe || i2c_scl_oe) begin
+                if (smbus_drive_ctr != 16'hFFFF)
+                    smbus_drive_ctr <= smbus_drive_ctr + 16'd1;
+                else
+                    smbus_drive_fault_sticky <= 1'b1;
+            end else begin
+                smbus_drive_ctr <= 16'd0;
+            end
+        end
+    end
+
+    reg [1:0] smbus_drive_fault_sys = 2'b00;
+    always @(posedge sys_clk)
+        smbus_drive_fault_sys <= {smbus_drive_fault_sys[0], smbus_drive_fault_sticky};
+
+    // Visible post-lock signature on the external bank LED:
+    //   RED    = SDRAM PLL/reset fault
+    //   PURPLE = illegal LPC LAD drive/ownership
+    //   BLUE   = illegal/abnormally-long Xbox SMBus drive
+    //   WHITE  = two or more fault classes latched
+    //   normal = no monitored fault observed
+    wire lpc_fault_sys   = lpc_drive_fault_sys[1];
+    wire smbus_fault_sys = smbus_drive_fault_sys[1];
+    wire multi_bus_fault = (hdclk_fault_sticky && lpc_fault_sys) ||
+                           (hdclk_fault_sticky && smbus_fault_sys) ||
+                           (lpc_fault_sys && smbus_fault_sys);
+
+    wire [23:0] bank_led_grb_normal;
+    wire [23:0] bank_led_grb = multi_bus_fault
+                              ? RGB_TO_GRB(8'hFF, 8'hFF, 8'hFF)
+                              : hdclk_fault_sticky
+                              ? RGB_TO_GRB(8'hFF, 8'h00, 8'h00)
+                              : lpc_fault_sys
+                              ? RGB_TO_GRB(8'h80, 8'h00, 8'h80)
+                              : smbus_fault_sys
+                              ? RGB_TO_GRB(8'h00, 8'h00, 8'hFF)
+                              : bank_led_grb_normal;
+
     eos_bank_led #(
         .CLK_HZ(27_000_000)
     ) u_bank_led (
@@ -1248,7 +1461,8 @@ module eos_hdmi_top (
         .rstn      (ws_rst_n),
         .show_mode (led_mode_s2),
         .show_rgb  (led_rgb_s2),
-        .grb       (bank_led_grb)
+        .phase     (hb),           // share the heartbeat counter (was a duplicate inside the module)
+        .grb       (bank_led_grb_normal)
     );
 
     eos_ws2812 #(
@@ -1276,10 +1490,10 @@ module eos_hdmi_top (
     localparam [20:0] EXP_FRAME_BASE = 21'h00_0000;    // scratch base == flash 0x800000 mirror
     localparam [20:0] EXP_TEXT_BASE  = EXP_FRAME_BASE + 21'd16;
     wire clk = clk_sd;  wire resetn = sd_rstn;
-    // Keep the original, proven target source.  The completed 128K script preload
-    // now delays validation long enough that we no longer validate against empty
-    // scratch at boot, without introducing a second HD-presence state machine.
-    wire exp_sys_target = hd_transport_en;             // HD transport active -> EXP1-3 reserved
+    // Expansion TARGET follows stable physical ADV presence, not the later 0x69
+    // transport-enable point. While the probe is unresolved, fail safely as HD
+    // so EXP1-3 cannot be driven into the ADV bus during bring-up.
+    wire exp_sys_target = hd_target_known ? hd_target_hd : 1'b1;
     wire exp_boot_ready = dbg_script_ready;
     // boot gate: first served BIOS byte (mem_req @clk_lpc) -> sticky -> 2FF -> clk_sd
     reg  exp_served_lclk = 1'b0;
@@ -1303,7 +1517,6 @@ module eos_hdmi_top (
     wire [7:0] exp_scr_rdata  = be_scr_rdata;
     wire       exp_scr_rvalid = be_scr_rvalid & ~upd_scr_active;
     wire       exp_scr_busy   = be_scr_busy   | upd_scr_active;
-    wire [7:0] mbx_rd_index, mbx_rd_data, mbx_wr_index, mbx_wr_data; wire mbx_wr_stb;
     wire [7:0] exp_out, exp_oe;
     wire [7:0] exp_in = {exp8, exp7, exp6, exp5, exp4, adv_int, adv_scl, adv_sda}; // idx7..0
     wire exp_st_running, exp_st_fault, exp_st_image_valid, exp_st_gate, exp_st_busy;
@@ -1415,6 +1628,9 @@ module eos_hdmi_top (
         .s_wr(se_wr),.s_waddr(se_waddr),.s_wdata(se_wdata),.s_raddr(se_raddr),.s_rdata(se_rdata));
 
     // ---- mailbox (0x6E 0x40-0x6F) ---------------------------------------
+    // Declare exec status before u_mbx consumes it; avoids Gowin implicit-net warning.
+    wire [7:0]  fcode;
+    wire [15:0] pc;
     wire mbx_clr;
     eos_exp_mailbox u_mbx(.clk(clk),.resetn(resetn),
         .st_running(exp_st_running),.st_fault(exp_st_fault),.st_image_valid(exp_st_image_valid),
@@ -1428,7 +1644,7 @@ module eos_hdmi_top (
         .v_wr(mv_wr),.v_waddr(mv_waddr),.v_wdata(mv_wdata),.v_raddr(mv_raddr),.v_rdata(mv_rdata));
 
     // ---- exec -----------------------------------------------------------
-    wire        exec_start,exec_halt,exec_running,exec_fault; wire [7:0] fcode; wire [15:0] pc;
+    wire        exec_start,exec_halt,exec_running,exec_fault;
     wire        p_start; wire [7:0] p_op,p_result,p_a0; wire [2:0] p_pin3; wire [16:0] p_a1; wire p_done;
     wire        ws_wr; wire [11:0] ws_waddr; wire [7:0] ws_wdata; wire ws_send; wire [12:0] ws_len; wire ws_zero; wire [2:0] ws_pin; wire ws_busy;
     wire        iw_wr; wire [8:0] iw_waddr; wire [7:0] iw_wdata; wire i2c_go,i2c_read; wire [6:0] i2c_addr; wire [8:0] i2c_len,ir_raddr; wire [7:0] ir_rdata;
@@ -1459,6 +1675,7 @@ module eos_hdmi_top (
     wire        pins_active,safe_out;
     wire        i2c_m_scl_oe,i2c_m_sda_oe,i2c_m_scl_in,i2c_m_sda_in;
     eos_exp_pins #(.CLK_HZ(32'd64800000)) u_pins(.clk(clk),.resetn(resetn),.boot_gate(pins_active),.safe_mode(safe_out),
+        .init_pulse(exec_start),
         .pin_type_flat(ptf),.pin_init_flat(pif),.pin_safe_flat(psf),
         .p_start(p_start),.p_op(p_op),.p_pin(p_pin3),.p_val0(p_a0),.p_val1(p_a1),
         .p_done(p_done),.p_result(p_result),
@@ -1470,6 +1687,7 @@ module eos_hdmi_top (
 
     // ---- soft I2C master (script I2CW/I2CR) -----------------------------
     eos_exp_i2c #(.SCL_LOW_CYCLES(324),.SCL_HIGH_CYCLES(324)) u_i2cm(.clk(clk),.resetn(resetn),
+        .cancel(exec_halt | safe_out),
         .sda_in(i2c_m_sda_in),.scl_in(i2c_m_scl_in),.sda_oe(i2c_m_sda_oe),.scl_oe(i2c_m_scl_oe),
         .iw_wr(iw_wr),.iw_waddr(iw_waddr),.iw_wdata(iw_wdata),.ir_raddr(ir_raddr),.ir_rdata(ir_rdata),
         .i2c_go(i2c_go),.i2c_read(i2c_read),.i2c_addr(i2c_addr),.i2c_len(i2c_len),
@@ -1496,12 +1714,14 @@ module eos_hdmi_top (
     assign be_scr_rd    = crc_busy ? crc_scr_rd    : bank_scr_rd ? bank_scr_rd    : exp_scr_rd;
     assign be_scr_raddr = crc_busy ? crc_scr_raddr : bank_scr_rd ? bank_scr_raddr : exp_scr_raddr;
     // ---- EXP4..EXP8 open-drain (idx3..7). EXP1..3 (idx0..2)=ADV bus, reserved under HD ----
-    // Under NOHD the editor/spec exposes all eight EXP pins. The ADV private
-    // bus remains authoritative under HD; expansion only adds a driver when
-    // hd_transport_en is false.
-    assign adv_sda = (!hd_transport_en && exp_oe[0]) ? exp_out[0] : 1'bz; // EXP1
-    assign adv_scl = (!hd_transport_en && exp_oe[1]) ? exp_out[1] : 1'bz; // EXP2
-    assign adv_int = (!hd_transport_en && exp_oe[2]) ? exp_out[2] : 1'bz; // EXP3
+    // Under NOHD the editor/spec exposes all eight EXP pins. EXP1-3 are never
+    // handed to the script merely because the X-HD 0x69 responder is not yet
+    // enabled: physical ADV presence owns them from probe through runtime.
+    // This closes the bring-up window where script GPIO/PWM could contend with
+    // ADV SDA/SCL/INT before hd_transport_en asserted.
+    assign adv_sda = (!hd_pins_reserved && exp_oe[0]) ? exp_out[0] : 1'bz; // EXP1
+    assign adv_scl = (!hd_pins_reserved && exp_oe[1]) ? exp_out[1] : 1'bz; // EXP2
+    assign adv_int = (!hd_pins_reserved && exp_oe[2]) ? exp_out[2] : 1'bz; // EXP3
     assign exp4 = exp_oe[3] ? exp_out[3] : 1'bz;
     assign exp5 = exp_oe[4] ? exp_out[4] : 1'bz;
     assign exp6 = exp_oe[5] ? exp_out[5] : 1'bz;

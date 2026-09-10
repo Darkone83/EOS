@@ -64,12 +64,9 @@
 //     covering exactly 0x00EC / 0x00ED / 0x00EE / 0x00EF, and WRITE_DATA1
 //     compares the full 16-bit address for 0xEF.
 //
-//     NOT fixed (would need LFRAME#, which this build ignores): after declining
-//     an unsupported I/O cycle the loader returns to WAIT_START while the host is
-//     still driving that cycle's remaining nibbles. A 0000 data nibble can
-//     therefore look like a START. The nibble after it is a TAR (1111), which
-//     fails the CYCTYPE decode and drops straight back to WAIT_START, so it is
-//     self-correcting -- but it is why WAIT_START must stay cheap.
+//     START qualification is gated by LFRAME#. After declining an unsupported
+//     I/O cycle, remaining host data nibbles cannot be mistaken for a new START
+//     unless the host also asserts a new LFRAME# transaction.
 //
 // =============================================================================
 //
@@ -85,8 +82,8 @@
 // KNOWN BEHAVIOUR / DELIBERATE DEVIATIONS
 // =============================================================================
 //
-//   * LFRAME# is NOT used to gate START. WAIT_START triggers on any 0000 nibble
-//     on LAD. lframe_n_pin is accepted and ignored.
+//   * LFRAME# qualifies START. WAIT_START advances only when LFRAME# is asserted
+//     and LAD carries the LPC START field (0000).
 //
 //   * Memory address decode ignores A31:A21 and captures only A20:A0. Eos
 //     answers a memory read at ANY 4 GB address whose low 21 bits match. This
@@ -110,12 +107,17 @@ module eos_lpc_loader #(
     input  wire        clk,                 // DIRECT: Xbox LPC LCLK
     input  wire        lreset_n,
 
+    // One-shot PFIFO workaround arm source. Asserted only while the loader is
+    // running on a pre-1.6 Conexant HD system. A qualifying user-bank 0xEF
+    // write latches the request across the following warm reset.
+    input  wire        pfifo_fix_enable,
+
     input  wire        lclk_pin,            // unused in direct-LCLK mode
-    input  wire        lframe_n_pin,        // accepted, not used to gate START
+    input  wire        lframe_n_pin,        // qualifies LPC START
     input  wire [3:0]  lad_pin,
 
     output reg  [3:0]  lad_out,
-    output wire        lad_oe,
+    output wire [3:0]  lad_oe,
 
     output reg         mem_req,
     output wire [20:0] mem_addr,        // full 2MB logical address (A20:A0), no 256K wrap
@@ -178,7 +180,7 @@ module eos_lpc_loader #(
     wire _unused_lclk   = lclk_pin;
 
     wire [3:0] lad_in = lad_pin;
-    wire _unused_lframe = lframe_n_pin;
+    wire       lpc_start = (!lframe_n_pin) && (lad_in == 4'h0);
 
     // -------------------------------------------------------------------------
     // Transaction state
@@ -213,16 +215,22 @@ module eos_lpc_loader #(
     // LAD output ownership
     // -------------------------------------------------------------------------
     //
-    // Target drives only during target-owned response phases.
-    // TAR1 and host WRITE_DATA phases remain Hi-Z.
+    // LAD data and output-enable are launched from registers on LCLK. Each
+    // state transition preloads the value required by the following LPC phase,
+    // removing the state-to-pin combinational decode from the launch path.
+    //
+    // Keep one OE register per LAD lane. They always carry the same protocol
+    // value, but remain physically independent so P&R can place each OE launch
+    // beside its corresponding bidirectional I/O cell instead of routing one
+    // shared OE register across all four LAD pins.
+    reg lad_oe0_r /* synthesis syn_preserve = 1 */;
+    reg lad_oe1_r /* synthesis syn_preserve = 1 */;
+    reg lad_oe2_r /* synthesis syn_preserve = 1 */;
+    reg lad_oe3_r /* synthesis syn_preserve = 1 */;
 
-    assign lad_oe = (state == TAR2)          ||
-                    (state == SYNCING)       ||
-                    (state == SYNC_COMPLETE) ||
-                    (state == SYNC_ABORT)    ||
-                    (state == READ_DATA0)    ||
-                    (state == READ_DATA1)    ||
-                    (state == TAR_EXIT);
+    assign lad_oe = {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r};
+
+    // TAR1 and host WRITE_DATA phases remain Hi-Z.
 
     // -------------------------------------------------------------------------
     // serving_mem -- the 1.6 LFRAME# abort window
@@ -254,6 +262,120 @@ module eos_lpc_loader #(
     assign serving_mem = (cycle_type == CYC_MEM_READ) ||
                          (cycle_type == CYC_MEM_WRITE);
 
+    // =========================================================================
+    // MakeMHz/XboxHD+ pre-1.6 Conexant PFIFO workaround -- gateware-owned
+    // =========================================================================
+    //
+    // The proven software/kpatch workaround writes:
+    //   0xFD00124C = 0x00000000   NV_PFIFO_CACHE1_DMA_SUBROUTINE
+    //   0xFD001250 = 0x00007800   NV_PFIFO_CACHE1_PULL0
+    //
+    // An LPC target cannot directly issue host MMIO writes, so EOS performs the
+    // operation transparently with a one-shot x86 reset-vector overlay. When a
+    // qualifying user BIOS is selected (0xEF = 0x03..0x09), pfifo_arm survives
+    // the warm LRESET. The next CPU reset-vector fetch sees a 3-byte near jump
+    // to a 29-byte ROM stub at FFFFE000. The stub performs the two 32-bit MMIO
+    // writes and near-jumps back to FFFFFFF0. Reading the final stub byte clears
+    // pfifo_arm BEFORE the reset-vector target is fetched again, so the original
+    // selected BIOS is then served byte-for-byte from SDRAM.
+    //
+    // This changes no BIOS image and requires no loader/XBE code once armed.
+    // It is deliberately armed only by an explicit user-bank launch and only
+    // when pfifo_fix_enable was true at that 0xEF write.
+    //
+    // Reset-state execution assumptions are standard 32-bit x86 reset semantics:
+    // CS hidden base = FFFF0000h, IP = FFF0h, DS base = 0. The stub uses 0x66
+    // operand-size and 0x67 address-size prefixes for 32-bit EAX/MMIO accesses.
+    localparam [20:0] PFIFO_RESET_BASE = 21'h1FFFF0; // FFFFFFF0 low 21 bits
+    localparam [20:0] PFIFO_STUB_BASE  = 21'h1FE000; // FFFFE000 low 21 bits
+    localparam [20:0] PFIFO_STUB_LAST  = 21'h1FE01C; // 29-byte stub, offset 0x1C
+
+    // Configuration-init only; intentionally NO LRESET reset. The latch must
+    // survive exactly the warm reset that follows Bank_Launch.
+    reg pfifo_arm = 1'b0;
+
+    function [7:0] pfifo_stub_byte;
+        input [4:0] off;
+        begin
+            case (off)
+                // 66 B8 00000000       mov eax,0
+                5'h00: pfifo_stub_byte=8'h66;
+                5'h01: pfifo_stub_byte=8'hB8;
+                5'h02: pfifo_stub_byte=8'h00;
+                5'h03: pfifo_stub_byte=8'h00;
+                5'h04: pfifo_stub_byte=8'h00;
+                5'h05: pfifo_stub_byte=8'h00;
+                // 67 66 A3 4C1200FD    mov dword [0xFD00124C],eax
+                5'h06: pfifo_stub_byte=8'h67;
+                5'h07: pfifo_stub_byte=8'h66;
+                5'h08: pfifo_stub_byte=8'hA3;
+                5'h09: pfifo_stub_byte=8'h4C;
+                5'h0A: pfifo_stub_byte=8'h12;
+                5'h0B: pfifo_stub_byte=8'h00;
+                5'h0C: pfifo_stub_byte=8'hFD;
+                // 66 B8 00007800       mov eax,0x00007800
+                5'h0D: pfifo_stub_byte=8'h66;
+                5'h0E: pfifo_stub_byte=8'hB8;
+                5'h0F: pfifo_stub_byte=8'h00;
+                5'h10: pfifo_stub_byte=8'h78;
+                5'h11: pfifo_stub_byte=8'h00;
+                5'h12: pfifo_stub_byte=8'h00;
+                // 67 66 A3 501200FD    mov dword [0xFD001250],eax
+                5'h13: pfifo_stub_byte=8'h67;
+                5'h14: pfifo_stub_byte=8'h66;
+                5'h15: pfifo_stub_byte=8'hA3;
+                5'h16: pfifo_stub_byte=8'h50;
+                5'h17: pfifo_stub_byte=8'h12;
+                5'h18: pfifo_stub_byte=8'h00;
+                5'h19: pfifo_stub_byte=8'hFD;
+                // E9 D31F             jmp near FFF0h (from E01Dh)
+                5'h1A: pfifo_stub_byte=8'hE9;
+                5'h1B: pfifo_stub_byte=8'hD3;
+                5'h1C: pfifo_stub_byte=8'h1F;
+                default: pfifo_stub_byte=8'h90;
+            endcase
+        end
+    endfunction
+
+    wire [20:0] mem_addr_live = {lpc_addr[20:4], lad_in};
+    wire pfifo_reset_hit = pfifo_arm &&
+                           (mem_addr_live[20:4] == PFIFO_RESET_BASE[20:4]) &&
+                           (mem_addr_live[3:0] <= 4'h2);
+    wire pfifo_stub_hit  = pfifo_arm &&
+                           (mem_addr_live[20:5] == PFIFO_STUB_BASE[20:5]) &&
+                           (mem_addr_live[4:0] <= 5'h1C);
+    wire pfifo_overlay_hit = pfifo_reset_hit || pfifo_stub_hit;
+
+    wire [7:0] pfifo_overlay_data = pfifo_reset_hit
+        ? ((mem_addr_live[1:0] == 2'd0) ? 8'hE9 :
+           (mem_addr_live[1:0] == 2'd1) ? 8'h0D : 8'hE0) // jmp E000h
+        : pfifo_stub_byte(mem_addr_live[4:0]);
+
+    // Qualifying 0xEF write at the end of the host write-data phase. The main
+    // FSM still handles the normal bank-select pulse; this parallel latch only
+    // remembers whether the following warm boot needs the PFIFO trampoline.
+    wire [7:0] pfifo_ef_value = {lad_in, write_data[3:0]};
+    wire pfifo_ef_commit = (state == WRITE_DATA1) &&
+                           (cycle_type == CYC_IO_WRITE) &&
+                           (lpc_addr[15:0] == PORT_00EF);
+    wire pfifo_ef_is_user = (pfifo_ef_value >= 8'h03) &&
+                            (pfifo_ef_value <= 8'h09);
+
+    // Clear as soon as the final byte of the near jump back to FFF0 is fetched.
+    // Nonblocking semantics guarantee that final byte is still served from the
+    // overlay on this clock; subsequent target fetches see the real BIOS.
+    wire pfifo_stub_last_fetch = (state == ADDRESS) &&
+                                 (cycle_type == CYC_MEM_READ) &&
+                                 (count == 4'd0) && pfifo_arm &&
+                                 (mem_addr_live == PFIFO_STUB_LAST);
+
+    always @(posedge clk) begin
+        if (pfifo_stub_last_fetch)
+            pfifo_arm <= 1'b0;
+        else if (pfifo_ef_commit)
+            pfifo_arm <= pfifo_fix_enable && pfifo_ef_is_user;
+    end
+
     // -------------------------------------------------------------------------
     // Response acceptance window for mem_valid.
     // -------------------------------------------------------------------------
@@ -270,19 +392,6 @@ module eos_lpc_loader #(
     wire mem_accept      = mem_valid && (cycle_type == CYC_MEM_READ)
                                      && !byte_ready
                                      && mem_resp_window;
-
-    always @(*) begin
-        case (state)
-            TAR2:          lad_out = 4'b1111;             // target turnaround
-            SYNCING:       lad_out = SYNC_WAIT;           // 0101 wait sync
-            SYNC_COMPLETE: lad_out = SYNC_READY;          // 0000 ready
-            SYNC_ABORT:    lad_out = SYNC_ERR;            // 1010 error, no data
-            READ_DATA0:    lad_out = read_buffer[3:0];    // low nibble first
-            READ_DATA1:    lad_out = read_buffer[7:4];    // high nibble second
-            TAR_EXIT:      lad_out = 4'b1111;             // peripheral-to-host turnaround
-            default:       lad_out = 4'b1111;
-        endcase
-    end
 
     // -------------------------------------------------------------------------
     // Main LPC FSM
@@ -316,6 +425,9 @@ module eos_lpc_loader #(
             io_wr_data     <= 8'd0;
             io_rd_stb      <= 1'b0;
             io_rd_addr     <= 16'd0;
+
+            lad_out        <= 4'b1111;
+            {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b0000;
         end else begin
             mem_req <= 1'b0;
             ef_wr   <= 1'b0;
@@ -337,15 +449,16 @@ module eos_lpc_loader #(
 
                 // -------------------------------------------------------------
                 // LPC START.
-                // START field is 0000.
-                // LFRAME# is intentionally not required in this build.
+                // A valid START requires LFRAME# asserted with LAD=0000.
                 // -------------------------------------------------------------
                 WAIT_START: begin
+                    lad_out        <= 4'b1111;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b0000;
                     lpc_addr       <= 21'd0;
                     count          <= 4'd0;
                     byte_ready     <= 1'b0;
 
-                    if (lad_in == 4'h0)
+                    if (lpc_start)
                         state <= CYCTYPE;
                 end
 
@@ -362,6 +475,8 @@ module eos_lpc_loader #(
                 // serving_mem) on entry to ADDRESS, one clock later.
                 // -------------------------------------------------------------
                 CYCTYPE: begin
+                    lad_out        <= 4'b1111;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b0000;
                     lpc_addr       <= 21'd0;
                     byte_ready     <= 1'b0;
 
@@ -414,6 +529,8 @@ module eos_lpc_loader #(
                 // already registered in lpc_addr, the last nibble is live on LAD.
                 // -------------------------------------------------------------
                 ADDRESS: begin
+                    lad_out <= 4'b1111;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b0000;
                     if (cycle_type == CYC_MEM_READ || cycle_type == CYC_MEM_WRITE) begin
                         if (count == 4'd5) begin
                             lpc_addr[20] <= lad_in[0];
@@ -436,10 +553,19 @@ module eos_lpc_loader #(
                             };
 
                             if (cycle_type == CYC_MEM_READ) begin
-                                // Request byte from SDRAM backend.
-                                mem_req    <= 1'b1;
-                                byte_ready <= 1'b0;
-                                state      <= TAR1;
+                                // One-shot reset-vector/stub overlay for the
+                                // PFIFO workaround. Overlay reads complete
+                                // locally; every other byte follows the normal
+                                // SDRAM backend path unchanged.
+                                if (pfifo_overlay_hit) begin
+                                    read_buffer <= pfifo_overlay_data;
+                                    byte_ready  <= 1'b1;
+                                    state       <= TAR1;
+                                end else begin
+                                    mem_req    <= 1'b1;
+                                    byte_ready <= 1'b0;
+                                    state      <= TAR1;
+                                end
                             end else begin
                                 // MEM_WRITE: consume two host data nibbles, then ACK.
                                 write_data <= 8'd0;
@@ -497,11 +623,15 @@ module eos_lpc_loader #(
                 // FPGA remains Hi-Z here.
                 // -------------------------------------------------------------
                 WRITE_DATA0: begin
+                    lad_out          <= 4'b1111;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b0000;
                     write_data[3:0] <= lad_in;
                     state           <= WRITE_DATA1;
                 end
 
                 WRITE_DATA1: begin
+                    lad_out          <= 4'b1111;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b0000;
                     write_data[7:4] <= lad_in;
 
                     // Commit minimal IO writes.
@@ -534,7 +664,9 @@ module eos_lpc_loader #(
                 // Hi-Z for one LPC clock.
                 // -------------------------------------------------------------
                 TAR1: begin
-                    state <= TAR2;
+                    lad_out <= 4'b1111;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b1111;
+                    state   <= TAR2;
                 end
 
                 // -------------------------------------------------------------
@@ -542,6 +674,8 @@ module eos_lpc_loader #(
                 // Drive 1111 for one LPC clock.
                 // -------------------------------------------------------------
                 TAR2: begin
+                    lad_out  <= SYNC_WAIT;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b1111;
                     sync_cnt <= {SYNC_CNT_W{1'b0}};
                     state    <= SYNCING;
                 end
@@ -554,13 +688,17 @@ module eos_lpc_loader #(
                 // MEM_READ can actually wait here.
                 // -------------------------------------------------------------
                 SYNCING: begin
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b1111;
                     if (byte_ready) begin
-                        state <= SYNC_COMPLETE;
+                        lad_out <= SYNC_READY;
+                        state   <= SYNC_COMPLETE;
                     end else if (sync_cnt == SYNC_TIMEOUT[SYNC_CNT_W-1:0] - 1'b1) begin
                         // Backend never answered. Abandon the cycle cleanly
                         // rather than hanging LAD and LFRAME# forever.
-                        state <= SYNC_ABORT;
+                        lad_out <= SYNC_ERR;
+                        state   <= SYNC_ABORT;
                     end else begin
+                        lad_out  <= SYNC_WAIT;
                         sync_cnt <= sync_cnt + 1'b1;
                     end
                 end
@@ -571,7 +709,9 @@ module eos_lpc_loader #(
                 // TAR_EXIT, releasing LFRAME# on the usual edge.
                 // -------------------------------------------------------------
                 SYNC_ABORT: begin
-                    state <= TAR_EXIT;
+                    lad_out <= 4'b1111;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b1111;
+                    state   <= TAR_EXIT;
                 end
 
                 // -------------------------------------------------------------
@@ -581,29 +721,41 @@ module eos_lpc_loader #(
                 // mem_resp_window, which excludes every state below.
                 // -------------------------------------------------------------
                 SYNC_COMPLETE: begin
-                    if (cycle_type == CYC_MEM_READ || cycle_type == CYC_IO_READ)
-                        state <= READ_DATA0;
-                    else
-                        state <= TAR_EXIT;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b1111;
+                    if (cycle_type == CYC_MEM_READ || cycle_type == CYC_IO_READ) begin
+                        lad_out <= read_buffer[3:0];
+                        state   <= READ_DATA0;
+                    end else begin
+                        lad_out <= 4'b1111;
+                        state   <= TAR_EXIT;
+                    end
                 end
 
                 READ_DATA0: begin
-                    state <= READ_DATA1;
+                    lad_out <= read_buffer[7:4];
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b1111;
+                    state   <= READ_DATA1;
                 end
 
                 READ_DATA1: begin
-                    state <= TAR_EXIT;
+                    lad_out <= 4'b1111;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b1111;
+                    state   <= TAR_EXIT;
                 end
 
                 // Clearing cycle_type here is what drops serving_mem (and thus
                 // LFRAME#) at the end of every served OR abandoned cycle.
                 TAR_EXIT: begin
+                    lad_out    <= 4'b1111;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b0000;
                     cycle_type <= CYC_IO_READ;
                     state      <= WAIT_START;
                 end
 
                 default: begin
-                    state <= WAIT_START;
+                    lad_out <= 4'b1111;
+                    {lad_oe3_r, lad_oe2_r, lad_oe1_r, lad_oe0_r} <= 4'b0000;
+                    state   <= WAIT_START;
                 end
 
             endcase

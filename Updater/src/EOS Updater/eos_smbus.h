@@ -1,4 +1,4 @@
-#pragma once
+
 // eos_smbus.h -- Xbox-side SMBus master to the Eos control device at 7-bit 0x6E.
 //
 // Uses the Xbox kernel HAL (HalReadSMBusValue / HalWriteSMBusValue) for all
@@ -33,6 +33,9 @@
 #define EOS_REG_ARG1      0x12
 #define EOS_REG_ARG2      0x13
 #define EOS_REG_ARG3      0x14
+#define EOS_REG_ADVSTAT   0x15     /* diagnostic: bit0 busy, bit1 valid, bit2 NACK */
+#define EOS_REG_ADVDATA   0x16     /* diagnostic: raw ADV7511 register byte */
+#define EOS_REG_ADVREG    0x17     /* diagnostic: echoed ADV register index */
 
 /* engine status (0x05) bits */
 #define EOS_ST_ARMED      0x01
@@ -63,6 +66,8 @@
 #define EOS_CMD_SETLOCK   0x37
 #define EOS_CMD_LEDMODE   0x38     /* arg0: 0=normal, 1=rainbow */
 #define EOS_CMD_DESCRELOAD 0x39   /* FPGA re-reads bank 0xF descriptor */
+#define EOS_CMD_ADVREAD    0x3B   /* read-only ADV7511 register diagnostic; ARG0=reg */
+#define EOS_CMD_ADVTRACE   0x3C   /* read transaction trace; ARG0=index, ARG1=field */
 
 #define EOS_CMD(region, action)  (BYTE)(((region) << 4) | (action))
 
@@ -90,6 +95,12 @@ BOOL Smb_Validate(BYTE region);                      /* async: poll Smb_WaitDone
 BOOL Smb_Commit(BYTE region);                        /* async: poll Smb_WaitDone */
 BOOL Smb_Clear(void);                                /* disarm + invalidate + scr_clear */
 BOOL Smb_SetLedMode(BYTE mode);                      /* 0=normal, 1=rainbow (updater active) */
+
+/* Read one raw ADV7511 register through EOS's private I2C master. This uses
+   only native EOS address 0x6E and never touches X-HD compatibility address
+   0x69. Returns FALSE on timeout, bridge error or ADV NACK. */
+BOOL Smb_AdvReadReg(BYTE reg, BYTE* val);
+BOOL Smb_AdvTraceRead(BYTE entry, BYTE field, BYTE* val);
 
 /* Poll engine status until BUSY clears or timeout. Returns the final status
    byte (check EOS_ST_VALID / EOS_ST_COMMITOK / EOS_ST_ERR); 0xFF on bus error. */

@@ -29,6 +29,7 @@ void        Theme_Init(void);          // apply the theme index saved in config
 int         Theme_Count(void);
 const char* Theme_Name(int idx);       // name of theme idx (NULL if out of range)
 int         Theme_Index(void);         // current active index
+int         Theme_BgIsModel(void);     // 1 = Darkone 83 embedded model/plasma backdrop
 void        Theme_Set(int idx);        // apply + persist (clamped)
 void        Theme_Preview(int idx);    // apply only, no persist (live picker)
 void        Theme_Commit(void);        // persist whatever is currently applied

@@ -6,7 +6,7 @@
 //   serial_clk  371.25 MHz   Gowin_rPLL  -> u_hpll/rpll_inst/CLKOUT   (27*55/4)
 //   pix_clk      74.25 MHz   CLKDIV /5 of serial_clk -> u_clkdiv/CLKOUT
 //   clk_sd       64.80 MHz   eos_sdram_pll -> u_spll/u_pll/CLKOUT     (27*12/5)
-//   clk_sdp      64.80 MHz   eos_sdram_pll -> u_spll/u_pll/CLKOUTP    (180 deg)
+//   clk_sdp      64.80 MHz   eos_sdram_pll -> u_spll/u_pll/CLKOUTP    (phase shifted)
 //   lpc_lclk     33.33 MHz   Xbox LPC clock (port); the loader runs DIRECTLY on it
 //
 // lpc_lreset_n used to appear here as a phantom clock: eos_serve_hud contained
@@ -86,16 +86,24 @@ set_clock_groups -asynchronous -group [get_clocks {sys_clk}] -group [get_clocks 
 //   set_false_path -from [get_clocks {lpc_lclk}] -to [get_clocks {sys_clk}]
 
 // ---------------------------------------------------------------------------
-// LPC pad timing (TODO -- bench-derived, not yet applied)
+// Xbox LPC pad timing
 // ---------------------------------------------------------------------------
 //
-// lpc_lad / lpc_lframe_n have no input/output delay, so the pad-to-reg and
-// reg-to-pad legs of the LPC path are unconstrained; only the internal
-// reg-to-reg leg is checked. Once MCPX Tco/Tsu are confirmed on the scope:
+// Model the standard 33 MHz LPC launch window at the package pins. LPC data
+// and frame signals are launched after the LCLK rising edge and are expected
+// to be valid within the 2 ns .. 11 ns output-valid window. These constraints
+// make the previously-unconstrained pad-to-register and register-to-pad legs
+// visible to timing-driven placement/routing.
 //
-//   set_input_delay  -clock lpc_lclk -max <t_co_max> [get_ports {lpc_lad[*]}]
-//   set_input_delay  -clock lpc_lclk -min <t_co_min> [get_ports {lpc_lad[*]}]
-//   set_output_delay -clock lpc_lclk -max <t_su>     [get_ports {lpc_lad[*]}]
-//   set_output_delay -clock lpc_lclk -min <-t_h>     [get_ports {lpc_lad[*]}]
-//
-// Do not add guessed numbers. Leaving these out is the current, working state.
+// Incoming host-driven LAD and LFRAME#.  The host launches on LCLK and EOS
+// captures on the following rising edge.
+set_input_delay -clock lpc_lclk -min 2.000 [get_ports {lpc_lad*}]
+set_input_delay -clock lpc_lclk -max 11.000 [get_ports {lpc_lad*}]
+set_input_delay -clock lpc_lclk -min 2.000 [get_ports {lpc_lframe_n}]
+set_input_delay -clock lpc_lclk -max 11.000 [get_ports {lpc_lframe_n}]
+
+// EOS-driven LAD.  Constrain clock-to-pad launch directly to the LPC output
+// valid window.  This is intentionally applied as max/min path delay rather
+// than another FSM stage, so it costs no logic and gives P&R a physical target.
+set_max_delay -from [get_clocks {lpc_lclk}] -to [get_ports {lpc_lad*}] 11.000
+set_min_delay -from [get_clocks {lpc_lclk}] -to [get_ports {lpc_lad*}] 2.000

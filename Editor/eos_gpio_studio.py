@@ -38,7 +38,7 @@ def _valid_name(s: str) -> str:
     s = re.sub(r"[^A-Za-z0-9_]", "_", (s or "").strip())
     if not s: s = "LEVEL"
     if s[0].isdigit(): s = "R_" + s
-    return s.upper()[:24]
+    return s.upper()[:16]
 
 
 def usable_pins(target: str):

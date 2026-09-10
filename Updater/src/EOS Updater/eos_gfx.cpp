@@ -120,7 +120,8 @@ bool Gfx_Init()
     pp.BackBufferFormat = D3DFMT_A8R8G8B8;
     pp.BackBufferCount = 1;
     pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    pp.EnableAutoDepthStencil = FALSE;
+    pp.EnableAutoDepthStencil = TRUE;              // Darkone83 model needs depth
+    pp.AutoDepthStencilFormat = D3DFMT_D24S8;
     pp.Flags = ppFlags;
     pp.FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_ONE;
 
@@ -243,7 +244,7 @@ void Gfx_Shutdown()
 
 void Gfx_Begin(DWORD clear_argb)
 {
-    g_dev->Clear(0, NULL, D3DCLEAR_TARGET, clear_argb, 1.0f, 0);
+    g_dev->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, clear_argb, 1.0f, 0);
     g_dev->BeginScene();
     SetState2D();
 }
@@ -550,11 +551,25 @@ void Gfx_Quad3DP(float cx, float cy, float cz, float ca, float sa,
 void Gfx_PillX3D(float cx, float cy, float cz, float ca, float sa,
     float hw, float hh, DWORD c)
 {
-    float mid = hw - hh;                 // half-width of the flat middle section
-    if (mid < 0.0f) { hw = hh; mid = 0.0f; }
-    if (mid > 0.0f)
-        Gfx_Quad3DP(cx, cy, cz, ca, sa, 0.0f, 0.0f, mid, hh, c, s_white, 0.0f, 0.0f, 1.0f, 1.0f);
-    // left cap = left half of the disc; right cap = right half.
-    Gfx_Quad3DP(cx, cy, cz, ca, sa, -(mid + hh * 0.5f), 0.0f, hh * 0.5f, hh, c, s_discTex, 0.0f, 0.0f, 0.5f, 1.0f);
-    Gfx_Quad3DP(cx, cy, cz, ca, sa, (mid + hh * 0.5f), 0.0f, hh * 0.5f, hh, c, s_discTex, 0.5f, 0.0f, 1.0f, 1.0f);
+    float mid;
+
+    mid = hw - hh;
+    if (mid < 0.0f) {
+        hw = hh;
+        mid = 0.0f;
+    }
+
+    if (mid > 0.0f) {
+        Gfx_Quad3DP(cx, cy, cz, ca, sa,
+            0.0f, 0.0f, mid, hh, c, s_white,
+            0.0f, 0.0f, 1.0f, 1.0f);
+    }
+
+    // Left cap = left half of the disc; right cap = right half.
+    Gfx_Quad3DP(cx, cy, cz, ca, sa,
+        -(mid + hh * 0.5f), 0.0f, hh * 0.5f, hh, c, s_discTex,
+        0.0f, 0.0f, 0.5f, 1.0f);
+    Gfx_Quad3DP(cx, cy, cz, ca, sa,
+        (mid + hh * 0.5f), 0.0f, hh * 0.5f, hh, c, s_discTex,
+        0.5f, 0.0f, 1.0f, 1.0f);
 }

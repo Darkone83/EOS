@@ -20,11 +20,11 @@ def usable_pins(target: str):
     return [f"EXP{i}" for i in range(4, 9)] if target.upper() == "HD" else [f"EXP{i}" for i in range(1, 9)]
 
 
-def clean_name(s: str, default="ITEM"):
+def clean_name(s: str, default="ITEM", max_len=16):
     s = re.sub(r"[^A-Za-z0-9_]", "_", (s or "").strip())
     if not s: s = default
     if s[0].isdigit(): s = "N_" + s
-    return s.upper()[:24]
+    return s.upper()[:max_len]
 
 
 def parse_hex_bytes(text: str):
@@ -94,7 +94,7 @@ def build_doorbell_script(*, target, scl, sda, dev_name, addr, poll_ms, regs, cm
             if r: acts.append(f"I2CW {dev} VOL {r.name} {r.width}")
         if c.op == "Write Fixed Bytes":
             hx = parse_hex_bytes(c.fixed) or "00"
-            dn = f"payload_{c.name.lower()}"
+            dn = f"PAYLOAD_{c.code:02X}"  # deterministic and always <= 16 chars
             data_defs.append((dn, hx)); acts.append(f"I2CW {dev} {dn}")
         if c.op in ("Read Register", "Write Register + Read Register"):
             r = regmap.get(c.rx)
@@ -185,7 +185,7 @@ class I2cStudioDialog(QDialog):
         self.tbl_regs = QTableWidget(0,3); self.tbl_regs.setHorizontalHeaderLabels(["Name", "Width", "Offset"])
         self.tbl_regs.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch); self.tbl_regs.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeToContents); self.tbl_regs.horizontalHeader().setSectionResizeMode(2,QHeaderView.ResizeToContents)
         rv.addWidget(self.tbl_regs)
-        rb = QHBoxLayout(); a=QPushButton("+ Register"); a.clicked.connect(lambda: self.add_reg()); d=QPushButton("− Remove"); d.clicked.connect(self.remove_reg); rb.addWidget(a); rb.addWidget(d); rb.addStretch(1); rv.addLayout(rb)
+        rb = QHBoxLayout(); a=QPushButton("+ Register"); a.clicked.connect(self.add_reg); d=QPushButton("− Remove"); d.clicked.connect(self.remove_reg); rb.addWidget(a); rb.addWidget(d); rb.addStretch(1); rv.addLayout(rb)
         left.addWidget(rg, 1)
 
         cg = QGroupBox("Doorbell Commands")
@@ -193,7 +193,7 @@ class I2cStudioDialog(QDialog):
         self.tbl_cmds = QTableWidget(0,6); self.tbl_cmds.setHorizontalHeaderLabels(["Name","Code","Operation","TX Register","RX Register","Fixed Hex"])
         self.tbl_cmds.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         cv.addWidget(self.tbl_cmds)
-        cb = QHBoxLayout(); a=QPushButton("+ Command"); a.clicked.connect(lambda: self.add_cmd()); d=QPushButton("− Remove"); d.clicked.connect(self.remove_cmd); cb.addWidget(a); cb.addWidget(d); cb.addStretch(1); cv.addLayout(cb)
+        cb = QHBoxLayout(); a=QPushButton("+ Command"); a.clicked.connect(self.add_cmd); d=QPushButton("− Remove"); d.clicked.connect(self.remove_cmd); cb.addWidget(a); cb.addWidget(d); cb.addStretch(1); cv.addLayout(cb)
         left.addWidget(cg, 1)
 
         opt = QHBoxLayout(); opt.addWidget(QLabel("Idle poll")); self.sp_poll=QSpinBox(); self.sp_poll.setRange(1,1000); self.sp_poll.setValue(10); self.sp_poll.setSuffix(" ms"); opt.addWidget(self.sp_poll); opt.addStretch(1); left.addLayout(opt)
@@ -237,7 +237,8 @@ class I2cStudioDialog(QDialog):
             try: width=int(self.tbl_regs.item(r,1).text())
             except Exception: width=1
             width=max(1,min(64,width));
-            if name in seen: name=f"{name}_{r+1}"
+            if name in seen:
+                suffix=f"_{r+1}"; name=name[:16-len(suffix)] + suffix
             seen.add(name); out.append(RegDef(name,width,off))
             self.tbl_regs.setItem(r,2,QTableWidgetItem(f"0x{off:02X}–0x{off+width-1:02X}" if width>1 else f"0x{off:02X}")); self.tbl_regs.item(r,2).setFlags(self.tbl_regs.item(r,2).flags() & ~Qt.ItemIsEditable)
             off += width
@@ -256,8 +257,9 @@ class I2cStudioDialog(QDialog):
     def _cmds(self):
         out=[]; seen=set()
         for r in range(self.tbl_cmds.rowCount()):
-            name=clean_name(self.tbl_cmds.item(r,0).text() if self.tbl_cmds.item(r,0) else "CMD", "CMD")
-            if name in seen: name=f"{name}_{r+1}"
+            name=clean_name(self.tbl_cmds.item(r,0).text() if self.tbl_cmds.item(r,0) else "CMD", "CMD", 12)
+            if name in seen:
+                suffix=f"_{r+1}"; name=name[:12-len(suffix)] + suffix
             seen.add(name)
             t=(self.tbl_cmds.item(r,1).text() if self.tbl_cmds.item(r,1) else "1").strip()
             try: code=int(t,0)
@@ -296,6 +298,7 @@ class I2cStudioDialog(QDialog):
         problems=[]
         if self.cb_scl.currentText()==self.cb_sda.currentText(): problems.append("SCL and SDA must use different pins")
         if regs and regs[-1].offset+regs[-1].width>0xF8: problems.append("register map reaches reserved volatile space 0xF8–0xFF")
+        if regs and regs[-1].offset+regs[-1].width>32: problems.append("pin-def mailbox bank exceeds 32-byte ABI limit (CMD + DOORBELL + REGs)")
         if self.tabs.currentIndex()==0:
             if self.cb_recipe.currentText() in ("Write Loop","Write + Read Loop") and parse_hex_bytes(self.ed_write.text()) is None: problems.append("write bytes must be an even number of hex digits (max 256 bytes)")
             if self.cb_recipe.currentText() in ("Read Loop","Write + Read Loop") and self.sp_dest.value()+self.sp_readlen.value()>0xF8: problems.append("read destination would overlap reserved volatile space 0xF8–0xFF")
@@ -307,14 +310,9 @@ class I2cStudioDialog(QDialog):
                 if c.op in ("Write Register","Write Register + Read Register") and c.tx not in rnames: problems.append(f"{c.name}: choose a valid TX register")
                 if c.op in ("Read Register","Write Register + Read Register") and c.rx not in rnames: problems.append(f"{c.name}: choose a valid RX register")
                 if c.op=="Write Fixed Bytes" and parse_hex_bytes(c.fixed) is None: problems.append(f"{c.name}: Fixed Hex is invalid")
-        # refresh_all() is also used while the default Doorbell rows are being
-        # seeded inside _build_doorbell_tab().  At that point the bottom status
-        # bar has not been constructed yet, so keep validation state but defer
-        # touching the widget until it exists.
-        self._problems = problems
-        if hasattr(self, "lbl_status"):
-            self.lbl_status.setText("⚠ " + problems[0] if problems else "✓ ready")
-            self.lbl_status.setStyleSheet("color:#ff8a80;" if problems else "color:#7ee787;")
+        self.lbl_status.setText("⚠ " + problems[0] if problems else "✓ ready")
+        self.lbl_status.setStyleSheet("color:#ff8a80;" if problems else "color:#7ee787;")
+        self._problems=problems
 
     def _blocked(self):
         self.refresh_all()

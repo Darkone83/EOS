@@ -241,6 +241,56 @@ BOOL Smb_SetLedMode(BYTE mode)
     return Smb_CommandArgs(EOS_CMD_LEDMODE, (BYTE)(mode & 0x03), 0, 0, 0);
 }
 
+BOOL Smb_AdvReadReg(BYTE reg, BYTE* val)
+{
+    int waited;
+    BYTE st = 0, data = 0, echo = 0;
+
+    // ARG0 is the register index; the remaining args are deliberately zeroed so
+    // the diagnostic command has a deterministic trace in the native register map.
+    if (!Smb_CommandArgs(EOS_CMD_ADVREAD, reg, 0, 0, 0)) return FALSE;
+
+    // The FPGA services diagnostic reads only between complete X-HD loop
+    // iterations. A mode apply can therefore delay us briefly; 250 ms is far
+    // beyond one private-bus register read while remaining bounded if HD is absent.
+    for (waited = 0; waited < 250; ++waited) {
+        if (Smb_ReadReg(EOS_REG_ADVSTAT, &st)) {
+            if ((st & 0x02) && !(st & 0x01)) {
+                if (st & 0x04) return FALSE;
+                if (!Smb_ReadReg(EOS_REG_ADVREG, &echo) || echo != reg) return FALSE;
+                if (!Smb_ReadReg(EOS_REG_ADVDATA, &data)) return FALSE;
+                if (val) *val = data;
+                return TRUE;
+            }
+        }
+        KeStallExecutionProcessor(1000);
+    }
+    return FALSE;
+}
+
+
+BOOL Smb_AdvTraceRead(BYTE entry, BYTE field, BYTE* val)
+{
+    int waited;
+    BYTE st = 0, data = 0, echo = 0;
+
+    if (!Smb_CommandArgs(EOS_CMD_ADVTRACE, entry, field, 0, 0)) return FALSE;
+
+    for (waited = 0; waited < 250; ++waited) {
+        if (Smb_ReadReg(EOS_REG_ADVSTAT, &st)) {
+            if ((st & 0x02) && !(st & 0x01)) {
+                if (st & 0x04) return FALSE;
+                if (!Smb_ReadReg(EOS_REG_ADVREG, &echo) || echo != entry) return FALSE;
+                if (!Smb_ReadReg(EOS_REG_ADVDATA, &data)) return FALSE;
+                if (val) *val = data;
+                return TRUE;
+            }
+        }
+        KeStallExecutionProcessor(1000);
+    }
+    return FALSE;
+}
+
 /* ---- wait for an async op (VALIDATE / COMMIT) ----------------------------- */
 BYTE Smb_WaitDone(int timeout_ms)
 {

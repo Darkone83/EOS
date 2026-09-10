@@ -8,11 +8,12 @@
 //Device Version: C
 //Created Time: Wed Jun 24 08:23:38 2026
 
-module Gowin_rPLL (clkout, lock, clkin);
+module Gowin_rPLL (clkout, lock, clkin, reset);
 
 output clkout;
 output lock;
 input clkin;
+input reset;
 
 wire clkoutp_o;
 wire clkoutd_o;
@@ -27,8 +28,8 @@ rPLL rpll_inst (
     .CLKOUTP(clkoutp_o),
     .CLKOUTD(clkoutd_o),
     .CLKOUTD3(clkoutd3_o),
-    .RESET(gw_gnd),
-    .RESET_P(gw_gnd),
+    .RESET(reset),
+    .RESET_P(reset),
     .CLKIN(clkin),
     .CLKFB(gw_gnd),
     .FBDSEL({gw_gnd,gw_gnd,gw_gnd,gw_gnd,gw_gnd,gw_gnd}),

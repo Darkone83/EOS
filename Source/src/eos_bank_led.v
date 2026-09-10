@@ -17,13 +17,16 @@ module eos_bank_led #(
     input  wire        rstn,          // interface parity; not gated (free-running)
     input  wire [2:0]  show_mode,
     input  wire [23:0] show_rgb,      // packed {R,G,B}
+    input  wire [24:0] phase,         // shared free-running heartbeat (top `hb`); breathe timebase
     output reg  [23:0] grb            // WS2812 GRB
 );
     // ---- breathing ramp ----------------------------------------------------
-    // 25-bit phase; bit24 selects rising/falling half, bits[23:16] are the ramp
-    // position, giving a smooth 0..255..0 triangle over ~1.24 s at 27 MHz.
-    reg [24:0] phase = 25'd0;
-    always @(posedge clk) phase <= phase + 25'd1;
+    // The 25-bit breathe phase is supplied by the caller (top-level `hb`), a
+    // free-running sys_clk counter. It was previously duplicated here; the two
+    // counters were bit-identical and the synthesiser merged them (DI0019), so
+    // the timebase is now shared explicitly instead. bit24 selects the
+    // rising/falling half and bits[23:16] are the ramp position, giving a
+    // smooth 0..255..0 triangle over ~1.24 s at 27 MHz.
     wire [7:0] ramp = phase[24] ? (8'd255 - phase[23:16]) : phase[23:16];
     // small floor so the breathe never fully blacks out at the trough
     wire [7:0] lvl = (ramp < 8'd16) ? 8'd16 : ramp;

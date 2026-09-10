@@ -4,6 +4,9 @@
 #include "eos_ui.h"
 #include "eos_gfx.h"
 #include "eos_font.h"
+#include "eos_model.h"   // Darkone 83 skin: embedded 3D model
+#include "eos_plasma.h"  // Darkone 83 skin: plasma field behind model
+#include "eos_theme.h"
 
 
 // ---- 3D parallax orb field --------------------------------------------
@@ -81,14 +84,26 @@ static void orbsDraw(void)
     }
 }
 
-// Solid base fill, then the real 3D parallax field behind everything.
+// Solid base fill, then the active themed background. Darkone 83 mirrors the
+// loader: computed plasma in the 2D pass, then the embedded character mesh in
+// the depth-tested 3D pass. Any model init failure falls back to normal orbs.
 void Ui_Backdrop(void)
 {
+    float tsec;
     Gfx_Fill(0, 0, (float)g_scrW, (float)g_scrH, EOS_BG);
-    orbsStep();
-    Gfx_Begin3D();
-    orbsDraw();
-    Gfx_End3D();
+    if (Theme_BgIsModel() && Model_Init()) {
+        tsec = (float)GetTickCount() * 0.001f;
+        Plasma_Draw(tsec);
+        Gfx_Begin3D();
+        Model_Draw(tsec);
+        Gfx_End3D();
+    }
+    else {
+        orbsStep();
+        Gfx_Begin3D();
+        orbsDraw();
+        Gfx_End3D();
+    }
 }
 
 // Soft accent halo behind a selected pill.

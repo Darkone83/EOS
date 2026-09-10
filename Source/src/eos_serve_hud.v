@@ -111,7 +111,7 @@ module eos_serve_hud (
 
     // ---- microcode ROM (synchronous, block_ram) ----
     localparam [4:0] HK_HEX=5'd0, HK_STR=5'd1, HK_BOOL=5'd2, HK_VER=5'd3, HK_BAR=5'd4, HK_NOP=5'd31;
-    (* syn_romstyle = "block_ram" *) reg [31:0] hud_micro [0:255];
+    (* syn_romstyle = "block_rom" *) reg [31:0] hud_micro [0:255];
     initial $readmemh("eos_hud_microcode.hex", hud_micro);
     reg [7:0]  hud_rom_addr = 8'd0;
     reg [31:0] hud_rom_q    = 32'd0;

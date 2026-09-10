@@ -39,9 +39,9 @@ module sdram
     parameter [3:0]   CAS  = 4'd2,     // 2/3 cycles, set in mode register
     parameter [3:0]   T_WR = 4'd2,     // 2 cycles, write recovery
     parameter [3:0]   T_MRD= 4'd2,     // 2 cycles, mode register set
-    parameter [3:0]   T_RP = 4'd1,     // 15ns, precharge to active
-    parameter [3:0]   T_RCD= 4'd1,     // 15ns, active to r/w
-    parameter [3:0]   T_RC = 4'd4      // 60ns, ref/active to ref/active
+    parameter [3:0]   T_RP = 4'd2,     // conservative precharge-to-active margin
+    parameter [3:0]   T_RCD= 4'd2,     // conservative active-to-read/write margin
+    parameter [3:0]   T_RC = 4'd5      // conservative refresh/activate cycle margin
 )
 (
     // SDRAM side interface
@@ -251,7 +251,7 @@ end
 //
 // Generate cfg_now pulse after initialization delay (normally 200us)
 //
-reg  [14:0]   rst_cnt;
+reg  [15:0]   rst_cnt;
 reg rst_done, rst_done_p1, cfg_busy;
   
 always @(posedge clk) begin
@@ -259,7 +259,7 @@ always @(posedge clk) begin
     cfg_now     <= rst_done & ~rst_done_p1;// Rising Edge Detect
 
     if (rst_cnt != FREQ / 1000 * 200 / 1000) begin      // count to 200 us
-        rst_cnt  <= rst_cnt[14:0] + 1;
+        rst_cnt  <= rst_cnt[14:0] + 1'b1;
         rst_done <= 1'b0;
         cfg_busy <= 1'b1;
     end else begin
@@ -268,7 +268,7 @@ always @(posedge clk) begin
     end
 
     if (~resetn) begin
-        rst_cnt  <= 15'd0;
+        rst_cnt  <= 16'd0;
         rst_done <= 1'b0;
         cfg_busy <= 1'b1;
     end

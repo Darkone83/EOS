@@ -134,6 +134,17 @@ module eos_sdram_backend #(
     output reg         scr_rvalid,      // 1-cycle pulse when scr_rdata valid
     output wire        scr_busy,        // 1 while a scratch op is queued/in flight
 
+    // ---- X-HD private SDRAM lane (0x5C0000..0x5FFFFF, 256 KB) ----
+    // Kept physically separate from updater/EXP scratch at 0x600000+ and from
+    // the SD-card lane ending at 0x5BFFFF. eos_hd.v owns the contents/meaning.
+    input  wire        xhd_mem_wr,
+    input  wire        xhd_mem_rd,
+    input  wire [15:0] xhd_mem_addr,    // byte offset within 64 KB virtual STM flash
+    input  wire [7:0]  xhd_mem_wdata,
+    output reg  [7:0]  xhd_mem_rdata,
+    output reg         xhd_mem_rvalid,  // 1-cycle pulse
+    output wire        xhd_mem_busy,
+
     // ---- NRGN_SDCARD fill port (SD precache -- see eos_sd_precache.v) ----
     // Mirrors scr_wr/scr_waddr/scr_wdata exactly, but targets NRGN_SDCARD, a
     // dedicated 1MB lane of its own -- NOT NRGN_SD, which stays exclusively
@@ -479,18 +490,25 @@ module eos_sdram_backend #(
     localparam S_S1_PWAIT   = 4'd14;   // slot1: check captured magic byte
     localparam S_S1_FILL    = 4'd15;   // slot1: run the 768K window reload
     localparam S_NR_WR      = 5'd16;   // NRGN_SDCARD fill-port write (mirrors S_SCR_WR)
+    localparam S_XHD_WR     = 5'd17;   // X-HD private-lane byte write
+    localparam S_XHD_RD_REQ = 5'd18;   // X-HD private-lane byte read request
+    localparam S_XHD_RD_WAIT= 5'd19;   // X-HD private-lane read completion
 
     reg [4:0] st;
 
     reg        scr_wr_pend, scr_rd_pend;
     reg [20:0] scr_waddr_r, scr_raddr_r;
     reg [7:0]  scr_wdata_r;
+    reg        xhd_wr_pend, xhd_rd_pend;
+    reg [15:0] xhd_waddr_r, xhd_raddr_r;
+    reg [7:0]  xhd_wdata_r;
     reg        nr_wr_pend;
     reg [19:0] nr_waddr_r;
     reg [7:0]  nr_wdata_r;
 
     // Post-flash reload bookkeeping
-    localparam [22:0] SCRATCH_BASE = 23'h60_0000;  // SDRAM serve ceiling (6MB managed)
+    localparam [22:0] XHD_PRIVATE_BASE = 23'h5C_0000; // 256 KB free gap below scratch
+    localparam [22:0] SCRATCH_BASE     = 23'h60_0000;  // SDRAM serve ceiling (6MB managed)
     // §6 EOS script region: a dedicated 128 KB persistent flash block (first free,
     // above the managed CONFIG top). Loaded once after preload into the scratch
     // window the EXP engine reads (its base == SCRATCH_BASE, i.e. flash 0x800000
@@ -563,6 +581,8 @@ module eos_sdram_backend #(
     assign dbg_newrgn_ready = newrgn_ready;
     assign scr_busy      = scr_wr_pend | scr_rd_pend |
                            (st == S_SCR_WR) | (st == S_SCR_RD_REQ) | (st == S_SCR_RD_WAIT);
+    assign xhd_mem_busy  = xhd_wr_pend | xhd_rd_pend |
+                           (st == S_XHD_WR) | (st == S_XHD_RD_REQ) | (st == S_XHD_RD_WAIT);
     assign nr_busy       = nr_wr_pend | (st == S_NR_WR);
 
     always @(posedge sclk or negedge sresetn) begin
@@ -608,6 +628,13 @@ module eos_sdram_backend #(
             scr_waddr_r    <= 21'd0;
             scr_raddr_r    <= 21'd0;
             scr_wdata_r    <= 8'd0;
+            xhd_wr_pend    <= 1'b0;
+            xhd_rd_pend    <= 1'b0;
+            xhd_waddr_r    <= 16'd0;
+            xhd_raddr_r    <= 16'd0;
+            xhd_wdata_r    <= 8'd0;
+            xhd_mem_rvalid <= 1'b0;
+            xhd_mem_rdata  <= 8'd0;
             nr_wr_pend     <= 1'b0;
             nr_waddr_r     <= 20'd0;
             nr_wdata_r     <= 8'd0;
@@ -631,14 +658,21 @@ module eos_sdram_backend #(
             sd_rd      <= 1'b0;
             sd_wr      <= 1'b0;
             sd_refresh <= 1'b0;
-            fr_start   <= 1'b0;
-            scr_rvalid <= 1'b0;
+            fr_start       <= 1'b0;
+            scr_rvalid     <= 1'b0;
+            xhd_mem_rvalid <= 1'b0;
 
             if (scr_wr && !scr_wr_pend && !scr_rd_pend) begin
                 scr_wr_pend <= 1'b1; scr_waddr_r <= scr_waddr; scr_wdata_r <= scr_wdata;
             end
             if (scr_rd && !scr_wr_pend && !scr_rd_pend) begin
                 scr_rd_pend <= 1'b1; scr_raddr_r <= scr_raddr;
+            end
+            if (xhd_mem_wr && !xhd_wr_pend && !xhd_rd_pend) begin
+                xhd_wr_pend <= 1'b1; xhd_waddr_r <= xhd_mem_addr; xhd_wdata_r <= xhd_mem_wdata;
+            end
+            if (xhd_mem_rd && !xhd_wr_pend && !xhd_rd_pend) begin
+                xhd_rd_pend <= 1'b1; xhd_raddr_r <= xhd_mem_addr;
             end
             if (nr_wr && !nr_wr_pend) begin
                 nr_wr_pend <= 1'b1; nr_waddr_r <= nr_waddr; nr_wdata_r <= nr_wdata;
@@ -913,6 +947,10 @@ module eos_sdram_backend #(
                         // before its SDRAM fill finished. Do nothing -- hold the
                         // pending request in S_SERVE; the fill runs from this loop
                         // and once newrgn_ready is set the branch above serves it.
+                        end else if (xhd_wr_pend) begin
+                            st <= S_XHD_WR;
+                        end else if (xhd_rd_pend) begin
+                            st <= S_XHD_RD_REQ;
                         end else if (scr_wr_pend) begin
                             st <= S_SCR_WR;
                         end else if (scr_rd_pend) begin
@@ -1140,6 +1178,41 @@ module eos_sdram_backend #(
                 S_SCR_RD_WAIT: begin
                     if (sd_data_ready) begin
                         scr_rdata  <= sd_dout; scr_rvalid <= 1'b1; st <= S_SERVE;
+                    end
+                end
+
+                // X-HD private SDRAM lane. Same controller/clock domain as the
+                // rest of the backend, but a disjoint physical address window.
+                S_XHD_WR: begin
+                    if (!sd_busy && !op_lock) begin
+                        if (refresh_due) begin
+                            sd_refresh <= 1'b1; op_lock <= 1'b1;
+                        end else begin
+                            sd_addr      <= XHD_PRIVATE_BASE + {7'b0, xhd_waddr_r};
+                            sd_din       <= xhd_wdata_r;
+                            sd_wr        <= 1'b1; op_lock <= 1'b1;
+                            xhd_wr_pend  <= 1'b0; st <= S_SERVE;
+                        end
+                    end
+                end
+
+                S_XHD_RD_REQ: begin
+                    if (!sd_busy && !op_lock) begin
+                        if (refresh_due) begin
+                            sd_refresh <= 1'b1; op_lock <= 1'b1;
+                        end else begin
+                            sd_addr      <= XHD_PRIVATE_BASE + {7'b0, xhd_raddr_r};
+                            sd_rd        <= 1'b1; op_lock <= 1'b1;
+                            xhd_rd_pend  <= 1'b0; st <= S_XHD_RD_WAIT;
+                        end
+                    end
+                end
+
+                S_XHD_RD_WAIT: begin
+                    if (sd_data_ready) begin
+                        xhd_mem_rdata  <= sd_dout;
+                        xhd_mem_rvalid <= 1'b1;
+                        st             <= S_SERVE;
                     end
                 end
 

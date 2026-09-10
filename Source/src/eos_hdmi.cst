@@ -18,18 +18,14 @@ IO_PORT "tmds_d_p[2]" IO_TYPE=LVDS25 PULL_MODE=NONE DRIVE=3.5 BANK_VCCIO=3.3;
 IO_LOC  "sys_clk" 4;
 IO_PORT "sys_clk" IO_TYPE=LVCMOS33 PULL_MODE=UP;
 
-// ===== reset button S1 (POR does the real reset; kept for completeness) =====
-IO_LOC  "rst_btn" 88;
-IO_PORT "rst_btn" IO_TYPE=LVCMOS33 PULL_MODE=DOWN SINGLE_RESISTOR=ON BANK_VCCIO=3.3;
-
 // ---- LPC bus (LCLK input + LAD bidirectional + frame/reset in) ----
 IO_LOC  "lpc_lclk"     73;  IO_PORT "lpc_lclk"     IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
-IO_LOC  "lpc_lframe_n" 74;  IO_PORT "lpc_lframe_n" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=12;
-IO_LOC  "lpc_lad[0]"   25;  IO_PORT "lpc_lad[0]"   IO_TYPE=LVCMOS33 PULL_MODE=UP HYSTERESIS=HIGH;
-IO_LOC  "lpc_lad[1]"   26;  IO_PORT "lpc_lad[1]"   IO_TYPE=LVCMOS33 PULL_MODE=UP HYSTERESIS=HIGH;
-IO_LOC  "lpc_lad[2]"   27;  IO_PORT "lpc_lad[2]"   IO_TYPE=LVCMOS33 PULL_MODE=UP HYSTERESIS=HIGH;
-IO_LOC  "lpc_lad[3]"   28;  IO_PORT "lpc_lad[3]"   IO_TYPE=LVCMOS33 PULL_MODE=UP HYSTERESIS=HIGH;
-IO_LOC  "lpc_lreset_n" 86;  IO_PORT "lpc_lreset_n" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+IO_LOC  "lpc_lframe_n" 74;  IO_PORT "lpc_lframe_n" IO_TYPE=LVCMOS33 PULL_MODE=NONE DRIVE=12 HYSTERESIS=HIGH;
+IO_LOC  "lpc_lad[0]"   25;  IO_PORT "lpc_lad[0]"   IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
+IO_LOC  "lpc_lad[1]"   26;  IO_PORT "lpc_lad[1]"   IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
+IO_LOC  "lpc_lad[2]"   27;  IO_PORT "lpc_lad[2]"   IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
+IO_LOC  "lpc_lad[3]"   28;  IO_PORT "lpc_lad[3]"   IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
+IO_LOC  "lpc_lreset_n" 86;  IO_PORT "lpc_lreset_n" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
 
 // D0 -- open-drain boot control (low = force LPC boot, Hi-Z = stock/onboard)
 IO_LOC  "lpc_d0"       75;  IO_PORT "lpc_d0"       IO_TYPE=LVCMOS33 PULL_MODE=NONE OPEN_DRAIN=ON;
@@ -44,19 +40,19 @@ IO_LOC  "i2c_scl" 72;  IO_PORT "i2c_scl" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERE
 // Private ADV7511 I2C bus (EOS sole master) -- EXP1=SDA, EXP2=SCL.
 // Open-drain is done in RTL (Hi-Z release); needs EXTERNAL pull-ups
 // (~2.2k-4.7k to 3.3V) on each line. This bus is isolated from the Xbox SMBus.
-IO_LOC  "adv_sda" 52;  IO_PORT "adv_sda" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
-IO_LOC  "adv_scl" 53;  IO_PORT "adv_scl" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
-IO_LOC  "adv_int" 49;  IO_PORT "adv_int" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
+IO_LOC  "adv_sda" 52;  IO_PORT "adv_sda" IO_TYPE=LVCMOS33 PULL_MODE=UP HYSTERESIS=HIGH;
+IO_LOC  "adv_scl" 53;  IO_PORT "adv_scl" IO_TYPE=LVCMOS33 PULL_MODE=UP HYSTERESIS=HIGH;
+IO_LOC  "adv_int" 55;  IO_PORT "adv_int" IO_TYPE=LVCMOS33 PULL_MODE=NONE HYSTERESIS=HIGH;
 
 // EXP header pin constraints (Tang Nano 20K / GW2AR-18) -- EXP4..EXP8
 // EXP1=adv_sda, EXP2=adv_scl, EXP3=adv_int are already constrained (ADV7511 bus).
 // [DECISION] Confirm these physical pin numbers against the board (pin 75 was a
 // config pin). Match IO_TYPE/bank to the existing LVCMOS33 EXP1-3 lines.
-IO_LOC  "exp4" 55;   IO_PORT "exp4" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
-IO_LOC  "exp5" 48;   IO_PORT "exp5" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
-IO_LOC  "exp6" 51;   IO_PORT "exp6" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
-IO_LOC  "exp7" 54;   IO_PORT "exp7" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
-IO_LOC  "exp8" 56;   IO_PORT "exp8" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "exp4" 48;   IO_PORT "exp4" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "exp5" 51;   IO_PORT "exp5" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "exp6" 54;   IO_PORT "exp6" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "exp7" 56;   IO_PORT "exp7" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
+IO_LOC  "exp8" 41;   IO_PORT "exp8" IO_TYPE=LVCMOS33 PULL_MODE=NONE;
 // I2C on EXP pins wants external pull-ups on the header (open-drain in fabric);
 // if the board lacks them, set PULL_MODE=UP for the SCL/SDA pins in use.
 

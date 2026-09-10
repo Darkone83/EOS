@@ -26,31 +26,43 @@
 // CLOCK STRETCHING (as master, respecting a slave that stretches): every bit
 // clock releases SCL (scl_oe<=0) and then WAITS for scl_in to actually read
 // high before treating the clock as risen -- a real wait, not a fixed
-// counter standing in for one. Bounded by STRETCH_TIMEOUT so a stuck/absent
-// slave can't hang this engine forever; reports back via wr_timeout/rd_timeout.
+// counter standing in for one. The generic engine can bound this wait; the
+// X-HD application instance disables that bound to mirror HAL_MAX_DELAY.
 //
 // Byte-level interface: the caller (eos_hd.v) sequences transactions itself
 // (start, write addr+bytes, [repeated start], read bytes, stop) by pulsing
 // the individual ops below and waiting for each op's done pulse, same shape
 // as eos_sd_spi.v's card interface elsewhere in this project.
 module eos_i2c_master #(
-    // X-HD uses STM32 timing register 0x00303D5B with an 8 MHz I2C
-    // kernel clock. Decoding that register gives approximately:
-    //   SCL low  = (0x5B + 1) / 8 MHz = 11.50 us
-    //   SCL high = (0x3D + 1) / 8 MHz =  7.75 us
-    // or about 52 kHz before filter/rise-time effects.
-    //
-    // At EOS's 64.8 MHz clock these are 745 and 502 cycles. Separate
-    // low/high periods are used instead of the former symmetric 100 kHz
-    // approximation.
+    // Byte clock periods.  The X-HD V0.1.8 ADV instance overrides these
+    // from STM32F0 TIMINGR=0x00303D5B: SCLL=0x5B -> 11.50 us and
+    // SCLH=0x3D -> 7.75 us (~51.95 kHz at EOS's 64.8 MHz clock).
     parameter integer SCL_LOW_CYCLES  = 745,
     parameter integer SCL_HIGH_CYCLES = 502,
+
+    // START/RESTART/STOP timings. STM32F0 uses SCLL to generate tBUF and
+    // tSU:STA, and SCLH to generate tHD:STA and tSU:STO. Keep the repeated-
+    // START setup interval independently tunable; defaulting it to START_SETUP
+    // preserves legacy generic-user behavior unless an instance overrides it.
+    parameter integer START_SETUP_CYCLES   = SCL_HIGH_CYCLES, // START hold: tHD:STA
+    parameter integer RESTART_SETUP_CYCLES = START_SETUP_CYCLES, // tSU:STA
+    parameter integer STOP_SETUP_CYCLES    = SCL_HIGH_CYCLES, // tSU:STO
+
+    // Optional short input deglitch stage.  X-HD enables the STM32F0 analog
+    // I2C filter and disables the digital filter.  A 3-sample majority at
+    // 64.8 MHz rejects single-cycle spikes while adding only ~46 ns of history.
+    parameter INPUT_DEGLITCH = 1'b0,
     parameter integer STRETCH_TIMEOUT = 32'd6_480_000, // ~100ms at 64.8MHz --
                                             // generous; a real stretch is
                                             // microseconds, this only exists
                                             // to catch a genuinely stuck bus.
     parameter integer IDLE_WAIT_TIMEOUT = 32'd194_400_000, // ~3s total wait at 64.8MHz
     parameter integer BUS_FREE_CYCLES = 32'd324,
+    // Keep waits bounded in FPGA hardware. X-HD passes HAL_MAX_DELAY to its
+    // blocking STM32 I2C calls, but reproducing an unbounded peripheral wait in
+    // fabric can permanently wedge EOS. The caller maps timeout completion to
+    // the same application-level failure result: read returns 0; write has no effect.
+    parameter BOUNDED_WAITS = 1'b1,
     parameter SINGLE_MASTER = 1'b1,
     parameter WAIT_BUS_FREE = 1'b1,
     parameter HONOR_CLOCK_STRETCH = 1'b1
@@ -123,16 +135,23 @@ module eos_i2c_master #(
     // The SMBus pins are asynchronous to clk_sd. Two-stage synchronization
     // avoids sampling ACK/data/idle transitions directly on the FPGA clock.
     reg sda_meta, sda_sync, scl_meta, scl_sync;
-    wire sda_bus = sda_sync;
-    wire scl_bus = scl_sync;
+    reg [2:0] sda_hist, scl_hist;
+    wire sda_filt = (sda_hist[2] & sda_hist[1]) |
+                    (sda_hist[2] & sda_hist[0]) |
+                    (sda_hist[1] & sda_hist[0]);
+    wire scl_filt = (scl_hist[2] & scl_hist[1]) |
+                    (scl_hist[2] & scl_hist[0]) |
+                    (scl_hist[1] & scl_hist[0]);
+    wire sda_bus = INPUT_DEGLITCH ? sda_filt : sda_sync;
+    wire scl_bus = INPUT_DEGLITCH ? scl_filt : scl_sync;
 
     always @(posedge clk or negedge resetn) begin
         if (!resetn) begin
-            sda_meta<=1'b1; sda_sync<=1'b1;
-            scl_meta<=1'b1; scl_sync<=1'b1;
+            sda_meta<=1'b1; sda_sync<=1'b1; sda_hist<=3'b111;
+            scl_meta<=1'b1; scl_sync<=1'b1; scl_hist<=3'b111;
         end else begin
-            sda_meta<=sda_in; sda_sync<=sda_meta;
-            scl_meta<=scl_in; scl_sync<=scl_meta;
+            sda_meta<=sda_in; sda_sync<=sda_meta; sda_hist<={sda_hist[1:0],sda_sync};
+            scl_meta<=scl_in; scl_sync<=scl_meta; scl_hist<={scl_hist[1:0],scl_sync};
         end
     end
 
@@ -215,7 +234,7 @@ module eos_i2c_master #(
                     // gap also reset the timeout, so neither counter could
                     // ever finish. The private ADV bus never sees that
                     // contention, but the total-elapsed counter is kept.
-                    if (stretch_ctr >= IDLE_WAIT_TIMEOUT-1) begin
+                    if (BOUNDED_WAITS && stretch_ctr >= IDLE_WAIT_TIMEOUT-1) begin
                         sda_oe<=1'b0; scl_oe<=1'b0; bus_owned<=1'b0;
                         idle_high_ctr<=32'd0;
                         start_done<=1'b1; start_timeout<=1'b1; st<=S_IDLE;
@@ -237,104 +256,94 @@ module eos_i2c_master #(
                 S_RSTART_WAIT: begin
                     case (rstart_phase)
                         2'd0: begin
-                            // Phase 0: ACK falling edge -> full tLOW.
-                            //
-                            // SDA is released while SCL remains actively low.
-                            // Wait the complete X-HD SCLL period (0x5B + 1
-                            // ticks at 8 MHz = 11.50 us). At the end, also
-                            // require SDA to have genuinely returned high
-                            // before raising SCL.
+                            // Complete the ACK->next-clock tLOW. STM32F0 starts
+                            // SCLL after its internal low detection, so do not
+                            // count until the synchronized/filtered line is low.
                             scl_oe<=1'b1;
                             sda_oe<=1'b0;
-
-                            if (pc < SCL_LOW_CYCLES-1) begin
+                            if (scl_bus) begin
+                                pc<=16'd0;
+                            end else if (pc < SCL_LOW_CYCLES-1) begin
                                 pc<=pc+16'd1;
                             end else if (!sda_bus) begin
+                                // SDA must actually be released before a
+                                // repeated START can be formed.
                                 stretch_ctr<=stretch_ctr+32'd1;
-                                if (stretch_ctr >= STRETCH_TIMEOUT) begin
-                                    sda_oe<=1'b0; scl_oe<=1'b0;
-                                    bus_owned<=1'b0;
-                                    start_done<=1'b1;
-                                    start_timeout<=1'b1;
-                                    st<=S_IDLE;
+                                if (BOUNDED_WAITS && stretch_ctr >= STRETCH_TIMEOUT) begin
+                                    sda_oe<=1'b0; scl_oe<=1'b0; bus_owned<=1'b0;
+                                    start_done<=1'b1; start_timeout<=1'b1; st<=S_IDLE;
                                 end
                             end else begin
-                                // SDA is high while SCL is still low. Now
-                                // release SCL and begin the high/setup phase.
                                 scl_oe<=1'b0;
-                                pc<=16'd0;
-                                stretch_ctr<=32'd0;
-                                rstart_phase<=2'd1;
+                                pc<=16'd0; stretch_ctr<=32'd0; rstart_phase<=2'd1;
                             end
                         end
-
                         2'd1: begin
-                            // Phase 1: wait for the physical SCL line to rise,
-                            // then hold the complete X-HD SCLH interval
-                            // (0x3D + 1 ticks at 8 MHz = 7.75 us).
+                            // Repeated-START setup: after SCL is physically
+                            // high, wait tSU:STA before SDA falls. X-HD's STM32F0
+                            // derives this interval from SCLL.
                             sda_oe<=1'b0;
-
                             if (HONOR_CLOCK_STRETCH && !scl_bus) begin
-                                pc<=16'd0;
-                                stretch_ctr<=stretch_ctr+32'd1;
-                                if (stretch_ctr >= STRETCH_TIMEOUT) begin
-                                    sda_oe<=1'b0; scl_oe<=1'b0;
-                                    bus_owned<=1'b0;
-                                    start_done<=1'b1;
-                                    start_timeout<=1'b1;
-                                    st<=S_IDLE;
+                                pc<=16'd0; stretch_ctr<=stretch_ctr+32'd1;
+                                if (BOUNDED_WAITS && stretch_ctr >= STRETCH_TIMEOUT) begin
+                                    sda_oe<=1'b0; scl_oe<=1'b0; bus_owned<=1'b0;
+                                    start_done<=1'b1; start_timeout<=1'b1; st<=S_IDLE;
                                 end
-                            end else if (pc < SCL_HIGH_CYCLES-1) begin
+                            end else if (pc < RESTART_SETUP_CYCLES-1) begin
                                 pc<=pc+16'd1;
                             end else begin
-                                pc<=16'd0;
-                                stretch_ctr<=32'd0;
+                                // SDA high -> low while SCL is high = repeated START.
+                                sda_oe<=1'b1; pc<=16'd0; stretch_ctr<=32'd0;
                                 st<=S_RSTART_HOLD;
                             end
                         end
-
-                        default: begin
-                            rstart_phase<=2'd0;
-                            pc<=16'd0;
-                        end
+                        default: begin rstart_phase<=2'd0; pc<=16'd0; end
                     endcase
                 end
                 S_RSTART_HOLD: begin
-                    // Generate the repeated START edge only after both the
-                    // complete ACK-to-restart tLOW and SCL-high setup phases:
-                    // SDA high -> low while the physical SCL line is high.
+                    // Hold START for tHD:STA (derived from SCLH on STM32F0),
+                    // then pull SCL low. The following byte state supplies SCLL.
                     sda_oe<=1'b1;
-                    pc<=pc+16'd1;
-                    if (pc >= SCL_HIGH_CYCLES-1) begin
-                        pc<=16'd0;
-                        scl_oe<=1'b1;
-                        st<=S_START_B;
+                    if (pc < START_SETUP_CYCLES-1) begin
+                        pc<=pc+16'd1;
+                    end else begin
+                        scl_oe<=1'b1; pc<=16'd0; rstart_phase<=2'd0;
+                        start_done<=1'b1; start_timeout<=1'b0;
+                        bus_owned<=1'b1; st<=S_IDLE;
                     end
                 end
                 S_START_A: begin
-                    // Fresh START already pulled SDA low while SCL was high.
-                    pc<=pc+16'd1;
-                    if (pc >= SCL_HIGH_CYCLES-1) begin
+                    // SDA has just fallen while SCL is high. Hold the START
+                    // condition for tHD:STA before pulling SCL low.
+                    if (pc < START_SETUP_CYCLES-1) begin
+                        pc<=pc+16'd1;
+                    end else begin
                         pc<=16'd0; scl_oe<=1'b1; st<=S_START_B;
                     end
                 end
                 S_START_B: begin
-                    pc<=pc+16'd1;
-                    if (pc >= SCL_LOW_CYCLES-1) begin
-                        start_done<=1'b1; start_timeout<=1'b0;
-                        bus_owned<=1'b1; pc<=16'd0; st<=S_IDLE;
-                    end
+                    // SCL is now low.  Complete immediately; S_BIT_RISE will
+                    // provide the first full SCLL interval after the caller
+                    // presents the address byte.
+                    start_done<=1'b1; start_timeout<=1'b0;
+                    bus_owned<=1'b1; pc<=16'd0; st<=S_IDLE;
                 end
 
                 // ---- one bit, shared by write and read ----
                 // write: SDA carries sh[7] (MSB first, shifted after);  read: SDA released, sampled at HIGH
                 S_BIT_SETUP: begin
-                    sda_oe <= cur_is_write ? ~sh[7] : 1'b0;
-                    pc<=16'd0; st<=S_BIT_RISE;
+                    // STM32F0 starts its SCLL timing after internal SCL-low
+                    // detection. Wait for the synchronized/filtered physical line
+                    // before changing SDA; SDADEL=0 then makes the new data valid
+                    // immediately at that internal-low point.
+                    if (!scl_bus) begin
+                        sda_oe <= cur_is_write ? ~sh[7] : 1'b0;
+                        pc<=16'd0; st<=S_BIT_RISE;
+                    end
                 end
                 S_BIT_RISE: begin
-                    // hold SCL low for one setup period before releasing, so
-                    // SDA is stable before the rising edge
+                    // Hold the programmed SCLL interval after physical-low
+                    // detection, then release SCL.
                     if (pc < SCL_LOW_CYCLES-1) begin
                         pc<=pc+16'd1;
                     end else begin
@@ -356,7 +365,7 @@ module eos_i2c_master #(
                         // output. Reset the high-period counter while stretched.
                         pc<=16'd0;
                         stretch_ctr<=stretch_ctr+32'd1;
-                        if (stretch_ctr >= STRETCH_TIMEOUT) begin
+                        if (BOUNDED_WAITS && stretch_ctr >= STRETCH_TIMEOUT) begin
                             timed_out<=1'b1; scl_oe<=1'b0; sda_oe<=1'b0;
                             bus_owned<=1'b0; st<=S_IDLE;
                             if (cur_is_write) begin
@@ -403,8 +412,10 @@ module eos_i2c_master #(
                 // ---- ACK/NACK bit, shared by write (sample slave's ACK)
                 // and read (drive our own ACK/NACK) ----
                 S_ACK_SETUP: begin
-                    sda_oe <= cur_is_write ? 1'b0 : rd_send_ack;
-                    pc<=16'd0; st<=S_ACK_RISE;
+                    if (!scl_bus) begin
+                        sda_oe <= cur_is_write ? 1'b0 : rd_send_ack;
+                        pc<=16'd0; st<=S_ACK_RISE;
+                    end
                 end
                 S_ACK_RISE: begin
                     if (pc < SCL_LOW_CYCLES-1) begin
@@ -426,7 +437,7 @@ module eos_i2c_master #(
                     end else if (!scl_bus) begin
                         pc<=16'd0;
                         stretch_ctr<=stretch_ctr+32'd1;
-                        if (stretch_ctr >= STRETCH_TIMEOUT) begin
+                        if (BOUNDED_WAITS && stretch_ctr >= STRETCH_TIMEOUT) begin
                             timed_out<=1'b1; scl_oe<=1'b0; sda_oe<=1'b0;
                             bus_owned<=1'b0; st<=S_IDLE;
                             if (cur_is_write) begin
@@ -460,10 +471,13 @@ module eos_i2c_master #(
 
                 // ---- STOP: SCL low+SDA low (already true entering here) -> SCL high -> SDA high ----
                 S_STOP_A: begin
-                    pc<=pc+16'd1;
-                    if (pc >= SCL_LOW_CYCLES-1) begin
+                    if (scl_bus) begin
+                        pc<=16'd0;
+                    end else if (pc >= SCL_LOW_CYCLES-1) begin
                         pc<=16'd0; stretch_ctr<=32'd0;
                         scl_oe<=1'b0; st<=S_STOP_B;
+                    end else begin
+                        pc<=pc+16'd1;
                     end
                 end
                 S_STOP_B: begin
@@ -472,19 +486,19 @@ module eos_i2c_master #(
                     // completion so the caller can take its bounded failure path.
                     if (!HONOR_CLOCK_STRETCH) begin
                         // fixed-rate STOP: SCL is high once released.
-                        // Hold one period, then release SDA = STOP. No readback.
+                        // Hold tSU:STO, then release SDA = STOP.
                         pc<=pc+16'd1;
-                        if (pc >= SCL_HIGH_CYCLES-1) begin
+                        if (pc >= STOP_SETUP_CYCLES-1) begin
                             sda_oe<=1'b0; stop_done<=1'b1; bus_owned<=1'b0; st<=S_IDLE; pc<=16'd0;
                         end
                     end else if (scl_bus) begin
                         pc<=pc+16'd1;
-                        if (pc >= SCL_HIGH_CYCLES-1) begin
+                        if (pc >= STOP_SETUP_CYCLES-1) begin
                             sda_oe<=1'b0; stop_done<=1'b1; bus_owned<=1'b0; st<=S_IDLE; pc<=16'd0;
                         end
                     end else begin
                         stretch_ctr<=stretch_ctr+32'd1;
-                        if (stretch_ctr >= STRETCH_TIMEOUT) begin
+                        if (BOUNDED_WAITS && stretch_ctr >= STRETCH_TIMEOUT) begin
                             sda_oe<=1'b0; scl_oe<=1'b0; stop_done<=1'b1;
                             bus_owned<=1'b0; st<=S_IDLE; pc<=16'd0;
                         end

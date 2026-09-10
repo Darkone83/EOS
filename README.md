@@ -10,6 +10,8 @@
 
 **A clean-room LPC BIOS-loader modchip for the original Xbox, built as FPGA gateware.**
 
+**Current firmware: 1.0.5** · [Changelog](CHANGELOG.md)
+
 Eos runs on the **Sipeed Tang Nano 20K** (Gowin GW2AR-18C). It sits on the Xbox LPC bus,
 serves a BIOS bank you pick from on-board memory, and works on **both pre-1.6 and 1.6**
 consoles. It reports in over the Xbox SMBus as a Darkone control device, and — if you have a
@@ -24,11 +26,11 @@ it's doing.
 |---|---|
 | `Source/` | Gowin project + FPGA gateware (`src/*.v`, `.cst`, `.sdc`, generated IP) |
 | `Firmware/` | Prebuilt bitstream (`Eos.fs`) |
-| `Updater/` | **EOS Updater** — native Xbox in-system update app (`src/` + `xbe/EOS_Updater.xbe`) |
+| `Updater/` | **EOS Updater** — status, bank/script management, loader/XbDiag updates, backup/restore utilities |
 | `Tools/` | Host tooling: recovery GUI, BIOS packer, HUD generator — see `Tools/readme.md` |
 | `Gerbers/` | PCB fab set (`EOS.zip`), `BOM.xlsx`, `PickAndPlace.xlsx` |
 | `Schematics/` | Board schematic |
-| `Editor/` | EOS Script Editor IDE |
+| `Editor/` | EOS Script Editor mini-IDE, validator, and LED / GPIO-PWM / I²C studios |
 | `images/` | Logos and board renders |
 
 ---
@@ -36,7 +38,7 @@ it's doing.
 ## Quick start
 
 1. **Flash the board once.** Bitstream plus a BIOS image, both over the Nano's USB. The
-   easiest way is the **Eos Recovery** app — point, click, done. CLI commands are further down
+   easiest way is the **EOS Recovery** app — point, click, done. CLI commands are further down
    if you'd rather.
 2. **Wire it to the Xbox LPC header.** Six series resistors, power, and either a D0 connection
    (1.0–1.4) or an LFRAME# tap plus an LPC rebuild (1.6).
@@ -51,32 +53,32 @@ needed.
 
 ## What it does
 
-- **Serves the BIOS over LPC** — answers the MCPX's memory-read cycles and streams the active
+- **Serves the BIOS over LPC** — answers the MCPX memory-read cycles and streams the active
   BIOS image out of SDRAM.
-- **Works on 1.0–1.4 and 1.6** — D0 on the older boards, LFRAME# transaction abort on 1.6,
-  picked by a hardware switch. See **Console revisions** below.
+- **Works on 1.0–1.4 and 1.6** — D0 on the older boards and LFRAME# transaction abort on 1.6,
+  selected by the hardware revision switch. See **Console revisions** below.
 - **Xenium-style bank select** — the bank register lives at I/O `0xEF` (low nibble = bank),
-  the same convention Xenium-family tools expect. It's a clean-room implementation of that
-  convention — it is **not** OpenXenium.
-- **SD Card BIOS loading** - Place your favorite BIOSs on a FAT32 formatted MicroSD card and
-  boot directly from the SD Card no flashing needed.
-- **In-system flashing** — an I/O path (`0xEC`/`0xED`) lets the Xbox side erase, write, read,
-  and verify the backing flash, so you never need a programmer after the first flash.
-- **Only answers its own ports** — Eos claims exactly `0x00EC`–`0x00EF` and nothing else, so
-  it stays out of the way of other devices on the LPC bus.
-- **Fast preload** — the BIOS streams from flash into SDRAM in bursts. The boot image is
-  resident in about a second, and Eos serves reads the whole time it's still filling.
-- **Darkone SMBus device** — shows up in an XbDiag SMBus scan as an EOS modchip at 7-bit
-  `0x6E`, reporting firmware version and status, and carrying the control channel the updater
-  talks to.
-- **HDMI dashboard** — a colour readout of link state, bank, serve rate, the flash engine,
-  the preload bar, a live map of what's been served, a serve log, and a stability panel.
-- **HD addon support (experimental)** — Eos can drive an external ADV7511 HDMI transmitter
-  on a compatible **HD addon** board, giving the console a digital HDMI output. **Experimental.**
-  Uses a private I²C bus on the expansion header — see **Expansion header** in the pinmap (EXP1–EXP3
-  are reserved for HD addon compatibility) and **Credits**.
-- **Status LEDs / WS2812** — tells you where a boot got to without needing a screen.
-- ** Expandable I/O ** - Allows you to program EXP 1 - 8 via the ESO script system
+  using the long-established Xenium-family convention.
+- **SD card BIOS support** — boot BIOS images directly from a FAT32 MicroSD card, with raw
+  single-block read/write support available to the EOS SD path.
+- **In-system flashing** — the Xbox can erase, write, read, and verify the backing flash, so
+  a programmer is not required after the initial board flash.
+- **Bank and recovery management** — the Xbox-side updater can flash, verify, rename, color,
+  back up, restore, and clear supported BIOS regions while respecting protected banks.
+- **Fast preload** — BIOS data streams from flash into SDRAM in bursts and can be served while
+  the remaining image continues to fill.
+- **Darkone SMBus device** — EOS reports at 7-bit `0x6E`, exposes firmware/status information,
+  and carries updater and expansion-mailbox control traffic.
+- **EOS Script expansion system** — programmable GPIO, PWM, WS2812, soft-I²C, mailbox, and
+  doorbell handling on the expansion header. With no HD add-on, EXP1–EXP8 are available; when
+  the HD add-on is present, EXP1–EXP3 are reserved and EXP4–EXP8 remain available to scripts.
+- **Onboard HDMI diagnostic dashboard** — a condensed live view of boot/link, bank, flash,
+  preload, SMBus, and HD status designed to keep FPGA resource use low.
+- **HD add-on support — EXPERIMENTAL** — EOS can drive a compatible external ADV7511-based HD
+  add-on. This support is **actively being tested and revised**; video-mode handling, handoff,
+  and compatibility should not be treated as final or production-stable yet.
+- **Status LEDs / WS2812** — visual boot, flash, bank, and runtime status without requiring a
+  diagnostic display.
 
 ---
 
@@ -84,11 +86,14 @@ needed.
 
 ### V1
 
-The V1 carrier will perform all the basic functions EOS requires and is not FW dependent. V1 is missing the bank RGB led the HD Status LED and the expansion header and the RTC
+The V1 carrier supports the core EOS functions and is not firmware-dependent. It does not
+include the bank RGB LED, HD status LED, expansion header, or RTC found on V2.
 
 ### V2
 
-The V2 carrier offers easy accessibility to all planned features and expansion options of EOS and includes the additional items: the RGB Bank LED, HD Status LED, Expansion header, and on-board RTC.
+The V2 carrier exposes the full planned expansion feature set, including the RGB bank LED,
+HD status LED, expansion header, and onboard RTC. Use the **current V2 fabrication and
+schematic files** in the repository; the V2 package was corrected after 1.0.4-1.
 
 ---
 
@@ -100,7 +105,7 @@ The V2 carrier offers easy accessibility to all planned features and expansion o
 | FPGA | Gowin GW2AR-18C, QFN88, C8/I7 |
 | Memory | 64 Mbit on-package SDRAM (BIOS lives here while serving) |
 | Flash | On-board SPI flash (holds the bitstream and the BIOS banks) |
-| Video | HDMI for the diagnostic dashboard |
+| Video | Onboard HDMI diagnostic dashboard; optional experimental HD add-on |
 
 ### Wiring to the Xbox
 
@@ -214,10 +219,14 @@ serving · **blue** is up and idle. The write/sync purple is the project accent 
 
 ### Status RGB LED (pin 29)
 
-The Status led is fully programable per bank. Once a BIOS is flashed you can set a color via Bank Management or from the WebUI. Choose from 11 colors and OFF. 3 Banks have pre determined colors that are not changable via the Loader or the WebUI. Recovery = White, breathing, XbDiag Lite = Purple, breathing, and SD Card = Magenta, breating.
+The bank status LED is programmable per user bank. After a BIOS is flashed, choose one of
+11 colors or OFF from Bank Management / the supported UI. Recovery, XbDiag Lite, and SD use
+reserved status colors/animations rather than user-selectable colors.
 
 ### HD Status LED (pins 30, 31)
-Pin 30, is PLL lock. Pin 31, Mode / Handoff Status.
+
+V2 exposes two HD-status indicators: pin 30 reports PLL lock and pin 31 reports mode/handoff
+status. These indicators belong to the **experimental HD add-on** path.
 
 ---
 
@@ -284,24 +293,28 @@ map is under **SMBus interface** below.
 
 ### Expansion header
 
-Eight GPIO on the expansion header, 3.3 V (LVCMOS33), unwired to the Xbox. **EXP1–EXP3 are
-reserved for HD addon compatibility** (the experimental HD addon support drives an external
-ADV7511 over a private I²C bus on these pins — SDA / SCL / INT). **EXP4–EXP8 are free.** The
-HD addon lines need external pull-ups on the harness.
+Eight 3.3 V (LVCMOS33) expansion pins are exposed on V2. **Without an HD add-on, EOS Script
+can use EXP1–EXP8.** When the HD add-on is physically present, EOS reserves EXP1–EXP3 for its
+private control bus and leaves EXP4–EXP8 available to scripts. In the Script Editor, use
+`TARGET HD` so the authoring tools reserve those first three pins.
+
+The gateware also protects EXP1–EXP3 while the HD hardware probe is unresolved, preventing a
+script from driving the transmitter bus during bring-up.
 
 | Label | Port | Pin | Use |
 |---|---|---|---|
-| EXP1 | `adv_sda` | 52 | HD addon — ADV7511 I²C SDA *(reserved)* |
-| EXP2 | `adv_scl` | 53 | HD addon — ADV7511 I²C SCL *(reserved)* |
-| EXP3 | `adv_int` | 49 | HD addon — ADV7511 INT (pull-up) *(reserved)* |
-| EXP4 | — | 55 | free |
-| EXP5 | — | 48 | free |
-| EXP6 | — | 51 | free |
-| EXP7 | — | 54 | free |
-| EXP8 | — | 56 | free |
+| EXP1 | `adv_sda` | 52 | HD SDA when present; script I/O when no HD add-on |
+| EXP2 | `adv_scl` | 53 | HD SCL when present; script I/O when no HD add-on |
+| EXP3 | `adv_int` | 49 | HD INT when present; script I/O when no HD add-on |
+| EXP4 | — | 55 | EOS Script / general expansion I/O |
+| EXP5 | — | 48 | EOS Script / general expansion I/O |
+| EXP6 | — | 51 | EOS Script / general expansion I/O |
+| EXP7 | — | 54 | EOS Script / general expansion I/O |
+| EXP8 | — | 56 | EOS Script / general expansion I/O |
 
-> The ADV7511 sits at its default 7-bit `0x39` on this private bus, which EOS masters alone —
-> it is separate from the Xbox SMBus. HD addon support is experimental (see **What it does**).
+> The HD add-on control path uses a private bus separate from the Xbox SMBus. External pull-ups
+> are required on the HD harness. HD add-on support remains experimental and is actively being
+> tested and revised.
 
 ### Clock / reset / status
 
@@ -326,8 +339,9 @@ HD addon lines need external pull-ups on the harness.
 
 ## SMBus interface
 
-Eos is a register-file slave at 7-bit `0x6E`. The master writes an index byte, then reads or
-writes data. It shows up in an XbDiag SMBus scan as an EOS modchip.
+EOS exposes its native control/status interface at 7-bit `0x6E`. It shows up in an XbDiag
+SMBus scan as an EOS modchip. In 1.0.5, native readback is tied to the command for the current
+transaction, reducing stale-index/version readback races on a busy shared bus.
 
 ### Registers you read
 
@@ -336,7 +350,7 @@ writes data. It shows up in an XbDiag SMBus scan as an EOS modchip.
 | `0x00` | MAGIC | `0xD8` (Darkone signature) |
 | `0x01` | VER_MAJOR | `1` |
 | `0x02` | VER_MINOR | `0` |
-| `0x03` | VER_PATCH | `0` → firmware 1.0.0 |
+| `0x03` | VER_PATCH | `5` → firmware 1.0.5 |
 | `0x04` | STATUS | live bits, see below |
 | `0x05` | ENGINE | update-engine flags (armed / staged / CRC set / busy / err / commit-ok) |
 | `0x06` | COMMIT | `{commit_bank, armed_region}` |
@@ -344,6 +358,7 @@ writes data. It shows up in an XbDiag SMBus scan as an EOS modchip.
 | `0x0B`–`0x0C` | LOCK | lock-mask, low byte first |
 | `0x10` | CMD | reads back the last command opcode |
 | `0x11`–`0x14` | ARG0–3 | reads back the last command args |
+| `0x15`–`0x17` | HD_DIAG | experimental HD diagnostic status/data/register echo |
 
 **STATUS (`0x04`) bits**, low to high: `preload_done`, `mode_16`, `d0_active`,
 `abort_active`, `slot1_ready`. Top three bits are zero.
@@ -414,12 +429,18 @@ Handshake: host sets `SEL` → writes args to `CMD`/volatile window → rings
 |---|---|---|
 | `0x01` | PING | liveness, no change |
 | `0x02` / `0x03` | ABORT / CLEAR | disarms and invalidates the staged image |
+| `0x30` | SELECT | latches `arg0[3:0]`; see **Known interface notes** |
+| `0x36` | BOOTMODE | latches `arg0[1:0]`; see **Known interface notes** |
+| `0x37` | SETLOCK | updates the bank lock mask |
 | `0x38` | LEDMODE | `arg0`: 0 = normal, 1 = rainbow |
 | `0x39` | DESCRELOAD | re-read the descriptor block |
-| `0xN0` / `0xN1` / `0xN4` | ARM / SETCRC / COMMIT | update flow for region N |
+| `0x3A` | SETBANKCOLOR | set RGB color for user banks 1–4 |
+| `0x3B` | ADVREAD | experimental HD diagnostic register read |
+| `0x3D` | HUDMODE | enable/disable the onboard diagnostic HUD engine |
+| `0xN0` / `0xN1` / `0xN3` / `0xN4` | ARM / SETCRC / VALIDATE / COMMIT | staged update flow for region N |
 
-The updater drives ARM → SETCRC → COMMIT for the **loader** (region 1) and **XbDiag**
-(region 2). A few other opcodes are decoded but don't do anything yet — see **Active Notes**.
+The loader and XbDiag update paths use staged data plus CRC validation before commit. Bank
+flashing in the updater also performs post-write verification before a bank is accepted.
 
 ---
 
@@ -450,9 +471,9 @@ Reads are served the whole time any fill is running.
 The bitstream and the BIOS both live in the Nano's SPI flash. You do this **once** per board;
 after that, banks update in-system.
 
-### Easiest: the Eos Recovery app
+### Easiest: the EOS Recovery app
 
-The **Eos Recovery** GUI wraps the two commands below — pick the bitstream, pick the BIOS
+The **EOS Recovery** GUI wraps the two commands below — pick the bitstream, pick the BIOS
 image, hit each Program button. It finds the board for you and doubles as the un-brick tool
 (JTAG-over-USB always works, even with a dead bitstream). Use this unless you live in a
 terminal.
@@ -502,15 +523,28 @@ Every physical target is `0x200000 + bank_base + offset`.
 
 ### Updating BIOS banks (in-system)
 
-Once a bootable image is on the board, you rewrite banks from a running console — push a new
-image over the loader's network/FTP path, stage and validate it, commit it to a bank through
-the flash engine, pick the bank, and warm-reset so Eos serves it. No programmer.
+Once a bootable image is on the board, BIOS banks can be rewritten from a running console.
+The updater validates targets, writes the requested region, and verifies the result before the
+new bank is treated as complete.
 
-The **EOS Updater** (`Updater/`) is the native Xbox app for this. It loads a full image into
-RAM (local file or network), stages it to the FPGA in chunks, validates it with a streaming
-CRC-32, and **stops for you to confirm** right before it writes to flash. It handles the
-loader, BIOS, and XbDiag update flows over the Darkone SMBus channel, with a version gate for
-XbDiag. Ships as `Updater/xbe/EOS_Updater.xbe` with full source in `Updater/src/`.
+### EOS Updater
+
+The **EOS Updater** (`Updater/`) is the native Xbox management application. The 1.0.5 build is
+organized around six top-level areas:
+
+- **EOS Status** — reads the installed EOS identity/version and live device state.
+- **Bank Management** — flash, verify, rename, delete, and set per-bank status colors, including
+  descriptor handling for larger BIOS layouts.
+- **EOS Scripts** — install, replace, inspect, or remove the active `.eos` expansion script.
+- **Update Loader** — staged loader update with additional validation, confirmation, and an
+  optional safety backup/restore path for BIOS banks, Recovery, and configuration.
+- **Update XbDiag Lite** — version-aware XbDiag update and verification.
+- **Utilities** — manual bank backup/restore and maintenance/reset functions.
+
+The updater UI now renders against the active Xbox video mode/backbuffer instead of assuming a
+480-line output, improving presentation across 480i/480p, PAL 576i, 720p, and 1080i modes.
+
+Ships as `Updater/xbe/EOS_Updater.xbe` with full source in `Updater/src/`.
 
 ---
 
@@ -520,12 +554,14 @@ Synthesis is done in **Gowin EDA**. The device has to be **GW2AR-18C QN88 C8/I7*
 project, constraints, and programmer — a mismatch is the usual "won't configure" reason.
 
 1. Open the project in Gowin EDA and add all `src/*.v` sources.
-2. Make sure the memory-init hex files are in `src/` next to the RTL — they're read at
-   synthesis, and a missing one silently zero-fills (a blank dashboard, for instance):
-   `eos_font.hex`, `eos_attr.hex`, `eos_logo.hex`, `eos_screen.hex`.
+2. Make sure the memory-init hex files are in `src/` next to the RTL — they are read at
+   synthesis, and a missing file may silently zero-fill the corresponding ROM/RAM:
+   `eos_font.hex`, `eos_attr.hex`, `eos_logo.hex`, `eos_screen.hex`,
+   `eos_hud_microcode.hex`, and `eos_xhd_bios_modes.hex`.
 3. Apply `eos_hdmi.cst` and `eos_hdmi.sdc`.
-4. Under Project -> Configuration -> Bitstream -> sysControl set Loading Rate to 62.5MHz
-5. Under Project -> Configuration -> Place & Route -> Dual-Purpose Pin set Use SSPI as regualr IO, and Use MSPI as regular IO as enabled.
+4. Under **Project → Configuration → Bitstream → sysControl**, set Loading Rate to **62.5 MHz**.
+5. Under **Project → Configuration → Place & Route → Dual-Purpose Pin**, enable **Use SSPI as
+   regular IO** and **Use MSPI as regular IO**.
 6. Synthesize → Place & Route → generate the bitstream (`.fs`).
 
 A clean build produces **no synthesis warnings**. If width-truncation, unused-input, or
@@ -534,38 +570,53 @@ explain what each guards against.
 
 ### The dashboard is generated
 
-`eos_serve_hud.v` is produced by `Tools/gen_hud.py` — don't hand-edit it, edit the generator
-and regenerate:
+`eos_serve_hud.v` is generated by `Tools/gen_hud.py`; edit the generator/layout source rather
+than hand-editing the generated module:
 
 ```bash
 python3 Tools/gen_hud.py Source/src/eos_serve_hud.v
 ```
 
-It emits the whole module (607 cells). Panels: title, boot/link, serve, flash engine, I2C
-engine, SDRAM preload, address-space serve map, serve log, stability.
+The current condensed HUD uses static screen/attribute ROM plus
+`eos_hud_microcode.hex` for **102 dynamic cells**. The older serve-log/map/rate/stability
+telemetry panels were removed to reclaim FPGA LUTs and registers while retaining the primary
+boot, preload, flash, SMBus, bank, and HD status information.
 
 ---
 
-### SMBus commands with no effect yet
+### Known interface notes
 
-Some opcodes are decoded and latch cleanly, but their outputs aren't consumed by anything on
-the FPGA yet:
-
-- **SELECT (`0x30`)**, **BOOTMODE (`0x36`)** — the values land in registers, but nothing acts
-  on them. Bank selection today goes through the `0xEF` I/O register, not SMBus.
-- **SETLOCK (`0x37`) / lock-mask** — the mask is stored and readable at `0x0B`/`0x0C`, and the
-  default (`0x0402`) marks the boot and recovery banks locked, but the one place that check
-  would apply can't currently be reached (see below), so it doesn't block anything yet.
-- **Scratch physical-wipe** — ABORT/CLEAR does the logical flush (disarm + invalidate) that
-  matters for safety; the optional physical scratch wipe it also signals isn't hooked up.
+- **SELECT (`0x30`)** and **BOOTMODE (`0x36`)** latch cleanly, but their outputs are not
+  currently consumed by the rest of the FPGA. Normal bank selection still uses the `0xEF` I/O
+  register.
+- **SETLOCK (`0x37`)** updates the lock mask used by the staged bank-commit path, but the
+  region-3 ARM opcode conflict below prevents that SMBus bank path from being reached today.
+- **Scratch physical wipe** remains optional/unhooked; ABORT/CLEAR still performs the logical
+  invalidate/disarm required to prevent stale staged data from committing.
 
 ### Bank-region ARM collides with SELECT
 
 The "arm an arbitrary bank" command (region 3, opcode `0x30`) shares its opcode with SELECT,
-which is decoded first — so **region-3 arm never runs**. This doesn't affect the updater, which
-only arms the **loader** and **XbDiag** regions (`0x10` / `0x20`). It does mean SETLOCK's bank
-lock has nothing to enforce against yet. Fixing it means giving bank-arm its own opcode, which
-is a firmware + updater change and is deliberately left for later.
+which is decoded first, so **region-3 ARM does not run through this SMBus command path**. The
+loader and XbDiag staged-update regions are unaffected. Bank Management uses its supported
+flash/descriptor path instead.
+
+---
+
+## EOS Script system
+
+EOS Script provides a small expansion runtime for the V2 header. Scripts can declare GPIO
+inputs/outputs, PWM, WS2812, soft-I²C devices, mailbox registers, and doorbell-style host
+commands. The gateware validates the stored script before enabling its pins; invalid/reloading
+scripts are held in a safe state.
+
+In 1.0.5, validated script starts/restarts **reapply GPIO `INIT` values**, and HD presence no
+longer disables the entire script runtime. Instead, the hardware reserves EXP1–EXP3 only when
+the HD add-on is physically present, leaving EXP4–EXP8 available.
+
+The desktop **EOS Script Editor** in `Editor/` provides live validation, autocomplete, hints,
+pin/budget reporting, and specialized LED, GPIO/PWM, and I²C studios. Generated identifiers
+follow the 16-character EOS symbol limit.
 
 ---
 
@@ -575,34 +626,34 @@ is a firmware + updater change and is deliberately left for later.
 Eos.gprj                      Gowin EDA project
 
 src/
-  eos_hdmi_top.v        top level: clocks, LPC, SDRAM, HUD, D0/LFRAME, I2C, video
-  eos_lpc_loader.v      LPC cycle decode + serve; drives the 1.6 LFRAME abort
-  eos_boot_ctrl.v       1.6 LFRAME# abort (mode16_n-gated)
+  eos_hdmi_top.v        top level: clocks, LPC, SDRAM, HUD, expansion, SMBus, HD integration
+  eos_lpc_loader.v      LPC cycle decode + BIOS serve; drives the 1.6 LFRAME abort
+  eos_boot_ctrl.v       1.6 LFRAME# abort control (mode16_n-gated)
   eos_bank_ctrl.v       0xEF bank register + address map + flash write engine
-  eos_bank_led.v        Bank and status LED framework and command set
-  eos_exp_engine.v      EOS expansion engine and plumbing for WS2812, GPIO, PWM and soft i2c master
-  eos_exp_pkg.vh        All expansion widths, offsets and opcodes
+  eos_bank_led.v        bank/status RGB framework and color persistence path
+  eos_exp_engine.v      EOS Script parser/runtime, mailbox, GPIO, PWM, WS2812, soft-I²C
+  eos_exp_pkg.vh        expansion widths, offsets, opcodes, and shared constants
   eos_flash_cmd.v       flash command bridge (0xEC/0xED) + scratch staging
   eos_flash_reader.v    SPI flash read path (burst reads with backpressure)
-  eos_sd_spi.v			SPI framework to allow raw LBA / byte access to the SD Card
-  eos_sd_precache.v		SD precaching framework for SDRAM precache
+  eos_sd_spi.v          raw MicroSD SPI single-block read/write engine
+  eos_sd_precache.v     SD-to-SDRAM BIOS precache path
   eos_sdram_backend.v   SDRAM serve + preload + scratch
   eos_sdram_pll.v       SDRAM PLL wrapper
   sdram.v               SDRAM controller
-  eos_crc32.v           streaming CRC-32 (update validate)
-  eos_i2c.v             Darkone SMBus slave (0x6E) + update command engine
-  eos_i2c_master.v      Private I2C matser for X-HD compatability
-  eos_serve_hud.v       serve dashboard  ** GENERATED — edit Tools/gen_hud.py **
-  eos_text_rendre.v     colour text renderer + logo overlay
-  eos_char_buffer.v     char cell buffer
-  eos_attr_buffer.v     colour-attr cell buffer
-  eos_font_rom.v        8x16 font ROM  (eos_font.hex)
-  eos_logo_rom.v        EOS logo ROM   (eos_logo.hex)
-  eos_video_timing.v    HDMI video timing
-  eos_ws2812.v          WS2812 status LED
-  *.hex                 memory inits (font / attr / logo / screen)
-  eos_hd.v              X-HD compatible compatibility layer
-  eos_hdmi.cst          pin + IO constraints
+  eos_crc32.v           streaming CRC-32 validator
+  eos_i2c.v             EOS SMBus slave (0x6E), update commands, expansion mailbox transport
+  eos_i2c_master.v      private I²C master used by the experimental HD add-on path
+  eos_hd.v              experimental HD add-on control, mode, and handoff layer
+  eos_serve_hud.v       condensed diagnostic HUD **GENERATED — edit Tools/gen_hud.py**
+  eos_text_rendre.v     color text renderer + logo overlay
+  eos_char_buffer.v     character-cell buffer
+  eos_attr_buffer.v     color-attribute cell buffer
+  eos_font_rom.v        8x16 font ROM (`eos_font.hex`)
+  eos_logo_rom.v        EOS logo ROM (`eos_logo.hex`)
+  eos_video_timing.v    onboard diagnostic HDMI video timing
+  eos_ws2812.v          WS2812 status LED driver
+  *.hex                 memory init / HUD microcode / HD mode tables
+  eos_hdmi.cst          pin + I/O constraints
   eos_hdmi.sdc          timing constraints
 
   dvi_tx/  gowin_rpll/  sdram_pll/    Gowin IP (generated)
@@ -612,7 +663,7 @@ src/
 
 ## Credits
 
-Eos firmware © Team Resurgent / Darkone83.
+EOS firmware © Team Resurgent / Darkone83.
 
 The **`0xEF` banking convention** is Xenium-style and long-established in the OG Xbox scene;
 Eos's bank system is a clean-room implementation of it and is **not** derived from OpenXenium.

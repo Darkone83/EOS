@@ -154,8 +154,9 @@ module eos_exp_lex (
     wire is_digit = (cb >= 8'h30 && cb <= 8'h39);
     wire is_hexU  = (fold >= 8'h41 && fold <= 8'h46);
     wire is_xchar = (cb == 8'h78 || cb == 8'h58);
-    wire [3:0] dig  = cb - 8'h30;
-    wire [3:0] hexv = is_digit ? (cb - 8'h30) : (fold - 8'h41 + 4'd10);
+    wire [3:0] dig  = cb[3:0];                 // cb-0x30 == cb (mod 16) for '0'-'9'
+    wire [7:0] hexv_w = is_digit ? (cb - 8'h30) : (fold - 8'h41 + 8'd10);
+    wire [3:0] hexv = hexv_w[3:0];
 
     // Exact reserved-word recognizer as a compact binary trie/DFA. Terminal
     // states are deliberately numbered exactly like EOS_T_* (1..52), so the
@@ -1126,7 +1127,8 @@ module eos_exp_layout (
     assign dat_rdlen = {17'd0,dat_meta[14:0]};
 
     wire is_exp = (tok_tag>=`EOS_T_EXP1) && (tok_tag<=`EOS_T_EXP8);
-    wire [2:0] exp_bit = tok_tag - `EOS_T_EXP1;
+    wire [7:0] exp_bit_w = tok_tag - `EOS_T_EXP1;
+    wire [2:0] exp_bit = exp_bit_w[2:0];
     wire [8:0] reg_new_len = {1'b0,cur_banklen} + {1'b0,cur_width};
     wire [7:0] reg_new_cnt = cur_regcnt + 8'd1;
     wire [15:0] payload_new = {1'b0,payload_total} + {1'b0,d_bytes};
@@ -1621,10 +1623,16 @@ module eos_exp_mailbox (
                 end
                 default: begin
                     if (wr_index>=8'h50 && wr_index<=8'h6F && winkind!=8'h00) begin
-                        // volatile window write (host): reserved + bank-lock aware
-                        v_wr<=1'b1;
-                        v_waddr<={page[2:0],wr_index[5],wr_index[3:0]};
-                        v_wdata<=wr_data;
+                        // Conservative ABI-v1 bank lock: while any coherent
+                        // doorbell transaction is active, freeze host WINDOW
+                        // writes so the paged path cannot bypass CMD/REG locking.
+                        // With all doorbells IDLE, normal doorbell-less level
+                        // polling/writes remain unchanged.
+                        if (db_shadow_r == 16'd0) begin
+                            v_wr<=1'b1;
+                            v_waddr<={page[2:0],wr_index[5],wr_index[3:0]};
+                            v_wdata<=wr_data;
+                        end
                     end
                 end
                 endcase
@@ -1777,7 +1785,8 @@ module eos_exp_exec #(
         .raddr(ow_raddr),.rdata(ow_rdata));
 
     wire is_reg_tok = (tok_tag>=`EOS_T_R0) && (tok_tag<=`EOS_T_R7);
-    wire [2:0] reg_idx_tok = tok_tag - `EOS_T_R0;
+    wire [7:0] reg_idx_tok_w = tok_tag - `EOS_T_R0;
+    wire [2:0] reg_idx_tok = reg_idx_tok_w[2:0];
 
     // latched line for delayed dispatch
     reg        disp_pend;
@@ -1809,6 +1818,11 @@ module eos_exp_exec #(
     reg [7:0]  i_op; reg i_dest;                    // DATA dest: 0=WS, 1=I2C
     reg [20:0] hexptr; reg [12:0] dcnt, dlen; reg [3:0] nib_hi; reg nib_hi_v;
     reg        sym_wait;                            // one-cycle latency for BSRAM symbol reads
+    reg        sym_eval;                            // registered compare result is ready
+    reg [3:0]  sym_match;                           // four registered 32-bit compare lanes
+    reg [31:0] sym_def_val;
+    reg [20:0] sym_dat_off;
+    reg [31:0] sym_dat_len;
     reg [4:0]  vnext;                               // consumer after synchronous RAM prefetch
 
     // IFMAIL compare uses the lexer's compact exact token tag.
@@ -1835,7 +1849,8 @@ module eos_exp_exec #(
         exec_ptype = pin_type_flat[n*8 +: 8];
     end endfunction
     wire       op_pin_valid = (op_tag0>=`EOS_T_EXP1) && (op_tag0<=`EOS_T_EXP8);
-    wire [2:0] op_pin_idx   = op_tag0 - `EOS_T_EXP1;
+    wire [7:0] op_pin_idx_w = op_tag0 - `EOS_T_EXP1;
+    wire [2:0] op_pin_idx   = op_pin_idx_w[2:0];
     wire [7:0] op_pin_type  = exec_ptype(op_pin_idx);
     wire [7:0] op_need_type = (cmd_code==`EOS_OP_SET) ? `EOS_TYPE_GPIO_OUT :
                               (cmd_code==`EOS_OP_GET) ? `EOS_TYPE_GPIO_IN : `EOS_TYPE_PWM;
@@ -1882,10 +1897,11 @@ module eos_exp_exec #(
         ishex=(c>=8'h30&&c<=8'h39)||(c>=8'h41&&c<=8'h46)||(c>=8'h61&&c<=8'h66); end endfunction
     function isws;  input [7:0] c; begin
         isws=(c==8'h20)||(c==8'h09)||(c==8'h0A)||(c==8'h0D); end endfunction
-    function [3:0] hexv; input [7:0] c; begin
-        if (c<=8'h39) hexv=c-8'h30;
-        else if (c<=8'h46) hexv=c-8'h41+4'd10;
-        else hexv=c-8'h61+4'd10; end endfunction
+    function [3:0] hexv; input [7:0] c; reg [7:0] t; begin
+        if (c<=8'h39) t=c-8'h30;
+        else if (c<=8'h46) t=c-8'h41+8'd10;
+        else t=c-8'h61+8'd10;
+        hexv=t[3:0]; end endfunction
     always @(posedge clk or negedge resetn) begin
         if (!resetn) begin
             st<=E_IDLE; running<=1'b0; fault<=1'b0; fault_code<=8'd0; pc<=16'd0;
@@ -1894,6 +1910,7 @@ module eos_exp_exec #(
             p_start<=1'b0; sp<=3'd0; skip_cnt<=12'd0; disp_pend<=1'b0; loop_arm<=1'b0; ldone_l<=1'b0; pget<=1'b0;
             ws_wr<=1'b0; ws_send<=1'b0; ws_zero<=1'b0;
             iw_wr<=1'b0; i2c_go<=1'b0; i2c_read<=1'b0; x_scr_rd<=1'b0; def_ridx<=7'd0; dat_ridx<=6'd0; nib_hi_v<=1'b0; sym_wait<=1'b0;
+            sym_eval<=1'b0; sym_match<=4'b0000; sym_def_val<=32'd0; sym_dat_off<=21'd0; sym_dat_len<=32'd0;
             opn<=3'd0; op_tag0<=`EOS_T_NONE; op_tag1<=`EOS_T_NONE;
             op_num0<=32'd0; op_num1<=32'd0; op_num2<=32'd0; op_num3<=32'd0;
             op_ready<=4'd0; op_has<=4'd0; op_reg0<=3'd0; op_reg1<=3'd0;
@@ -2161,27 +2178,38 @@ module eos_exp_exec #(
                 else begin i_fi<=i_fi+9'd1; st<=E_IRDRAIN; end
             end
             E_RESOLVE: begin                                           // operand-word + DEF[0] BSRAM settle
-                sym_wait<=1'b1; st<=E_DEFSCAN;
+                sym_wait<=1'b1; sym_eval<=1'b0; st<=E_DEFSCAN;
             end
             E_DEFSCAN: begin                                           // shared exact 16-char DEF resolver
                 if (def_cnt==7'd0) begin fault<=1'b1; fault_code<=F_ARG; pc<=cmd_ord; st<=E_FAULT; end
-                else if (!sym_wait) sym_wait<=1'b1;
-                else if (def_rword==ow_rdata) begin
+                else if (!sym_wait) begin
+                    // Allow the newly indexed BSRAM word to settle first.
+                    sym_wait<=1'b1; sym_eval<=1'b0;
+                end else if (!sym_eval) begin
+                    // Pipeline cut: capture the wide compare and associated value.
+                    // The following cycle contains only small executor-control logic.
+                    sym_match[0]<=(def_rword[31:0]   ==ow_rdata[31:0]);
+                    sym_match[1]<=(def_rword[63:32]  ==ow_rdata[63:32]);
+                    sym_match[2]<=(def_rword[95:64]  ==ow_rdata[95:64]);
+                    sym_match[3]<=(def_rword[127:96] ==ow_rdata[127:96]);
+                    sym_def_val<=def_rval;
+                    sym_eval<=1'b1;
+                end else if (&sym_match) begin
                     case (res_pos)
-                        2'd0: op_num0<=def_rval;
-                        2'd1: op_num1<=def_rval;
-                        2'd2: op_num2<=def_rval;
-                        default: op_num3<=def_rval;
+                        2'd0: op_num0<=sym_def_val;
+                        2'd1: op_num1<=sym_def_val;
+                        2'd2: op_num2<=sym_def_val;
+                        default: op_num3<=sym_def_val;
                     endcase
-                    op_ready[res_pos]<=1'b1; sym_wait<=1'b0; st<=E_DISP;
+                    op_ready[res_pos]<=1'b1; sym_wait<=1'b0; sym_eval<=1'b0; st<=E_DISP;
                 end else if (def_ridx>=def_cnt-7'd1) begin
-                    sym_wait<=1'b0; fault<=1'b1; fault_code<=F_ARG; pc<=cmd_ord; st<=E_FAULT;
+                    sym_wait<=1'b0; sym_eval<=1'b0; fault<=1'b1; fault_code<=F_ARG; pc<=cmd_ord; st<=E_FAULT;
                 end else begin
-                    def_ridx<=def_ridx+7'd1; sym_wait<=1'b0;
+                    def_ridx<=def_ridx+7'd1; sym_wait<=1'b0; sym_eval<=1'b0;
                 end
             end
             E_IADDR: begin                                             // DATA operand-word + DATA[0] BSRAM settle
-                sym_wait<=1'b1; st<=E_DATSCAN;
+                sym_wait<=1'b1; sym_eval<=1'b0; st<=E_DATSCAN;
             end
             E_IFORM: begin
                 if (i_op==8'h21) begin                                 // I2CR addr len dstoff
@@ -2204,18 +2232,30 @@ module eos_exp_exec #(
             end
             E_DATSCAN: begin                                           // resolve DATA name (op_word1); WS uses op_word1 too
                 if (dat_cnt==6'd0) begin fault<=1'b1; fault_code<=F_BADCMD; pc<=cmd_ord; st<=E_FAULT; end
-                else if (!sym_wait) sym_wait<=1'b1;                 // allow synchronous RAM read to settle
-                else if (dat_rword==ow_rdata) begin
-                    sym_wait<=1'b0;
-                    if ((i_dest==1'b0 && (dat_rdlen[14:0]==15'd0 || |dat_rdlen[14:12])) ||
-                        (i_dest==1'b1 && (|dat_rdlen[14:9] || (dat_rdlen[8] && |dat_rdlen[7:0])))) begin
+                else if (!sym_wait) begin
+                    sym_wait<=1'b1; sym_eval<=1'b0;                 // allow synchronous RAM read to settle
+                end else if (!sym_eval) begin
+                    // Pipeline cut for the 128-bit DATA-name compare.  Latch the
+                    // metadata with the compare so no BSRAM output feeds control
+                    // logic directly on the following cycle.
+                    sym_match[0]<=(dat_rword[31:0]   ==ow_rdata[31:0]);
+                    sym_match[1]<=(dat_rword[63:32]  ==ow_rdata[63:32]);
+                    sym_match[2]<=(dat_rword[95:64]  ==ow_rdata[95:64]);
+                    sym_match[3]<=(dat_rword[127:96] ==ow_rdata[127:96]);
+                    sym_dat_off<=dat_rdoff;
+                    sym_dat_len<=dat_rdlen;
+                    sym_eval<=1'b1;
+                end else if (&sym_match) begin
+                    sym_wait<=1'b0; sym_eval<=1'b0;
+                    if ((i_dest==1'b0 && (sym_dat_len[14:0]==15'd0 || |sym_dat_len[14:12])) ||
+                        (i_dest==1'b1 && (|sym_dat_len[14:9] || (sym_dat_len[8] && |sym_dat_len[7:0])))) begin
                         fault<=1'b1; fault_code<=F_ARG; pc<=cmd_ord; st<=E_FAULT;
                     end else begin
-                        hexptr<=dat_rdoff; dlen<=dat_rdlen[12:0]; dcnt<=13'd0; nib_hi_v<=1'b0; st<=E_DHEXF;
+                        hexptr<=sym_dat_off; dlen<=sym_dat_len[12:0]; dcnt<=13'd0; nib_hi_v<=1'b0; st<=E_DHEXF;
                     end
                 end
-                else if (dat_ridx>=dat_cnt-6'd1) begin sym_wait<=1'b0; fault<=1'b1; fault_code<=F_BADCMD; pc<=cmd_ord; st<=E_FAULT; end
-                else begin dat_ridx<=dat_ridx+6'd1; sym_wait<=1'b0; end
+                else if (dat_ridx>=dat_cnt-6'd1) begin sym_wait<=1'b0; sym_eval<=1'b0; fault<=1'b1; fault_code<=F_BADCMD; pc<=cmd_ord; st<=E_FAULT; end
+                else begin dat_ridx<=dat_ridx+6'd1; sym_wait<=1'b0; sym_eval<=1'b0; end
             end
             E_DHEXF: begin x_scr_rd<=1'b1; x_scr_raddr<=hexptr; st<=E_DHEXW; end  // issue 1 read (stable addr)
             E_DHEXW: begin                                             // consume: decode compact hex -> buffer
@@ -2384,6 +2424,7 @@ module eos_exp_pins #(
     input             resetn,
     input             boot_gate,       // 1 = engine live (pins active)
     input             safe_mode,       // 1 = force SAFE (fault/reload)
+    input             init_pulse,      // validated script start/restart: reapply GPIO INIT
 
     input      [63:0] pin_type_flat,
     input      [63:0] pin_init_flat,
@@ -2429,14 +2470,20 @@ module eos_exp_pins #(
     // PWM driver
     reg        pwm_set; reg [2:0] pwm_ch; reg [7:0] pwm_duty; reg [16:0] pwm_freq;
     wire       pwm_busy; wire [7:0] pwm_out;
-    eos_exp_pwm #(.CLK_HZ(CLK_HZ)) u_pwm (.clk(clk),.resetn(resetn),
+    // Lifecycle cleanup reuses the existing reset path instead of adding
+    // another per-channel clear mux/FSM.
+    wire       pwm_resetn = resetn & boot_gate & ~safe_mode & ~init_pulse;
+    eos_exp_pwm #(.CLK_HZ(CLK_HZ)) u_pwm (.clk(clk),.resetn(pwm_resetn),
         .pwm_set(pwm_set),.pwm_ch(pwm_ch),.pwm_duty(pwm_duty),.pwm_freq(pwm_freq),
         .pwm_busy(pwm_busy),.pwm_out(pwm_out));
 
     // WS2812 driver (single channel, routed to the active WS pin)
     wire ws_drv_out;
     reg [2:0] ws_active;
-    eos_exp_ws2812 #(.CLK_HZ(CLK_HZ)) u_ws (.clk(clk),.resetn(resetn),
+    // Stop an in-flight frame on SAFE/reload through the existing reset path.
+    // The LUT-heavy explicit all-zero SAFE-frame sequencer remains deferred.
+    wire ws_resetn = resetn & boot_gate & ~safe_mode;
+    eos_exp_ws2812 #(.CLK_HZ(CLK_HZ)) u_ws (.clk(clk),.resetn(ws_resetn),
         .ws_wr(ws_wr),.ws_waddr(ws_waddr),.ws_wdata(ws_wdata),
         .ws_send(ws_send),.ws_len(ws_len),.ws_zero(ws_zero),
         .ws_busy(ws_busy),.ws_out(ws_drv_out));
@@ -2459,8 +2506,8 @@ module eos_exp_pins #(
         end else begin
             boot_d<=boot_gate; pwm_set<=1'b0; p_done<=1'b0;
 
-            // load INIT into GPIO_OUT pins when the boot gate opens
-            if (boot_rise)
+            // Reapply GPIO INIT on every validated script start/restart.
+            if (boot_rise || init_pulse)
                 for (i=0;i<8;i=i+1)
                     if (ptype(i[2:0])==`EOS_TYPE_GPIO_OUT) gpio_out[i] <= (pinit(i[2:0]) != 8'd0);
 
@@ -2623,6 +2670,7 @@ module eos_exp_i2c #(
 )(
     input             clk,
     input             resetn,
+    input             cancel,          // reload/fault: abort and release the external bus
     // physical open-drain bus (to pinmux)
     input             sda_in,
     input             scl_in,
@@ -2657,8 +2705,16 @@ module eos_exp_i2c #(
     reg        start_go, wr_go, rd_go, rd_send_ack, stop_go; reg [7:0] wr_byte;
     wire       start_done, start_timeout, wr_done, wr_ack, wr_timeout, wr_arb_lost;
     wire       rd_done, rd_timeout, stop_done, m_busy; wire [7:0] rd_byte;
-    eos_i2c_master #(.SCL_LOW_CYCLES(SCL_LOW_CYCLES), .SCL_HIGH_CYCLES(SCL_HIGH_CYCLES))
-      u_m (.clk(clk),.resetn(resetn),
+    // Abort cheaply by reusing both FSMs' existing reset behavior.
+    wire       run_resetn = resetn & ~cancel;
+    eos_i2c_master #(
+        .SCL_LOW_CYCLES(SCL_LOW_CYCLES),
+        .SCL_HIGH_CYCLES(SCL_HIGH_CYCLES),
+        .STRETCH_TIMEOUT(32'd64800),
+        .IDLE_WAIT_TIMEOUT(32'd64800),
+        .BUS_FREE_CYCLES(32'd324),
+        .BOUNDED_WAITS(1'b1)
+    ) u_m (.clk(clk),.resetn(run_resetn),
         .sda_in(sda_in),.scl_in(scl_in),.sda_oe(sda_oe),.scl_oe(scl_oe),
         .start_go(start_go),.start_done(start_done),.start_timeout(start_timeout),
         .wr_go(wr_go),.wr_byte(wr_byte),.wr_done(wr_done),.wr_ack(wr_ack),
@@ -2672,8 +2728,8 @@ module eos_exp_i2c #(
     reg [3:0]  ts;
     reg        rd_l; reg [6:0] addr_l; reg [8:0] len_l, bidx;
 
-    always @(posedge clk or negedge resetn) begin
-        if (!resetn) begin
+    always @(posedge clk or negedge run_resetn) begin
+        if (!run_resetn) begin
             ts<=T_IDLE; i2c_busy<=1'b0; i2c_done<=1'b0; i2c_result<=3'd0;
             start_go<=1'b0; wr_go<=1'b0; rd_go<=1'b0; stop_go<=1'b0; rd_send_ack<=1'b0;
         end else begin
@@ -2705,9 +2761,17 @@ module eos_exp_i2c #(
             T_RD: if (bidx>=len_l) begin stop_go<=1'b1; ts<=T_STOPW; end
                   else begin rd_send_ack<=(bidx < len_l-9'd1); rd_go<=1'b1; ts<=T_RDW; end
             T_RDW: if (rd_done) begin
-                rbuf[bidx[5:0]]<=rd_byte;
-                if (rd_timeout) i2c_result<=3'd3;
-                bidx<=bidx+9'd1; ts<=T_RD;
+                if (rd_timeout) begin
+                    // A failed byte terminates this transfer immediately.
+                    // Do not continue reading the remaining requested length.
+                    i2c_result<=3'd3;
+                    stop_go<=1'b1;
+                    ts<=T_STOPW;
+                end else begin
+                    rbuf[bidx[5:0]]<=rd_byte;
+                    bidx<=bidx+9'd1;
+                    ts<=T_RD;
+                end
             end
             T_STOPW: if (stop_done) ts<=T_DONE;
             T_DONE: begin i2c_done<=1'b1; i2c_busy<=1'b0; ts<=T_IDLE; end
