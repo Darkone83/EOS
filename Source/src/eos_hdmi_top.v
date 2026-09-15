@@ -165,7 +165,7 @@ module eos_hdmi_top (
     wire        mem_valid;
     wire [20:0] mem_addr;
     wire        ef_wr;
-    wire        pfifo_fix_enable;
+    wire        xcode_pad_fix_enable;
     wire [7:0]  ef_data;
     wire [7:0]  mem_data;
 
@@ -184,7 +184,7 @@ module eos_hdmi_top (
     eos_lpc_loader u_loader (
         .clk          (clk_lpc),
         .lreset_n     (lpc_lreset_n),
-        .pfifo_fix_enable (pfifo_fix_enable),
+        .xcode_pad_fix_enable (xcode_pad_fix_enable),
 
         .lclk_pin     (lpc_lclk),
         .lframe_n_pin (lpc_lframe_n),
@@ -800,11 +800,12 @@ module eos_hdmi_top (
     wire [3:0]  hd_encoder_status;
     wire        hd_pll_lock_status, hd_bios_active_status, hd_guard_blocked_status;
 
-    // Arm the transparent PFIFO reset trampoline only for the exact historical
-    // target: an installed HD path on a pre-1.6 Conexant Xbox. The loader then
-    // further requires a user-bank 0xEF launch (0x03..0x09) before arming it.
-    assign pfifo_fix_enable = hd_target_hd && !mode_16 &&
-                              (hd_encoder_status[1:0] == 2'd0);
+    // Enable the ROM/Xcode PADCTL substitution only when the HD controller is
+    // present on the pre-1.6 LPC path and the active video encoder is Conexant.
+    // eos_lpc_loader samples this when a user BIOS bank (0x03..0x09) is selected
+    // and carries that one bit across the following warm reset.
+    assign xcode_pad_fix_enable = hd_target_hd && !mode_16 &&
+                                   (hd_encoder_status[1:0] == 2'd0);
 
     wire [5:0]  hd_brst_status;
     wire [2:0]  hd_disable_reason_status;
@@ -1088,12 +1089,22 @@ module eos_hdmi_top (
         if (raw_reset_high)
             seen_reset_high <= 1'b1;
 
-        if (raw_lclk_edge)
+        // A 1.6 console can leave EOS powered from the 5 V rail while the LPC
+        // interface is inactive. Re-arm the local status indication each time
+        // LPC reset is asserted, then enable it on the first observed LCLK edge.
+        // Pre-1.6 keeps the original sticky LCLK diagnostic behavior.
+        if (mode_16 && !raw_reset_high)
+            seen_lclk_edge <= 1'b0;
+        else if (raw_lclk_edge)
             seen_lclk_edge <= 1'b1;
 
         if (raw_lad_zero)
             seen_lad_zero <= 1'b1;
     end
+
+    // Blank only the local RGB status LED and LED0-LED5 while a 1.6 system is
+    // powered but has not begun LPC activity. The separate bank RGB is untouched.
+    wire status_diag_blank_16 = mode_16 && !seen_lclk_edge;
 
     // -------------------------------------------------------------------------
     // Loader-domain sticky/activity flags
@@ -1121,7 +1132,7 @@ module eos_hdmi_top (
         end
     end
 
-    assign led = ~{
+    assign led = status_diag_blank_16 ? 6'b111111 : ~{
         pdone,
         seen_reset_high,
         seen_lclk_edge,
@@ -1295,11 +1306,15 @@ module eos_hdmi_top (
         end
     end
 
+    // Hold only the local status WS2812 engine in reset while a powered 1.6
+    // console has not begun LPC activity. This avoids a 24-bit color mux and
+    // guarantees the output remains low until normal status indication resumes.
+    // The separate bank WS2812 keeps the unmodified ws_rst_n path below.
     eos_ws2812 #(
         .CLK_HZ(27_000_000)
     ) u_ws (
         .clk    (sys_clk),
-        .rstn   (ws_rst_n),
+        .rstn   (ws_rst_n & ~status_diag_blank_16),
         .grb    (color),
         .ws_out (ws2812)
     );
@@ -1436,7 +1451,7 @@ module eos_hdmi_top (
     //   PURPLE = illegal LPC LAD drive/ownership
     //   BLUE   = illegal/abnormally-long Xbox SMBus drive
     //   WHITE  = two or more fault classes latched
-    //   normal = no monitored fault observed
+    // Existing sticky faults retain priority over normal bank LED behavior.
     wire lpc_fault_sys   = lpc_drive_fault_sys[1];
     wire smbus_fault_sys = smbus_drive_fault_sys[1];
     wire multi_bus_fault = (hdclk_fault_sticky && lpc_fault_sys) ||

@@ -1,3 +1,4 @@
+// main.cpp -- Eos Updater. Xbox-side app that flashes the loader, a BIOS bank,
 // or XbDiag-lite onto the Eos board via the staged/validated/committed datapath.
 //
 // Three flows, source-per-risk:
@@ -29,7 +30,6 @@
 #include "eos_backup.h"
 #include "eos_script.h"
 #include "eos_status.h"
-#include "eos_xhd_diag.h"
 #include "dd_mount.h"
 #include "xboxinternals.h"
 
@@ -65,9 +65,7 @@ enum {
     PH_LOADER_RESTORE_PROMPT,
     PH_LOADER_RESTORING,
     PH_LOADER_FACTORY_WARN,
-    PH_LOADER_FACTORY,
-    PH_ADV_DUMP,
-    PH_XHD_DIAG
+    PH_LOADER_FACTORY
 };
 
 /* what the pending net fetch is for */
@@ -123,6 +121,7 @@ static int        s_flashIsRestore = 0;
 static char       s_flashLeaf[EOS_BANK_NAMELEN + 32];
 
 static EosStatusSnapshot s_status;
+static int        s_hdFixEnabled = 0;
 static EosLayout  s_uiLayout;
 static int        s_uiLayoutValid = 0;
 static int        s_serverChecked = 0;
@@ -138,7 +137,6 @@ static EosBackupSet s_loaderBackup;
 static int        s_loaderHasBackup = 0;
 static int        s_loaderOpPrimed = 0;
 static int        s_resultReboot = 0;
-static int        s_resultHardReboot = 0;
 static char       s_resultBuf[160];
 
 static const char* k_menu[6] = {
@@ -331,16 +329,6 @@ static void SetResult(const char* msg, int canReboot)
     CopyStr(s_resultBuf, sizeof(s_resultBuf), msg ? msg : "");
     s_resultMsg = s_resultBuf;
     s_resultReboot = canReboot;
-    s_resultHardReboot = 0;
-    GotoPhase(PH_RESULT);
-}
-
-static void SetResultHardReboot(const char* msg)
-{
-    CopyStr(s_resultBuf, sizeof(s_resultBuf), msg ? msg : "");
-    s_resultMsg = s_resultBuf;
-    s_resultReboot = 1;
-    s_resultHardReboot = 1;
     GotoPhase(PH_RESULT);
 }
 
@@ -355,8 +343,16 @@ static const char* BaseName(const char* path)
 
 static void RefreshStatus(void)
 {
+    volatile DWORD* dispioPadctl = (volatile DWORD*)0xFD00124C;
+    volatile DWORD* tvdioPadctl = (volatile DWORD*)0xFD001250;
+    DWORD dispioValue;
+    DWORD tvdioValue;
+
     Status_Refresh(&s_status);
     s_scriptInfo = s_status.script;
+    dispioValue = *dispioPadctl;
+    tvdioValue = *tvdioPadctl;
+    s_hdFixEnabled = ((dispioValue == 0x00000000) && (tvdioValue == 0x00007800)) ? 1 : 0;
     RefreshUiLayout();
 }
 
@@ -1050,7 +1046,7 @@ static void Ph_MgmtConfirm(WORD b)
 
 /* Utilities menu rows. Backup/Restore lead into a bank picker; the three clears
    go through the confirm gate. */
-enum { UTIL_BACKUP = 0, UTIL_RESTORE, UTIL_CLR_XBDIAG, UTIL_CLR_SETTINGS, UTIL_CLR_NAMES, UTIL_ADV_DUMP, UTIL_XHD_DIAG, UTIL_COUNT };
+enum { UTIL_BACKUP = 0, UTIL_RESTORE, UTIL_CLR_XBDIAG, UTIL_CLR_SETTINGS, UTIL_CLR_NAMES, UTIL_COUNT };
 
 static void Ph_Utilities(WORD b)
 {
@@ -1070,13 +1066,6 @@ static void Ph_Utilities(WORD b)
         case UTIL_CLR_NAMES:
             CopyStr(s_confirmMsg, sizeof(s_confirmMsg), "Reset all bank names?");
             s_pendAct = ACT_CLEAR_NAMES; GotoPhase(PH_MGMT_CONFIRM); break;
-        case UTIL_ADV_DUMP:
-            // Non-destructive live dump: current updater video mode is preserved.
-            GotoPhase(PH_ADV_DUMP); break;
-        case UTIL_XHD_DIAG:
-            // The next frame explains the destructive mode sweep; the blocking
-            // diagnostic starts only after that frame has actually presented.
-            GotoPhase(PH_XHD_DIAG); break;
         }
     }
 }
@@ -1215,11 +1204,7 @@ static void Ph_LoaderRestoring(WORD b)
     }
     Backup_SetProgressCb(0);
     RefreshStatus();
-
-    /* Keep the success prompt so the user decides when to reboot.  The reboot
-       action itself is HARD so the restored flash/descriptor are reloaded from
-       persistent storage rather than relying on resident BIOS state. */
-    SetResultHardReboot("Loader updated. BIOS banks, Recovery and configuration restored + verified.");
+    SetResult("Loader updated. BIOS banks, Recovery and configuration restored + verified.", 1);
 }
 
 static void Ph_LoaderFactoryWarn(WORD b)
@@ -1244,7 +1229,7 @@ static void Ph_Result(WORD b)
 {
     if (s_resultReboot && Pressed(b, s_prev, BTN_A)) {
         Smb_SetLedMode(0);
-        HalReturnToFirmware(s_resultHardReboot ? RETURN_FIRMWARE_HARD : RETURN_FIRMWARE_REBOOT);
+        HalReturnToFirmware(RETURN_FIRMWARE_REBOOT);
         return;
     }
     if (Pressed(b, s_prev, BTN_B) || (!s_resultReboot && Pressed(b, s_prev, BTN_A))) {
@@ -1297,11 +1282,13 @@ static void Draw_StatusScreen(void)
         Font_Draw(78, y, line, EOS_WHITE); y += 19;
     }
 
-    Gfx_FillRounded(54, 280, g_scrW - 108, 72, 14, EOS_PANEL);
+    Gfx_FillRounded(54, 280, g_scrW - 108, 92, 14, EOS_PANEL);
     DrawStatusValue(290, "XbDiag Lite", s_status.xbdiagPresent ? "Installed" : "Not Installed", EOS_WHITE);
     DrawStatusValue(310, "EOS Script", Script_StateText(s_status.script.state),
         (s_status.script.state == EOS_SCRIPT_FAULT || s_status.script.state == EOS_SCRIPT_INVALID) ? EOS_PURPLE : EOS_WHITE);
     DrawStatusValue(330, "Backups", s_status.backupAvailable ? "Available" : "None Yet", EOS_WHITE);
+    DrawStatusValue(350, "1.0 / 1.1 HD Fix", s_hdFixEnabled ? "Enabled" : "Disabled",
+        s_hdFixEnabled ? EOS_WHITE : EOS_PURPLE);
 
     // Update-server state is useful here; the Xbox network/IP itself is not.
     if (!s_serverChecked) CopyStr(line, sizeof(line), "Update Server: Not checked");
@@ -1317,9 +1304,9 @@ static void Draw_StatusScreen(void)
         }
     }
     if (s_statusMsg[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, 374, s_statusMsg, EOS_PURPLE);
+        Font_DrawCentered(0, g_scrW, 394, s_statusMsg, EOS_PURPLE);
     else
-        Font_DrawCentered(0, g_scrW, 374, line, s_serverChecked && !s_serverOnline ? EOS_PURPLE : EOS_DIM);
+        Font_DrawCentered(0, g_scrW, 394, line, s_serverChecked && !s_serverOnline ? EOS_PURPLE : EOS_DIM);
     Ui_Footer("A Refresh   Y Check Server   B Back");
 }
 
@@ -1549,30 +1536,13 @@ static void DrawPhase(void)
     case PH_UTILITIES: {
         static const char* k_util[UTIL_COUNT] = {
             "Backup Bank -> App Backups", "Restore Bank <- File",
-            "Clear XbDiag Bank", "Reset EOS Settings", "Clear Bank Names",
-            "Dump Current ADV7511", "X-HD Raw Register Sweep"
+            "Clear XbDiag Bank", "Reset EOS Settings", "Clear Bank Names"
         };
         Ui_TitleBar("UTILITIES"); Ui_Menu3D(k_util, UTIL_COUNT, s_utilSel);
         if (s_utilStatus[0]) Font_DrawCentered(0, g_scrW, g_scrH - 94, s_utilStatus, EOS_PURPLE);
         Ui_Footer("A Select   B Back");
         break;
     }
-    case PH_ADV_DUMP:
-        Ui_TitleBar("ADV7511 CURRENT REGISTER DUMP");
-        Font_DrawCentered(40, g_scrW - 40, 204, "Reading live ADV7511 registers 00-FF", EOS_WHITE);
-        Font_DrawCentered(40, g_scrW - 40, 240, "Current video mode is preserved", EOS_WHITE);
-        Font_DrawCentered(40, g_scrW - 40, 292, "Output: D:\\adv7511_current.txt", EOS_PURPLE);
-        Ui_Footer("Dumping automatically...");
-        break;
-    case PH_XHD_DIAG:
-        Ui_TitleBar("X-HD RAW REGISTER SWEEP");
-        Font_DrawCentered(40, g_scrW - 40, 188, "480p -> 10s -> dump 00-FF", EOS_WHITE);
-        Font_DrawCentered(40, g_scrW - 40, 220, "720p -> 10s -> dump 00-FF", EOS_WHITE);
-        Font_DrawCentered(40, g_scrW - 40, 252, "1080i -> 10s -> dump 00-FF", EOS_WHITE);
-        Font_DrawCentered(40, g_scrW - 40, 304, "Output: D:\\regs.txt", EOS_PURPLE);
-        Font_DrawCentered(40, g_scrW - 40, 340, "Display may lose sync during the test.", EOS_DIM);
-        Ui_Footer("Starting automatically...");
-        break;
     case PH_UTIL_BANKPICK: {
         int i, count = Bank_Count();
         static char rows[EOS_BANK_MAX][64]; const char* ptrs[EOS_BANK_MAX];
@@ -1627,12 +1597,6 @@ void __cdecl main(void)
         case PH_RESULT:      Ph_Result(b);    break;
         case PH_UTILITIES:   Ph_Utilities(b); break;
         case PH_UTIL_BANKPICK: Ph_UtilBankPick(b); break;
-        case PH_ADV_DUMP:
-            // No input while the live dump is running; it starts after this frame.
-            break;
-        case PH_XHD_DIAG:
-            // No input while the sweep is running; it starts after this frame.
-            break;
         case PH_LEDCOLOR: {
             int nx = LedPick_Frame(b, s_prev);
             if (nx >= 0) { RefreshUiLayout(); GotoPhase(nx); }
@@ -1651,42 +1615,6 @@ void __cdecl main(void)
             static int armed = 0;
             if (armed) { armed = 0; RunNetFetch(); }
             else armed = 1;
-        }
-
-        // Non-destructive ADV current-state dump. Start only after the
-        // explanatory frame is visible; unlike the mode sweep this keeps the
-        // updater's existing D3D device/video mode alive throughout the read.
-        if (s_phase == PH_ADV_DUMP) {
-            static int advDumpArmed = 0;
-            if (advDumpArmed) {
-                advDumpArmed = 0;
-                if (XhdDiag_DumpCurrent("D:\\adv7511_current.txt"))
-                    SetUtilStatus("ADV dump saved: D:\\adv7511_current.txt");
-                else
-                    SetUtilStatus("ADV dump failed");
-                GotoPhase(PH_UTILITIES);
-            }
-            else advDumpArmed = 1;
-        }
-
-        // X-HD raw register sweep: start only after one complete explanatory
-        // frame has reached the display. From here on the diagnostic owns D3D.
-        if (s_phase == PH_XHD_DIAG) {
-            static int diagArmed = 0;
-            if (diagArmed) {
-                diagArmed = 0;
-                Smb_SetLedMode(0);
-                Splash_Shutdown();
-                Font_Shutdown();
-                Gfx_Shutdown();
-                XhdDiag_Run("D:\\regs.txt");
-
-                // The sweep ends in 1080i. Relaunching the updater rebuilds its
-                // normal graphics state and returns to the configured 720p UI.
-                XLaunchNewImage("D:\\default.xbe", NULL);
-                XLaunchNewImage(NULL, NULL);
-            }
-            else diagArmed = 1;
         }
 
         s_prev = b;

@@ -107,10 +107,9 @@ module eos_lpc_loader #(
     input  wire        clk,                 // DIRECT: Xbox LPC LCLK
     input  wire        lreset_n,
 
-    // One-shot PFIFO workaround arm source. Asserted only while the loader is
-    // running on a pre-1.6 Conexant HD system. A qualifying user-bank 0xEF
-    // write latches the request across the following warm reset.
-    input  wire        pfifo_fix_enable,
+    // Gate for the Conexant/XboxHD+ PBUS pad-control Xcode patch. This is
+    // synchronized locally and sampled only when a user BIOS bank is selected.
+    input  wire        xcode_pad_fix_enable,
 
     input  wire        lclk_pin,            // unused in direct-LCLK mode
     input  wire        lframe_n_pin,        // qualifies LPC START
@@ -263,117 +262,74 @@ module eos_lpc_loader #(
                          (cycle_type == CYC_MEM_WRITE);
 
     // =========================================================================
-    // MakeMHz/XboxHD+ pre-1.6 Conexant PFIFO workaround -- gateware-owned
+    // XboxHD+ / XeniumOS PBUS pad-control Xcode patch
     // =========================================================================
     //
-    // The proven software/kpatch workaround writes:
-    //   0xFD00124C = 0x00000000   NV_PFIFO_CACHE1_DMA_SUBROUTINE
-    //   0xFD001250 = 0x00007800   NV_PFIFO_CACHE1_PULL0
+    // The stock Xbox ROM init table contains these packed 9-byte Xcodes:
     //
-    // An LPC target cannot directly issue host MMIO writes, so EOS performs the
-    // operation transparently with a one-shot x86 reset-vector overlay. When a
-    // qualifying user BIOS is selected (0xEF = 0x03..0x09), pfifo_arm survives
-    // the warm LRESET. The next CPU reset-vector fetch sees a 3-byte near jump
-    // to a 29-byte ROM stub at FFFFE000. The stub performs the two 32-bit MMIO
-    // writes and near-jumps back to FFFFFFF0. Reading the final stub byte clears
-    // pfifo_arm BEFORE the reset-vector target is fetched again, so the original
-    // selected BIOS is then served byte-for-byte from SDRAM.
+    //   03 4C 12 00 0F 8B AA 8B AA
+    //      xc_mem_write 0x0F00124C, 0xAA8BAA8B  (NV_PBUS_DISPIO_PADCTL)
     //
-    // This changes no BIOS image and requires no loader/XBE code once armed.
-    // It is deliberately armed only by an explicit user-bank launch and only
-    // when pfifo_fix_enable was true at that 0xEF write.
+    //   03 50 12 00 0F 8B AA 00 00
+    //      xc_mem_write 0x0F001250, 0x0000AA8B  (NV_PBUS_TVDIO_PADCTL)
     //
-    // Reset-state execution assumptions are standard 32-bit x86 reset semantics:
-    // CS hidden base = FFFF0000h, IP = FFF0h, DS base = 0. The stub uses 0x66
-    // operand-size and 0x67 address-size prefixes for 32-bit EAX/MMIO accesses.
-    localparam [20:0] PFIFO_RESET_BASE = 21'h1FFFF0; // FFFFFFF0 low 21 bits
-    localparam [20:0] PFIFO_STUB_BASE  = 21'h1FE000; // FFFFE000 low 21 bits
-    localparam [20:0] PFIFO_STUB_LAST  = 21'h1FE01C; // 29-byte stub, offset 0x1C
+    // XeniumOS 2.3.5 replaces the resulting runtime values with:
+    //   0xFD00124C = 0x00000000
+    //   0xFD001250 = 0x00007800
+    //
+    // Instead of injecting executable code at the reset vector, patch only the
+    // DATA field of those two Xcodes while the BIOS bytes are served over LPC.
+    // The BIOS' own init engine therefore performs the writes at its normal
+    // point in the NV2A/PBUS initialization sequence. No ROM address is assumed:
+    // matching is content-based and requires consecutive LPC byte reads.
+    //
+    // xcode_patch_arm is configuration-initialized, not LRESET-reset. The Loader
+    // selects a user BIOS via 0x00EF immediately before the warm reset, so the
+    // qualification must survive that reset. Any later 0x00EF selection updates
+    // the arm state again.
 
-    // Configuration-init only; intentionally NO LRESET reset. The latch must
-    // survive exactly the warm reset that follows Bank_Launch.
-    reg pfifo_arm = 1'b0;
+    reg [1:0] xcode_fix_sync = 2'b00;
+    always @(posedge clk)
+        xcode_fix_sync <= {xcode_fix_sync[0], xcode_pad_fix_enable};
 
-    function [7:0] pfifo_stub_byte;
-        input [4:0] off;
-        begin
-            case (off)
-                // 66 B8 00000000       mov eax,0
-                5'h00: pfifo_stub_byte=8'h66;
-                5'h01: pfifo_stub_byte=8'hB8;
-                5'h02: pfifo_stub_byte=8'h00;
-                5'h03: pfifo_stub_byte=8'h00;
-                5'h04: pfifo_stub_byte=8'h00;
-                5'h05: pfifo_stub_byte=8'h00;
-                // 67 66 A3 4C1200FD    mov dword [0xFD00124C],eax
-                5'h06: pfifo_stub_byte=8'h67;
-                5'h07: pfifo_stub_byte=8'h66;
-                5'h08: pfifo_stub_byte=8'hA3;
-                5'h09: pfifo_stub_byte=8'h4C;
-                5'h0A: pfifo_stub_byte=8'h12;
-                5'h0B: pfifo_stub_byte=8'h00;
-                5'h0C: pfifo_stub_byte=8'hFD;
-                // 66 B8 00007800       mov eax,0x00007800
-                5'h0D: pfifo_stub_byte=8'h66;
-                5'h0E: pfifo_stub_byte=8'hB8;
-                5'h0F: pfifo_stub_byte=8'h00;
-                5'h10: pfifo_stub_byte=8'h78;
-                5'h11: pfifo_stub_byte=8'h00;
-                5'h12: pfifo_stub_byte=8'h00;
-                // 67 66 A3 501200FD    mov dword [0xFD001250],eax
-                5'h13: pfifo_stub_byte=8'h67;
-                5'h14: pfifo_stub_byte=8'h66;
-                5'h15: pfifo_stub_byte=8'hA3;
-                5'h16: pfifo_stub_byte=8'h50;
-                5'h17: pfifo_stub_byte=8'h12;
-                5'h18: pfifo_stub_byte=8'h00;
-                5'h19: pfifo_stub_byte=8'hFD;
-                // E9 D31F             jmp near FFF0h (from E01Dh)
-                5'h1A: pfifo_stub_byte=8'hE9;
-                5'h1B: pfifo_stub_byte=8'hD3;
-                5'h1C: pfifo_stub_byte=8'h1F;
-                default: pfifo_stub_byte=8'h90;
-            endcase
-        end
-    endfunction
-
-    wire [20:0] mem_addr_live = {lpc_addr[20:4], lad_in};
-    wire pfifo_reset_hit = pfifo_arm &&
-                           (mem_addr_live[20:4] == PFIFO_RESET_BASE[20:4]) &&
-                           (mem_addr_live[3:0] <= 4'h2);
-    wire pfifo_stub_hit  = pfifo_arm &&
-                           (mem_addr_live[20:5] == PFIFO_STUB_BASE[20:5]) &&
-                           (mem_addr_live[4:0] <= 5'h1C);
-    wire pfifo_overlay_hit = pfifo_reset_hit || pfifo_stub_hit;
-
-    wire [7:0] pfifo_overlay_data = pfifo_reset_hit
-        ? ((mem_addr_live[1:0] == 2'd0) ? 8'hE9 :
-           (mem_addr_live[1:0] == 2'd1) ? 8'h0D : 8'hE0) // jmp E000h
-        : pfifo_stub_byte(mem_addr_live[4:0]);
-
-    // Qualifying 0xEF write at the end of the host write-data phase. The main
-    // FSM still handles the normal bank-select pulse; this parallel latch only
-    // remembers whether the following warm boot needs the PFIFO trampoline.
-    wire [7:0] pfifo_ef_value = {lad_in, write_data[3:0]};
-    wire pfifo_ef_commit = (state == WRITE_DATA1) &&
+    wire [7:0] xcode_ef_value = {lad_in, write_data[3:0]};
+    wire xcode_ef_commit = (state == WRITE_DATA1) &&
                            (cycle_type == CYC_IO_WRITE) &&
                            (lpc_addr[15:0] == PORT_00EF);
-    wire pfifo_ef_is_user = (pfifo_ef_value >= 8'h03) &&
-                            (pfifo_ef_value <= 8'h09);
+    wire xcode_ef_is_user = (xcode_ef_value >= 8'h03) &&
+                            (xcode_ef_value <= 8'h09);
 
-    // Clear as soon as the final byte of the near jump back to FFF0 is fetched.
-    // Nonblocking semantics guarantee that final byte is still served from the
-    // overlay on this clock; subsequent target fetches see the real BIOS.
-    wire pfifo_stub_last_fetch = (state == ADDRESS) &&
-                                 (cycle_type == CYC_MEM_READ) &&
-                                 (count == 4'd0) && pfifo_arm &&
-                                 (mem_addr_live == PFIFO_STUB_LAST);
-
+    reg xcode_patch_arm = 1'b0;
     always @(posedge clk) begin
-        if (pfifo_stub_last_fetch)
-            pfifo_arm <= 1'b0;
-        else if (pfifo_ef_commit)
-            pfifo_arm <= pfifo_fix_enable && pfifo_ef_is_user;
+        if (xcode_ef_commit)
+            xcode_patch_arm <= xcode_fix_sync[1] && xcode_ef_is_user;
+    end
+
+    // Stream matcher states:
+    //   0 idle
+    //   1..4 matching the remaining address-header bytes after opcode 0x03
+    //   5..8 serving the four data bytes, which are replaced below
+    reg [3:0]  xcode_match_state;
+    reg        xcode_target_tvdio;
+    reg [20:0] xcode_prev_addr;
+    reg        xcode_prev_valid;
+
+    wire xcode_seq_now = xcode_prev_valid &&
+                         (mem_addr_r == (xcode_prev_addr + 21'd1));
+
+    reg [7:0] xcode_mem_data;
+    always @* begin
+        xcode_mem_data = mem_data;
+        if (xcode_patch_arm && xcode_seq_now) begin
+            case (xcode_match_state)
+                // DATA is little-endian in the packed XCODE structure.
+                4'd5: xcode_mem_data = 8'h00;
+                4'd6: xcode_mem_data = xcode_target_tvdio ? 8'h78 : 8'h00;
+                4'd7: xcode_mem_data = 8'h00;
+                4'd8: xcode_mem_data = 8'h00;
+                default: ;
+            endcase
+        end
     end
 
     // -------------------------------------------------------------------------
@@ -411,6 +367,11 @@ module eos_lpc_loader #(
             read_buffer    <= 8'd0;
             write_data     <= 8'd0;
 
+            xcode_match_state <= 4'd0;
+            xcode_target_tvdio <= 1'b0;
+            xcode_prev_addr    <= 21'd0;
+            xcode_prev_valid   <= 1'b0;
+
             byte_ready     <= 1'b0;
             sync_cnt       <= {SYNC_CNT_W{1'b0}};
 
@@ -441,8 +402,75 @@ module eos_lpc_loader #(
             // relax this back to an unconditional latch -- with the SYNCING
             // timeout in place, that reintroduces orphaned-response corruption.
             if (mem_accept) begin
-                read_buffer <= mem_data;
+                // Feed the host either the raw BIOS byte or the two narrowly
+                // matched Xcode payload replacements above.
+                read_buffer <= xcode_mem_data;
                 byte_ready  <= 1'b1;
+
+                if (!xcode_patch_arm) begin
+                    xcode_match_state <= 4'd0;
+                    xcode_target_tvdio <= 1'b0;
+                    xcode_prev_valid   <= 1'b0;
+                end else begin
+                    // A discontinuity cannot be part of one packed 9-byte Xcode.
+                    // Restart cleanly, while still allowing the current byte to
+                    // become a new opcode match.
+                    if (!xcode_seq_now) begin
+                        xcode_match_state <= (mem_data == 8'h03) ? 4'd1 : 4'd0;
+                        xcode_target_tvdio <= 1'b0;
+                    end else begin
+                        case (xcode_match_state)
+                            4'd0: begin
+                                xcode_match_state <= (mem_data == 8'h03) ? 4'd1 : 4'd0;
+                                xcode_target_tvdio <= 1'b0;
+                            end
+                            4'd1: begin
+                                if (mem_data == 8'h4C) begin
+                                    xcode_match_state <= 4'd2;
+                                    xcode_target_tvdio <= 1'b0;
+                                end else if (mem_data == 8'h50) begin
+                                    xcode_match_state <= 4'd2;
+                                    xcode_target_tvdio <= 1'b1;
+                                end else begin
+                                    xcode_match_state <= (mem_data == 8'h03) ? 4'd1 : 4'd0;
+                                    xcode_target_tvdio <= 1'b0;
+                                end
+                            end
+                            4'd2: begin
+                                xcode_match_state <= (mem_data == 8'h12) ? 4'd3 :
+                                                     (mem_data == 8'h03) ? 4'd1 : 4'd0;
+                                if (mem_data != 8'h12)
+                                    xcode_target_tvdio <= 1'b0;
+                            end
+                            4'd3: begin
+                                xcode_match_state <= (mem_data == 8'h00) ? 4'd4 :
+                                                     (mem_data == 8'h03) ? 4'd1 : 4'd0;
+                                if (mem_data != 8'h00)
+                                    xcode_target_tvdio <= 1'b0;
+                            end
+                            4'd4: begin
+                                xcode_match_state <= (mem_data == 8'h0F) ? 4'd5 :
+                                                     (mem_data == 8'h03) ? 4'd1 : 4'd0;
+                                if (mem_data != 8'h0F)
+                                    xcode_target_tvdio <= 1'b0;
+                            end
+                            4'd5: xcode_match_state <= 4'd6;
+                            4'd6: xcode_match_state <= 4'd7;
+                            4'd7: xcode_match_state <= 4'd8;
+                            4'd8: begin
+                                xcode_match_state <= 4'd0;
+                                xcode_target_tvdio <= 1'b0;
+                            end
+                            default: begin
+                                xcode_match_state <= 4'd0;
+                                xcode_target_tvdio <= 1'b0;
+                            end
+                        endcase
+                    end
+
+                    xcode_prev_addr  <= mem_addr_r;
+                    xcode_prev_valid <= 1'b1;
+                end
             end
 
             case (state)
@@ -553,19 +581,9 @@ module eos_lpc_loader #(
                             };
 
                             if (cycle_type == CYC_MEM_READ) begin
-                                // One-shot reset-vector/stub overlay for the
-                                // PFIFO workaround. Overlay reads complete
-                                // locally; every other byte follows the normal
-                                // SDRAM backend path unchanged.
-                                if (pfifo_overlay_hit) begin
-                                    read_buffer <= pfifo_overlay_data;
-                                    byte_ready  <= 1'b1;
-                                    state       <= TAR1;
-                                end else begin
-                                    mem_req    <= 1'b1;
-                                    byte_ready <= 1'b0;
-                                    state      <= TAR1;
-                                end
+                                mem_req    <= 1'b1;
+                                byte_ready <= 1'b0;
+                                state      <= TAR1;
                             end else begin
                                 // MEM_WRITE: consume two host data nibbles, then ACK.
                                 write_data <= 8'd0;
