@@ -25,8 +25,12 @@ int Config_ClearAll(void);   // factory-reset both config banks
 int Config_ResetSettings(void);   // reset settings block (0xC) only; banks untouched
 
 // --- persisted loader settings (stored in the settings block, bank 0xC) ------
+#define EOS_THEME_SOURCE_BUILTIN 0
+#define EOS_THEME_SOURCE_HDD     1
+#define EOS_THEME_SOURCE_SD      2
 int  Config_GetThemeIdx(void);
 void Config_SetThemeIdx(int idx);   // clamps, persists settings only
+int  Config_GetCustomThemeSource(void); // Loader settings v5+, read-only here
 
 // Background music (persisted in the settings block). Enable flag + one selected
 // track path. Setters persist immediately (settings bank only).

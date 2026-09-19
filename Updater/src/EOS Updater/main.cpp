@@ -30,6 +30,8 @@
 #include "eos_backup.h"
 #include "eos_script.h"
 #include "eos_status.h"
+#include "eos_xhd_diag.h"
+#include "eos_model.h"
 #include "dd_mount.h"
 #include "xboxinternals.h"
 
@@ -55,6 +57,8 @@ enum {
     PH_RESULT,
     PH_UTILITIES,
     PH_UTIL_BANKPICK,
+    PH_BACKUP_MGMT,
+    PH_XHD_SWEEP_WARN,
     PH_LEDCOLOR,
     PH_SCRIPTS,
     PH_SCRIPT_CONFIRM,
@@ -70,7 +74,7 @@ enum {
 
 /* what the pending net fetch is for */
 enum { FETCH_LOADER = 0, FETCH_XBDIAG, FETCH_STATUS };
-enum { BROWSE_LOADER = 0, BROWSE_BIOS_FLASH, BROWSE_BIOS_RESTORE, BROWSE_SCRIPT };
+enum { BROWSE_LOADER = 0, BROWSE_BIOS_FLASH, BROWSE_BIOS_RESTORE, BROWSE_SCRIPT, BROWSE_FIRMWARE_RESTORE };
 
 /* ---- state ---------------------------------------------------------------- */
 static int        s_phase = PH_SPLASH;
@@ -104,12 +108,16 @@ static int        s_flashTarget = -1;
 static int        s_writePrimed = 0;   /* PH_WRITING: 0=render frame, 1=do write */
 static int        s_renameTarget = -1;
 enum {
-    ACT_NONE = 0, ACT_DELETE, ACT_MGMT_FLASH,
+    ACT_NONE = 0, ACT_DELETE, ACT_MGMT_FLASH, ACT_RESTORE_FIRMWARE,
     ACT_CLEAR_XBDIAG, ACT_CLEAR_SETTINGS, ACT_CLEAR_NAMES
 };
 static int        s_utilSel = 0;    /* selected row in the Utilities menu */
 static int        s_utilBankSel = 0;/* selected bank in the backup/restore picker */
 static int        s_utilMode = 0;   /* 0 = backup, 1 = restore (for the bank picker) */
+static EosBackupEntry s_backupEntries[EOS_BACKUP_LIST_MAX];
+static int        s_backupCount = 0;
+static int        s_backupSel = 0;
+static int        s_backupArm = 0;  /* 0 none, 1 selected delete, 2 clear all */
 static int        s_pendAct = ACT_NONE;
 static int        s_pendIdx = -1;
 static char       s_confirmMsg[80];
@@ -134,6 +142,7 @@ static int        s_scriptOp = 0;       /* 1 install/replace, 2 remove */
 static int        s_scriptPrimed = 0;
 
 static EosBackupSet s_loaderBackup;
+static EosBackupSet s_firmwareBackup;
 static int        s_loaderHasBackup = 0;
 static int        s_loaderOpPrimed = 0;
 static int        s_resultReboot = 0;
@@ -323,6 +332,7 @@ static void SetMgmtStatus(const char* msg)
 }
 
 static void GotoPhase(int p) { s_phase = p; }
+static void SetUtilStatus(const char* m);
 
 static void SetResult(const char* msg, int canReboot)
 {
@@ -420,8 +430,10 @@ static void Boot(void)
     Gfx_Init();
     Font_Init();            /* build the glyph atlas texture (needs g_dev) */
     InitInput();
-    Config_Load();          /* bank table + settings from the config bank */
-    Theme_Init();           /* apply the saved theme (recolours everything) */
+    Config_Load();          /* bank table + settings directly from EOS flash */
+    Theme_Init();           /* model gate is also flash-backed; no storage dependency */
+    Mount_SelfToD();       /* make D:\\ resolve to the updater's own folder */
+    File_MountDrives();    /* expose C/E/F/G for backup/browser operations */
     Net_Start();            /* bring the network up; resolves over next frames */
     /* read Eos firmware version from the chip (SMBus regs 0x01-0x03).
        Use Smb_ReadVersion so ALL THREE reads must succeed together -- a
@@ -442,12 +454,11 @@ static void Boot(void)
         }
     }
     Splash_Init();
-    Mount_SelfToD();       /* make D:\ resolve to the updater's own folder */
-    File_MountDrives();
     s_img = (unsigned char*)MmAllocateContiguousMemory(IMG_CAP);
     s_work = (unsigned char*)MmAllocateContiguousMemory(WORK_CAP);
     s_cwd[0] = 0;
     ZeroMemory(&s_loaderBackup, sizeof(s_loaderBackup));
+    ZeroMemory(&s_firmwareBackup, sizeof(s_firmwareBackup));
     if (!s_img || !s_work) {
         SetResult("Unable to allocate EOS maintenance buffers.", 0);
         return;
@@ -640,7 +651,7 @@ static void drawProgressFrame(const char* title, int done, int total)
     Gfx_Begin(EOS_BG);
     Ui_Backdrop();
     Ui_TitleBar(title);
-    Font_DrawCentered(0, g_scrW, by - 70, "Writing flash - do NOT power off...", EOS_WHITE);
+    Ui_TextCenteredFit(0, g_scrW, by - 70, "Writing flash - do NOT power off...", EOS_WHITE);
 
     Gfx_FillRounded(bx - 2, by - 2, bw + 4, bh + 4, 8, EOS_DIM);        /* track */
     if (fillw > 0) Gfx_FillRounded(bx, by, fillw, bh, 6, EOS_PURPLE);   /* fill  */
@@ -649,7 +660,7 @@ static void drawProgressFrame(const char* title, int done, int total)
     if (pct >= 100) { msg[mp++] = '1'; msg[mp++] = '0'; msg[mp++] = '0'; }
     else { if (pct >= 10) msg[mp++] = (char)('0' + pct / 10); msg[mp++] = (char)('0' + pct % 10); }
     msg[mp++] = '%'; msg[mp] = 0;
-    Font_DrawCentered(0, g_scrW, by + bh + 16, msg, EOS_PURPLE);
+    Ui_TextCenteredFit(0, g_scrW, by + bh + 16, msg, EOS_PURPLE);
 
     Gfx_End();
 }
@@ -690,6 +701,7 @@ static void Ph_Browse(WORD b)
 
     backPhase = (s_browseMode == BROWSE_LOADER) ? PH_LOADER_SRC :
         (s_browseMode == BROWSE_BIOS_RESTORE) ? PH_UTIL_BANKPICK :
+        (s_browseMode == BROWSE_FIRMWARE_RESTORE) ? PH_UTILITIES :
         (s_browseMode == BROWSE_SCRIPT) ? PH_SCRIPTS : PH_BANKMGMT;
 
     if (Pressed(b, s_prev, BTN_B)) {
@@ -738,6 +750,30 @@ static void Ph_Browse(WORD b)
             s_scriptOp = 1;
             s_scriptPrimed = 0;
             GotoPhase(PH_SCRIPT_CONFIRM);
+            return;
+        }
+        if (s_browseMode == BROWSE_FIRMWARE_RESTORE) {
+            const char* fn = BaseName(s_pickedFile);
+            int ln = StrLen(fn);
+            int extOk = 0;
+            if (ln >= 7) {
+                const char* ext = fn + ln - 7;
+                extOk = ((ext[0] == '.') &&
+                    (ext[1] == 'e' || ext[1] == 'E') &&
+                    (ext[2] == 'o' || ext[2] == 'O') &&
+                    (ext[3] == 's' || ext[3] == 'S') &&
+                    (ext[4] == 'b' || ext[4] == 'B') &&
+                    (ext[5] == 'a' || ext[5] == 'A') &&
+                    (ext[6] == 'k' || ext[6] == 'K'));
+            }
+            if (!extOk || !Backup_LoadFirmwareSet(s_pickedFile, &s_firmwareBackup)) {
+                SetUtilStatus("Select a valid firmware.eosbak snapshot");
+                GotoPhase(PH_UTILITIES);
+                return;
+            }
+            CopyStr(s_confirmMsg, sizeof(s_confirmMsg), "Restore this complete EOS firmware snapshot?");
+            s_pendAct = ACT_RESTORE_FIRMWARE;
+            GotoPhase(PH_MGMT_CONFIRM);
             return;
         }
 
@@ -964,14 +1000,14 @@ static void backupProgress(const char* stage, int done, int total)
     bw = (g_scrW * 3) / 5; bh = 28; bx = (g_scrW - bw) / 2; by = g_scrH / 2 + 10;
     fillw = (bw * pct) / 100;
     Gfx_Begin(EOS_BG); Ui_Backdrop(); Ui_TitleBar(stage ? stage : "EOS Backup");
-    Font_DrawCentered(0, g_scrW, by - 70, "EOS maintenance in progress...", EOS_WHITE);
+    Ui_TextCenteredFit(0, g_scrW, by - 70, "EOS maintenance in progress...", EOS_WHITE);
     Gfx_FillRounded(bx - 2, by - 2, bw + 4, bh + 4, 8, EOS_DIM);
     if (fillw > 0) Gfx_FillRounded(bx, by, fillw, bh, 6, EOS_PURPLE);
     if (pct >= 100) { msg[mp++] = '1'; msg[mp++] = '0'; msg[mp++] = '0'; }
     else { if (pct >= 10) msg[mp++] = (char)('0' + pct / 10); msg[mp++] = (char)('0' + pct % 10); }
     msg[mp++] = '%'; msg[mp] = 0;
-    Font_DrawCentered(0, g_scrW, by + bh + 16, msg, EOS_PURPLE);
-    Font_DrawCentered(0, g_scrW, by + bh + 46, "Keep the console powered on until this step completes.", EOS_DIM);
+    Ui_TextCenteredFit(0, g_scrW, by + bh + 16, msg, EOS_PURPLE);
+    Ui_TextCenteredFit(0, g_scrW, by + bh + 46, "Keep the console powered on until this step completes.", EOS_DIM);
     Gfx_End();
 }
 
@@ -990,6 +1026,53 @@ static void DoBackupBank(int idx)
     fn = BaseName(path);
     msg[0] = 0; p = appendStr(msg, p, "Saved: "); appendStr(msg, p, fn);
     SetUtilStatus(msg);
+}
+
+static void DoBackupFirmware(void)
+{
+    const char* folder;
+    const char* leaf;
+    const char* why;
+    char msg[96];
+    int p = 0;
+
+    ZeroMemory(&s_firmwareBackup, sizeof(s_firmwareBackup));
+    Backup_SetProgressCb(backupProgress);
+    if (!Backup_CreateFirmwareSet(&s_firmwareBackup, s_work, WORK_CAP)) {
+        why = Backup_LastError();
+        Backup_SetProgressCb(0);
+        msg[0] = 0; p = appendStr(msg, p, "Firmware backup failed");
+        if (why && why[0]) { p = appendStr(msg, p, ": "); appendStr(msg, p, why); }
+        SetUtilStatus(msg);
+        return;
+    }
+    Backup_SetProgressCb(0);
+    folder = Backup_LastFolder();
+    leaf = BaseName(folder);
+    msg[0] = 0; p = appendStr(msg, p, "Saved snapshot: "); appendStr(msg, p, leaf);
+    SetUtilStatus(msg);
+    RefreshStatus();
+}
+
+static void DoRestoreFirmware(void)
+{
+    char msg[96];
+    int p = 0;
+    const char* why;
+
+    Backup_SetProgressCb(backupProgress);
+    if (!Backup_RestoreLoaderSet(&s_firmwareBackup, s_work, WORK_CAP)) {
+        Backup_SetProgressCb(0);
+        why = Backup_LastError();
+        msg[0] = 0; p = appendStr(msg, p, "Firmware restore failed");
+        if (why && why[0]) { p = appendStr(msg, p, ": "); appendStr(msg, p, why); }
+        SetUtilStatus(msg);
+        return;
+    }
+    Backup_SetProgressCb(0);
+    RefreshStatus();
+    RefreshUiLayout();
+    SetUtilStatus("Firmware snapshot restored + verified");
 }
 
 static void DoClearXbDiag(void)
@@ -1021,7 +1104,8 @@ static void DoClearNames(void)
 static void Ph_MgmtConfirm(WORD b)
 {
     int returnPhase = PH_BANKMGMT;
-    if (s_pendAct == ACT_CLEAR_XBDIAG || s_pendAct == ACT_CLEAR_SETTINGS || s_pendAct == ACT_CLEAR_NAMES)
+    if (s_pendAct == ACT_RESTORE_FIRMWARE || s_pendAct == ACT_CLEAR_XBDIAG ||
+        s_pendAct == ACT_CLEAR_SETTINGS || s_pendAct == ACT_CLEAR_NAMES)
         returnPhase = PH_UTILITIES;
     else if (s_pendAct == ACT_MGMT_FLASH && s_flashIsRestore)
         returnPhase = PH_UTILITIES;
@@ -1029,6 +1113,7 @@ static void Ph_MgmtConfirm(WORD b)
     if (Pressed(b, s_prev, BTN_A)) {
         if (s_pendAct == ACT_DELETE) DoMgmtDelete(s_pendIdx);
         else if (s_pendAct == ACT_MGMT_FLASH) DoMgmtFlash(s_pendIdx);
+        else if (s_pendAct == ACT_RESTORE_FIRMWARE) DoRestoreFirmware();
         else if (s_pendAct == ACT_CLEAR_XBDIAG) DoClearXbDiag();
         else if (s_pendAct == ACT_CLEAR_SETTINGS) DoClearSettings();
         else if (s_pendAct == ACT_CLEAR_NAMES) DoClearNames();
@@ -1044,9 +1129,64 @@ static void Ph_MgmtConfirm(WORD b)
     }
 }
 
-/* Utilities menu rows. Backup/Restore lead into a bank picker; the three clears
-   go through the confirm gate. */
-enum { UTIL_BACKUP = 0, UTIL_RESTORE, UTIL_CLR_XBDIAG, UTIL_CLR_SETTINGS, UTIL_CLR_NAMES, UTIL_COUNT };
+/* Utilities: complete firmware snapshots reuse the Loader-update transaction;
+   single-bank backup/restore remains available for targeted maintenance. */
+enum {
+    UTIL_FW_BACKUP = 0, UTIL_FW_RESTORE, UTIL_BANK_BACKUP, UTIL_BANK_RESTORE,
+    UTIL_BACKUP_MGMT, UTIL_XHD_DUMP, UTIL_XHD_SWEEP,
+    UTIL_CLR_XBDIAG, UTIL_CLR_SETTINGS, UTIL_CLR_NAMES, UTIL_COUNT
+};
+
+static void BackupMgmt_Refresh(void)
+{
+    s_backupCount = Backup_ListEntries(s_backupEntries, EOS_BACKUP_LIST_MAX);
+    if (s_backupSel >= s_backupCount) s_backupSel = (s_backupCount > 0) ? s_backupCount - 1 : 0;
+    if (s_backupSel < 0) s_backupSel = 0;
+}
+
+static void Ph_BackupMgmt(WORD b)
+{
+    if (s_backupArm) {
+        if (Pressed(b, s_prev, BTN_B)) { s_backupArm = 0; return; }
+        if (s_backupArm == 1 && Pressed(b, s_prev, BTN_A)) {
+            if (s_backupCount > 0 && Backup_DeleteEntry(&s_backupEntries[s_backupSel]))
+                SetUtilStatus("Backup deleted");
+            else SetUtilStatus("Backup delete failed");
+            s_backupArm = 0; BackupMgmt_Refresh(); return;
+        }
+        if (s_backupArm == 2 && Pressed(b, s_prev, BTN_X)) {
+            if (Backup_DeleteAll()) SetUtilStatus("All EOS backups cleared");
+            else SetUtilStatus("Some backups could not be deleted");
+            s_backupArm = 0; BackupMgmt_Refresh(); return;
+        }
+        return;
+    }
+
+    if (Pressed(b, s_prev, BTN_B)) { GotoPhase(PH_UTILITIES); return; }
+    if (s_backupCount <= 0) return;
+    if (Pressed(b, s_prev, BTN_DPAD_UP)) s_backupSel = (s_backupSel + s_backupCount - 1) % s_backupCount;
+    if (Pressed(b, s_prev, BTN_DPAD_DOWN)) s_backupSel = (s_backupSel + 1) % s_backupCount;
+    if (Pressed(b, s_prev, BTN_A)) s_backupArm = 1;
+    if (Pressed(b, s_prev, BTN_X)) s_backupArm = 2;
+}
+
+static void Ph_XhdSweepWarn(WORD b)
+{
+    BOOL ok;
+    if (Pressed(b, s_prev, BTN_B)) { GotoPhase(PH_UTILITIES); return; }
+    if (!Pressed(b, s_prev, BTN_A)) return;
+
+    Model_Free();
+    Splash_Shutdown();
+    Font_Shutdown();
+    Gfx_Shutdown();
+    ok = XhdDiag_Run("D:\\xhd_diag.txt");
+    Gfx_Init();
+    Font_Init();
+    Splash_Init();
+    SetUtilStatus(ok ? "X-HD sweep saved: D:\\xhd_diag.txt" : "X-HD sweep failed - see D:\\xhd_diag.txt");
+    GotoPhase(PH_UTILITIES);
+}
 
 static void Ph_Utilities(WORD b)
 {
@@ -1055,8 +1195,24 @@ static void Ph_Utilities(WORD b)
     if (Pressed(b, s_prev, BTN_B)) { s_utilStatus[0] = 0; GotoPhase(PH_MENU); return; }
     if (Pressed(b, s_prev, BTN_A)) {
         switch (s_utilSel) {
-        case UTIL_BACKUP:  s_utilMode = 0; s_utilBankSel = 0; RefreshUiLayout(); GotoPhase(PH_UTIL_BANKPICK); break;
-        case UTIL_RESTORE: s_utilMode = 1; s_utilBankSel = 0; RefreshUiLayout(); GotoPhase(PH_UTIL_BANKPICK); break;
+        case UTIL_FW_BACKUP:
+            DoBackupFirmware();
+            break;
+        case UTIL_FW_RESTORE:
+            s_cwd[0] = 0; s_browseSel = 0; s_browseMode = BROWSE_FIRMWARE_RESTORE;
+            Browse_Refresh(); GotoPhase(PH_BROWSE);
+            break;
+        case UTIL_BANK_BACKUP:  s_utilMode = 0; s_utilBankSel = 0; RefreshUiLayout(); GotoPhase(PH_UTIL_BANKPICK); break;
+        case UTIL_BANK_RESTORE: s_utilMode = 1; s_utilBankSel = 0; RefreshUiLayout(); GotoPhase(PH_UTIL_BANKPICK); break;
+        case UTIL_BACKUP_MGMT:
+            s_backupSel = 0; s_backupArm = 0; BackupMgmt_Refresh(); GotoPhase(PH_BACKUP_MGMT); break;
+        case UTIL_XHD_DUMP:
+            SetUtilStatus(XhdDiag_DumpCurrent("D:\\adv7511_current.txt")
+                ? "ADV/X-HD dump saved: D:\\adv7511_current.txt"
+                : "ADV/X-HD current-state dump failed");
+            break;
+        case UTIL_XHD_SWEEP:
+            GotoPhase(PH_XHD_SWEEP_WARN); break;
         case UTIL_CLR_XBDIAG:
             CopyStr(s_confirmMsg, sizeof(s_confirmMsg), "Clear the XbDiag bank?");
             s_pendAct = ACT_CLEAR_XBDIAG; GotoPhase(PH_MGMT_CONFIRM); break;
@@ -1204,7 +1360,7 @@ static void Ph_LoaderRestoring(WORD b)
     }
     Backup_SetProgressCb(0);
     RefreshStatus();
-    SetResult("Loader updated. BIOS banks, Recovery and configuration restored + verified.", 1);
+    SetResult("Loader updated. BIOS banks, Recovery, XbDiag and configuration restored + verified.", 1);
 }
 
 static void Ph_LoaderFactoryWarn(WORD b)
@@ -1229,7 +1385,7 @@ static void Ph_Result(WORD b)
 {
     if (s_resultReboot && Pressed(b, s_prev, BTN_A)) {
         Smb_SetLedMode(0);
-        HalReturnToFirmware(RETURN_FIRMWARE_REBOOT);
+        Eos_ColdReboot();
         return;
     }
     if (Pressed(b, s_prev, BTN_B) || (!s_resultReboot && Pressed(b, s_prev, BTN_A))) {
@@ -1245,13 +1401,13 @@ static void Draw_ProgressBar(int pct, const char* label)
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
     Gfx_FillRounded(x, y, w, h, h / 2, EOS_PANEL);
     if (pct > 0) Gfx_FillRounded(x, y, (w * pct) / 100, h, h / 2, EOS_PURPLE);
-    Font_DrawCentered(0, g_scrW, y + h + 16, label, EOS_WHITE);
+    Ui_TextCenteredFit(40, g_scrW - 80, y + h + 16, label, EOS_WHITE);
 }
 
 static void DrawStatusValue(int y, const char* label, const char* value, DWORD valueColor)
 {
-    Font_Draw(78, y, label, EOS_DIM);
-    Font_Draw(250, y, value, valueColor);
+    Ui_TextLeftFit(78, y, 154, label, EOS_DIM);
+    Ui_TextLeftFit(250, y, g_scrW - 328, value, valueColor);
 }
 
 static void Draw_StatusScreen(void)
@@ -1279,7 +1435,7 @@ static void Draw_StatusScreen(void)
     for (i = 0; i < 4; ++i) {
         int idx = Bank_IndexForEf((unsigned char)(0x3 + i));
         if (idx >= 0) buildMgmtRow(line, idx); else CopyStr(line, sizeof(line), "Unavailable");
-        Font_Draw(78, y, line, EOS_WHITE); y += 19;
+        Ui_TextLeftFit(78, y, g_scrW - 156, line, EOS_WHITE); y += 19;
     }
 
     Gfx_FillRounded(54, 280, g_scrW - 108, 92, 14, EOS_PANEL);
@@ -1304,9 +1460,10 @@ static void Draw_StatusScreen(void)
         }
     }
     if (s_statusMsg[0] && GetTickCount() < s_statusUntil)
-        Font_DrawCentered(0, g_scrW, 394, s_statusMsg, EOS_PURPLE);
+        Ui_StatusToast(s_statusMsg);
     else
-        Font_DrawCentered(0, g_scrW, 394, line, s_serverChecked && !s_serverOnline ? EOS_PURPLE : EOS_DIM);
+        Ui_TextCenteredFit(40, g_scrW - 80, 382, line,
+            s_serverChecked && !s_serverOnline ? EOS_PURPLE : EOS_DIM);
     Ui_Footer("A Refresh   Y Check Server   B Back");
 }
 
@@ -1317,10 +1474,10 @@ static void DrawFlashPreflight(void)
     Ui_TitleBar(s_flashIsRestore ? "CONFIRM BIOS RESTORE" : "CONFIRM BIOS FLASH");
 
     line[0] = 0; p = appendStr(line, p, "Image: "); appendStr(line, p, s_flashLeaf);
-    Font_DrawCentered(0, g_scrW, 126, line, EOS_WHITE);
+    Ui_TextCenteredFit(0, g_scrW, 126, line, EOS_WHITE);
 
     line[0] = 0; p = 0; p = appendStr(line, p, "Size: "); appendStr(line, p, sizeStr(s_flashPlan.sizeCode));
-    Font_DrawCentered(0, g_scrW, 158, line, EOS_DIM);
+    Ui_TextCenteredFit(0, g_scrW, 158, line, EOS_DIM);
 
     placement[0] = 0;
     if (s_flashPlan.slots == 1) {
@@ -1331,17 +1488,17 @@ static void DrawFlashPreflight(void)
         { int n = StrLen(placement); if (n < (int)sizeof(placement) - 1) { placement[n++] = '-'; placement[n] = 0; } }
         appendSmallInt(placement, sizeof(placement), s_flashPlan.anchorSlot + s_flashPlan.slots);
     }
-    Font_DrawCentered(0, g_scrW, 194, placement, EOS_WHITE);
+    Ui_TextCenteredFit(0, g_scrW, 194, placement, EOS_WHITE);
 
     if (s_flashPlan.slots == 1 && s_pendIdx >= 0) {
         line[0] = 0; p = 0; p = appendStr(line, p, "Current: "); appendStr(line, p, Bank_Occupied(s_pendIdx) ? Bank_Name(s_pendIdx) : "Empty");
-        Font_DrawCentered(0, g_scrW, 226, line, Bank_Occupied(s_pendIdx) ? EOS_PURPLE : EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 226, line, Bank_Occupied(s_pendIdx) ? EOS_PURPLE : EOS_DIM);
     }
     else {
-        Font_DrawCentered(0, g_scrW, 226, "The shown slot range will be reserved for this BIOS.", EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 226, "The shown slot range will be reserved for this BIOS.", EOS_DIM);
     }
 
-    Font_DrawCentered(0, g_scrW, 282, "The target flash area will be erased and verified page-by-page.", EOS_DIM);
+    Ui_TextCenteredFit(0, g_scrW, 282, "The target flash area will be erased and verified page-by-page.", EOS_DIM);
     Ui_Footer("A Confirm Write   B Cancel");
 }
 
@@ -1353,14 +1510,15 @@ static void DrawPhase(void)
     switch (s_phase) {
     case PH_SPLASH:
         Splash_Draw(g_scrW / 2, g_scrH / 2 - 20, 256, EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, g_scrH - 120, "EOS UPDATER", EOS_PURPLE);
+        Ui_TextCenteredFit(0, g_scrW, g_scrH - 120, "EOS UPDATER", EOS_PURPLE);
         break;
 
     case PH_MENU:
         Ui_TitleBar("EOS Maintenance");
         Ui_Menu3D(k_menu, 6, s_menuSel);
-        if (s_eosVer[0]) Font_Draw(g_scrW - 200, g_scrH - 86, s_eosVer, EOS_DIM);
-        Font_Draw(g_scrW - 200, g_scrH - 68, s_status.eosPresent ? "Maintenance Ready" : "EOS Not Detected",
+        if (s_eosVer[0]) Ui_TextLeftFit(g_scrW - 200, g_scrH - 86, 180, s_eosVer, EOS_DIM);
+        Ui_TextLeftFit(g_scrW - 200, g_scrH - 68, 180,
+            s_status.eosPresent ? "Maintenance Ready" : "EOS Not Detected",
             s_status.eosPresent ? EOS_DIM : EOS_PURPLE);
         Ui_Footer("A Select   B Exit");
         break;
@@ -1370,8 +1528,8 @@ static void DrawPhase(void)
         break;
     case PH_STATUS_FETCH:
         Ui_TitleBar("EOS STATUS");
-        Font_DrawCentered(0, g_scrW, 230, "Checking update server...", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 266, EOS_NET_HOST, EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 230, "Checking update server...", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 266, EOS_NET_HOST, EOS_DIM);
         break;
 
     case PH_LOADER_SRC: {
@@ -1386,16 +1544,24 @@ static void DrawPhase(void)
         if (s_browseMode == BROWSE_LOADER) title = "Loader - Pick File";
         else if (s_browseMode == BROWSE_SCRIPT) title = "EOS Script - Pick .eos";
         else if (s_browseMode == BROWSE_BIOS_RESTORE) title = "Restore BIOS - Pick File";
+        else if (s_browseMode == BROWSE_FIRMWARE_RESTORE) title = "Restore Firmware - Pick .eosbak";
         else title = "BIOS - Pick File";
         for (i = 0; i < n && i < EOS_FILE_MAX_ENTRIES; ++i) names[i] = s_entries[i].name;
         Ui_TitleBar(title);
         {
-            int y = 112, rowH = 30, gap = 5, x = 70, w = g_scrW - 140, top = s_browseSel - 5;
+            const int visible = 8;
+            int y = 104, rowH = 30, gap = 5, x = 70, w = g_scrW - 140;
+            int top = s_browseSel - visible / 2;
+            int maxTop = n - visible;
+            if (maxTop < 0) maxTop = 0;
             if (top < 0) top = 0;
-            for (i = top; i < n && i < top + 10; ++i) {
+            if (top > maxTop) top = maxTop;
+            for (i = top; i < n && i < top + visible; ++i) {
                 Ui_PillLeft(x, y, w, rowH, 8, (i == s_browseSel), names[i]);
                 y += rowH + gap;
             }
+            Ui_ScrollBar(x + w + 10, 104, visible * rowH + (visible - 1) * gap,
+                top, visible, n);
         }
         Ui_Footer((s_cwd[0] == 0) ? "A Open drive   B Back" : "A Open/Select   B Up");
         break;
@@ -1408,7 +1574,7 @@ static void DrawPhase(void)
         for (i = 0; i < cap; ++i) { buildMgmtRow(rows[i], i); ptrs[i] = rows[i]; }
         Ui_Menu3D(ptrs, cap, s_bankSel);
         if (s_statusMsg[0] && GetTickCount() < s_statusUntil)
-            Font_DrawCentered(0, g_scrW, g_scrH - 94, s_statusMsg, EOS_PURPLE);
+            Ui_StatusToast(s_statusMsg);
         Ui_Footer("A Flash   X Delete   Y Rename   Black LED   B Back");
         break;
     }
@@ -1419,8 +1585,8 @@ static void DrawPhase(void)
         if (s_pendAct == ACT_MGMT_FLASH) DrawFlashPreflight();
         else {
             Ui_TitleBar("CONFIRM");
-            Font_DrawCentered(0, g_scrW, 220, s_confirmMsg, EOS_WHITE);
-            Font_DrawCentered(0, g_scrW, 260, "This change is persistent.", EOS_DIM);
+            Ui_TextCenteredFit(0, g_scrW, 220, s_confirmMsg, EOS_WHITE);
+            Ui_TextCenteredFit(0, g_scrW, 260, "This change is persistent.", EOS_DIM);
             Ui_Footer("A Yes   B No");
         }
         break;
@@ -1428,121 +1594,163 @@ static void DrawPhase(void)
     case PH_SCRIPTS:
         Ui_TitleBar("EOS SCRIPTS");
         Gfx_FillRounded(74, 126, g_scrW - 148, 150, 16, EOS_PANEL);
-        Font_Draw(96, 148, "Status", EOS_DIM);
-        Font_Draw(250, 148, Script_StateText(s_scriptInfo.state),
+        Ui_TextLeftFit(96, 148, 136, "Status", EOS_DIM);
+        Ui_TextLeftFit(250, 148, g_scrW - 346, Script_StateText(s_scriptInfo.state),
             (s_scriptInfo.state == EOS_SCRIPT_FAULT || s_scriptInfo.state == EOS_SCRIPT_INVALID) ? EOS_PURPLE : EOS_WHITE);
-        Font_Draw(96, 180, "Installed", EOS_DIM);
-        Font_Draw(250, 180, s_scriptInfo.present ? "Yes" : "No", EOS_WHITE);
+        Ui_TextLeftFit(96, 180, 136, "Installed", EOS_DIM);
+        Ui_TextLeftFit(250, 180, g_scrW - 346, s_scriptInfo.present ? "Yes" : "No", EOS_WHITE);
         if (s_scriptInfo.present) {
-            Font_Draw(96, 212, "Target", EOS_DIM);
-            Font_Draw(250, 212, s_scriptInfo.targetHd ? "HD Expansion" : "Standard / NOHD", EOS_WHITE);
+            Ui_TextLeftFit(96, 212, 136, "Target", EOS_DIM);
+            Ui_TextLeftFit(250, 212, g_scrW - 346, s_scriptInfo.targetHd ? "HD Expansion" : "Standard / NOHD", EOS_WHITE);
         }
-        Font_DrawCentered(0, g_scrW, 312, s_scriptInfo.present ? "A Replace Script" : "A Install Script", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 344, s_scriptInfo.present ? "X Remove Script" : "X Remove Script (not installed)", EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 312, s_scriptInfo.present ? "A Replace Script" : "A Install Script", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 344, s_scriptInfo.present ? "X Remove Script" : "X Remove Script (not installed)", EOS_DIM);
         if (s_statusMsg[0] && GetTickCount() < s_statusUntil)
-            Font_DrawCentered(0, g_scrW, 392, s_statusMsg, EOS_PURPLE);
+            Ui_StatusToast(s_statusMsg);
         Ui_Footer("A Install/Replace   X Remove   Y Refresh   B Back");
         break;
 
     case PH_SCRIPT_CONFIRM:
         Ui_TitleBar(s_scriptOp == 2 ? "REMOVE EOS SCRIPT" : "INSTALL EOS SCRIPT");
         if (s_scriptOp == 2) {
-            Font_DrawCentered(0, g_scrW, 202, "Remove the currently installed EOS expansion script?", EOS_WHITE);
-            Font_DrawCentered(0, g_scrW, 238, "The expansion script slot will be erased and resynced.", EOS_DIM);
+            Ui_TextCenteredFit(0, g_scrW, 202, "Remove the currently installed EOS expansion script?", EOS_WHITE);
+            Ui_TextCenteredFit(0, g_scrW, 238, "The expansion script slot will be erased and resynced.", EOS_DIM);
         }
         else {
-            Font_DrawCentered(0, g_scrW, 184, "Install and start this EOS script?", EOS_WHITE);
-            Font_DrawCentered(0, g_scrW, 220, BaseName(s_pickedFile), EOS_PURPLE);
-            Font_DrawCentered(0, g_scrW, 256, "The selected file passed basic .eos size/type validation.", EOS_DIM);
+            Ui_TextCenteredFit(0, g_scrW, 184, "Install and start this EOS script?", EOS_WHITE);
+            Ui_TextCenteredFit(0, g_scrW, 220, BaseName(s_pickedFile), EOS_PURPLE);
+            Ui_TextCenteredFit(0, g_scrW, 256, "The selected file passed basic .eos size/type validation.", EOS_DIM);
         }
         Ui_Footer("A Confirm   B Cancel");
         break;
     case PH_SCRIPT_WORK:
         Ui_TitleBar("EOS SCRIPTS");
-        Font_DrawCentered(0, g_scrW, 230, s_scriptOp == 2 ? "Removing script..." : "Installing and verifying script...", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 270, "Do not power off while flash is being written.", EOS_PURPLE);
+        Ui_TextCenteredFit(0, g_scrW, 230, s_scriptOp == 2 ? "Removing script..." : "Installing and verifying script...", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 270, "Do not power off while flash is being written.", EOS_PURPLE);
         break;
 
     case PH_NET_FETCH:
         Ui_TitleBar((s_fetchWhat == FETCH_LOADER) ? "Update Loader" : "Update XbDiag Lite");
-        Font_DrawCentered(0, g_scrW, 240, "Contacting server...", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 280, EOS_NET_HOST, EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 240, "Contacting server...", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 280, EOS_NET_HOST, EOS_DIM);
         break;
     case PH_STAGE:
         Ui_TitleBar("Validating Update"); Draw_ProgressBar(Update_Progress(&s_job), s_job.msg); break;
     case PH_CONFIRM:
         Ui_TitleBar("Confirm Update");
-        Font_DrawCentered(0, g_scrW, 220, Update_ConfirmText(&s_job), EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 220, Update_ConfirmText(&s_job), EOS_WHITE);
         Ui_Footer("A Confirm Write   B Cancel");
         break;
     case PH_WRITING:
         Ui_TitleBar("Updating");
-        Font_DrawCentered(0, g_scrW, 240, "Writing flash - do NOT power off...", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 280, "Every page is read back and verified.", EOS_PURPLE);
+        Ui_TextCenteredFit(0, g_scrW, 240, "Writing flash - do NOT power off...", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 280, "Every page is read back and verified.", EOS_PURPLE);
         break;
 
     case PH_LOADER_WARN:
         Ui_TitleBar("LOADER UPDATE WARNING");
-        Font_DrawCentered(0, g_scrW, 132, "Updating the EOS Loader replaces the native BIOS region.", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 172, "Native BIOS Banks 1-4 can be erased by this update.", EOS_PURPLE);
-        Font_DrawCentered(0, g_scrW, 214, "Recovery, XbDiag and EOS settings are stored separately.", EOS_DIM);
-        Font_DrawCentered(0, g_scrW, 260, "The updater backs up BIOS banks, Recovery and configuration.", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 132, "Updating the EOS Loader replaces the native BIOS region.", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 172, "Native BIOS Banks 1-4 can be erased by this update.", EOS_PURPLE);
+        Ui_TextCenteredFit(0, g_scrW, 214, "Recovery, XbDiag and EOS settings are stored separately.", EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 260, "The updater backs up BIOS banks, Recovery, XbDiag and configuration.", EOS_WHITE);
         Ui_Footer("A Continue   B Cancel");
         break;
     case PH_LOADER_BACKUP_PROMPT:
         Ui_TitleBar("BACK UP EOS BANKS?");
-        Font_DrawCentered(0, g_scrW, 156, "Recommended: save BIOS banks + Recovery before flashing.", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 198, "Backups, descriptor and bank metadata are stored in:", EOS_DIM);
-        Font_DrawCentered(0, g_scrW, 228, "Updater Folder\\backups\\loader_update_XX", EOS_PURPLE);
-        Font_DrawCentered(0, g_scrW, 276, "Skipping backup will require a factory bank-layout reset after update.", EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 156, "Recommended: save BIOS banks + Recovery + XbDiag before flashing.", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 198, "Backups, descriptor and bank metadata are stored in:", EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 228, "Updater Folder\\backups\\loader_update_XX", EOS_PURPLE);
+        Ui_TextCenteredFit(0, g_scrW, 276, "Skipping backup will require a factory bank-layout reset after update.", EOS_DIM);
         Ui_Footer("A Back Up + Continue   X Skip Backup   B Cancel");
         break;
     case PH_LOADER_BACKINGUP:
         Ui_TitleBar("BACKING UP EOS");
-        Font_DrawCentered(0, g_scrW, 220, "Saving BIOS banks, Recovery, descriptor and bank table...", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 260, "The Loader has not been flashed yet.", EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 220, "Saving BIOS banks, Recovery, XbDiag, descriptor and bank table...", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 260, "The Loader has not been flashed yet.", EOS_DIM);
         break;
     case PH_LOADER_RESTORE_PROMPT:
         Ui_TitleBar("RESTORE EOS BANKS?");
-        Font_DrawCentered(0, g_scrW, 154, "EOS Loader updated successfully.", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 196, "Restore BIOS banks, Recovery and configuration from the backup?", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 240, "Oversized banks are verified first and only rewritten if needed.", EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 154, "EOS Loader updated successfully.", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 196, "Restore BIOS banks, Recovery, XbDiag and configuration from the backup?", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 240, "Oversized banks are verified first and only rewritten if needed.", EOS_DIM);
         if (s_statusMsg[0] && GetTickCount() < s_statusUntil)
-            Font_DrawCentered(0, g_scrW, 300, s_statusMsg, EOS_PURPLE);
+            Ui_StatusToast(s_statusMsg);
         Ui_Footer("A Restore Backup   X Do Not Restore");
         break;
     case PH_LOADER_RESTORING:
         Ui_TitleBar("RESTORING BIOS BANKS");
-        Font_DrawCentered(0, g_scrW, 230, "Restoring and verifying your pre-update bank configuration...", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 230, "Restoring and verifying your pre-update bank configuration...", EOS_WHITE);
         break;
     case PH_LOADER_FACTORY_WARN:
         Ui_TitleBar("RESET BIOS BANK LAYOUT");
-        Font_DrawCentered(0, g_scrW, 140, "BIOS banks will not be restored.", EOS_PURPLE);
-        Font_DrawCentered(0, g_scrW, 182, "EOS will clear Banks 1-4 names, mappings and LED assignments.", EOS_WHITE);
-        Font_DrawCentered(0, g_scrW, 224, "Recovery, XbDiag and unrelated EOS settings are preserved.", EOS_DIM);
-        Font_DrawCentered(0, g_scrW, 270, "Oversized-bank flash bytes are left untouched but unmapped.", EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 140, "BIOS banks will not be restored.", EOS_PURPLE);
+        Ui_TextCenteredFit(0, g_scrW, 182, "EOS will clear Banks 1-4 names, mappings and LED assignments.", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 224, "Recovery, XbDiag and unrelated EOS settings are preserved.", EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 270, "Oversized-bank flash bytes are left untouched but unmapped.", EOS_DIM);
         Ui_Footer(s_loaderHasBackup ? "A Factory Reset Banks   B Return to Restore" : "A Factory Reset Banks");
         break;
     case PH_LOADER_FACTORY:
         Ui_TitleBar("RESETTING BIOS BANKS");
-        Font_DrawCentered(0, g_scrW, 236, "Returning the BIOS bank layout to defaults...", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 236, "Returning the BIOS bank layout to defaults...", EOS_WHITE);
         break;
 
     case PH_RESULT:
         Ui_TitleBar("Result");
-        Font_DrawCentered(40, g_scrW - 40, 230, s_resultMsg, EOS_WHITE);
-        Ui_Footer(s_resultReboot ? "A Reboot   B Main Menu" : "A / B  Back to menu");
+        Ui_TextCenteredFit(40, g_scrW - 80, 230, s_resultMsg, EOS_WHITE);
+        Ui_Footer(s_resultReboot ? "A Cold Reboot   B Main Menu" : "A / B  Back to menu");
         break;
     case PH_UTILITIES: {
         static const char* k_util[UTIL_COUNT] = {
-            "Backup Bank -> App Backups", "Restore Bank <- File",
+            "Backup EOS Firmware", "Restore EOS Firmware",
+            "Backup Single Bank", "Restore Single Bank",
+            "Manage Backups", "ADV/X-HD Current Dump", "X-HD Video Mode Sweep",
             "Clear XbDiag Bank", "Reset EOS Settings", "Clear Bank Names"
         };
         Ui_TitleBar("UTILITIES"); Ui_Menu3D(k_util, UTIL_COUNT, s_utilSel);
-        if (s_utilStatus[0]) Font_DrawCentered(0, g_scrW, g_scrH - 94, s_utilStatus, EOS_PURPLE);
+        if (s_utilStatus[0]) Ui_StatusToast(s_utilStatus);
         Ui_Footer("A Select   B Back");
         break;
     }
+    case PH_BACKUP_MGMT: {
+        const int visible = 8;
+        int top, maxTop, i, y, x, w;
+        Ui_TitleBar("BACKUP MANAGEMENT");
+        if (s_backupCount <= 0) {
+            Ui_TextCenteredFit(0, g_scrW, 226, "No EOS backups found.", EOS_DIM);
+        }
+        else {
+            top = s_backupSel - visible / 2;
+            maxTop = s_backupCount - visible;
+            if (maxTop < 0) maxTop = 0;
+            if (top < 0) top = 0;
+            if (top > maxTop) top = maxTop;
+            x = 70; w = g_scrW - 140; y = 104;
+            for (i = top; i < s_backupCount && i < top + visible; ++i) {
+                Ui_PillLeft(x, y, w, 30, 8, i == s_backupSel, s_backupEntries[i].label);
+                y += 35;
+            }
+            Ui_ScrollBar(x + w + 10, 104, visible * 30 + (visible - 1) * 5,
+                top, visible, s_backupCount);
+        }
+        if (s_utilStatus[0]) Ui_StatusToast(s_utilStatus);
+        if (s_backupArm == 1)
+            Ui_Footer("A Confirm Delete   B Cancel");
+        else if (s_backupArm == 2)
+            Ui_Footer("X Confirm Clear All   B Cancel");
+        else if (s_backupCount > 0)
+            Ui_Footer("A Delete Selected   X Clear All   B Back");
+        else Ui_Footer("B Back");
+        break;
+    }
+    case PH_XHD_SWEEP_WARN:
+        Ui_TitleBar("X-HD VIDEO MODE SWEEP");
+        Ui_TextCenteredFit(0, g_scrW, 158, "Diagnostic only: cycles 480p, 720p and 1080i.", EOS_WHITE);
+        Ui_TextCenteredFit(0, g_scrW, 202, "The display will blank/change modes and each mode settles before capture.", EOS_DIM);
+        Ui_TextCenteredFit(0, g_scrW, 246, "Output is written to D:\\xhd_diag.txt.", EOS_PURPLE);
+        Ui_TextCenteredFit(0, g_scrW, 290, "Do not power off while the sweep is running.", EOS_WHITE);
+        Ui_Footer("A Run Sweep   B Cancel");
+        break;
+
     case PH_UTIL_BANKPICK: {
         int i, count = Bank_Count();
         static char rows[EOS_BANK_MAX][64]; const char* ptrs[EOS_BANK_MAX];
@@ -1597,6 +1805,8 @@ void __cdecl main(void)
         case PH_RESULT:      Ph_Result(b);    break;
         case PH_UTILITIES:   Ph_Utilities(b); break;
         case PH_UTIL_BANKPICK: Ph_UtilBankPick(b); break;
+        case PH_BACKUP_MGMT: Ph_BackupMgmt(b); break;
+        case PH_XHD_SWEEP_WARN: Ph_XhdSweepWarn(b); break;
         case PH_LEDCOLOR: {
             int nx = LedPick_Frame(b, s_prev);
             if (nx >= 0) { RefreshUiLayout(); GotoPhase(nx); }

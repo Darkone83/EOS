@@ -24,12 +24,15 @@
 #define BANKS_VER   1
 #define SET_VER     2
 #define OLD_SET_OFF 240           /* theme offset in the legacy combined "EOSC" page */
+#define SET_THEME_SOURCE_OFF 234   /* Loader settings v5 custom-theme source */
 
 static int s_themeIdx = 0;        /* cached setting, loaded by Config_Load */
 static int s_bgmOn = 0;        /* background music enabled */
 static char s_bgmPath[EOS_BGM_PATH_MAX] = { 0 };  /* selected track path */
+static int s_customThemeSource = EOS_THEME_SOURCE_BUILTIN;
 
 int Config_GetThemeIdx(void) { return s_themeIdx; }
+int Config_GetCustomThemeSource(void) { return s_customThemeSource; }
 
 int         Config_GetBgmOn(void) { return s_bgmOn ? 1 : 0; }
 const char* Config_GetBgmPath(void) { return s_bgmPath; }
@@ -192,6 +195,7 @@ static void loadSettings(void)
 {
     unsigned char buf[256];
     int rc;
+    s_customThemeSource = EOS_THEME_SOURCE_BUILTIN;
     rc = Flash_ReadPage(EOS_SETTINGS_BANK, 0, buf);
     if (rc != EOS_FLASH_OK) return;
     if (!(buf[0] == 'E' && buf[1] == 'O' && buf[2] == 'S' && buf[3] == 'S')) return;
@@ -203,6 +207,11 @@ static void loadSettings(void)
         s_bgmOn = buf[6] ? 1 : 0;
         for (i = 0; i < EOS_BGM_PATH_MAX - 1 && buf[7 + i]; ++i) s_bgmPath[i] = (char)buf[7 + i];
         s_bgmPath[i] = 0;
+    }
+    if (buf[4] >= 5) {
+        int src = (int)buf[SET_THEME_SOURCE_OFF];
+        if (src == EOS_THEME_SOURCE_HDD || src == EOS_THEME_SOURCE_SD)
+            s_customThemeSource = src;
     }
 }
 

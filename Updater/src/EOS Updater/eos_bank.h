@@ -52,6 +52,10 @@ int  Bank_CapacityBytes(int idx);
 // loader's menu instead of a half-mapped region. Call once at startup.
 void Bank_SetResting(void);
 
+// True SMC power-cycle (0x02/0x40): powers off then back on, resetting the
+// FPGA/cold-reset domain. Used after replacing the Loader image. No return.
+void Eos_ColdReboot(void);
+
 // Select the bank in the FPGA (0xEF write) then SMC warm-reset into it.
 // Does not return on real hardware.
 void Bank_Launch(int idx);
@@ -65,7 +69,7 @@ void Eos_TsopBoot(void);
 // XbDiag Lite (bank 0xD): shown in the launch menu only when installed. Launched
 // via a flash sync (page it into SDRAM) then select + warm reset -- not the plain
 // select a real bank uses.
-int  Bank_XbDiagPresent(void);             // 1 = XbDiag Lite installed in slot 0xD
+int  Bank_XbDiagPresent(void);             // live probe: 1 = XbDiag Lite installed in slot 0xD
 void Eos_LaunchXbDiag(void);               // sync 0xD -> select -> warm reset (no return)
 
 // --- diagnostics ---

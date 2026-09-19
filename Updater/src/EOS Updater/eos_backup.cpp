@@ -101,13 +101,13 @@ static int ensure_dir(const char* p)
     return CreateDirectoryA(p, NULL) ? 1 : 0;
 }
 
-static int create_numbered_folder(char* out, int cap)
+static int create_numbered_folder(char* out, int cap, const char* prefix)
 {
     int i;
     char leaf[40];
     if (!ensure_dir("D:\\backups")) return 0;
     for (i = 1; i <= 99; ++i) {
-        scopy(leaf, sizeof(leaf), "loader_update_");
+        scopy(leaf, sizeof(leaf), prefix);
         if (i < 10) scat(leaf, sizeof(leaf), "0");
         append_dec(leaf, sizeof(leaf), i);
         join(out, cap, "D:\\backups", leaf);
@@ -188,6 +188,26 @@ static void recovery_info(EosBackupBank* b)
     b->color = 0xFFFFFFu;
     b->crc32 = 0;
     scopy(b->name, sizeof(b->name), (idx >= 0) ? Bank_Name(idx) : "Recovery");
+    b->file[0] = 0;
+}
+
+static void xbdiag_info(EosBackupBank* b)
+{
+    int idx;
+    if (!b) return;
+    ZeroMemory(b, sizeof(*b));
+    idx = Bank_IndexForEf((unsigned char)EOS_BACKUP_XBDIAG_EF);
+    b->present = Bank_XbDiagPresent() ? 1 : 0;
+    b->tableIndex = idx;
+    b->slot = -1;
+    b->ef = (unsigned char)EOS_BACKUP_XBDIAG_EF;
+    b->sizeCode = EOS_BANK_SIZE_256K;
+    b->bytes = EOS_BACKUP_XBDIAG_BYTES;
+    b->state = EOS_SLOT_NATIVE;
+    b->physBase = 0x200000u;
+    b->color = 0xFFFFFFu;
+    b->crc32 = 0;
+    scopy(b->name, sizeof(b->name), (idx >= 0) ? Bank_Name(idx) : "XbDiag Lite");
     b->file[0] = 0;
 }
 
@@ -317,9 +337,10 @@ static int write_manifest(const EosBackupSet* set)
     char out[4096], path[EOS_BACKUP_PATH_MAX];
     int p = 0, i;
     out[0] = 0;
-    scat(out, sizeof(out), "EOS Loader Update Backup\r\n");
+    scat(out, sizeof(out), "EOS Firmware Snapshot\r\n");
     scat(out, sizeof(out), "Descriptor: ");
     scat(out, sizeof(out), set->descriptorValid ? "Valid" : "Legacy / blank");
+    scat(out, sizeof(out), "\r\nSettings: settings.bin");
     scat(out, sizeof(out), "\r\n\r\n");
     for (i = 0; i < EOS_BACKUP_USER_BANKS; ++i) {
         const EosBackupBank* b = &set->bank[i];
@@ -347,12 +368,69 @@ static int write_manifest(const EosBackupSet* set)
         scat(out, sizeof(out), "\r\nCRC32: "); append_hex8(out, sizeof(out), r->crc32);
         scat(out, sizeof(out), "\r\nFile: recovery.bin\r\n\r\n");
     }
+    if (set->xbdiag.present) {
+        const EosBackupBank* x = &set->xbdiag;
+        scat(out, sizeof(out), "XbDiag Bank\r\n");
+        scat(out, sizeof(out), "Name: "); scat(out, sizeof(out), x->name);
+        scat(out, sizeof(out), "\r\nSize: 256K");
+        scat(out, sizeof(out), "\r\nLayout: System / fixed EF D");
+        scat(out, sizeof(out), "\r\nCRC32: "); append_hex8(out, sizeof(out), x->crc32);
+        scat(out, sizeof(out), "\r\nFile: xbdiag.bin\r\n\r\n");
+    }
     p = slen(out);
     join(path, sizeof(path), set->folder, "manifest.txt");
     return File_WriteFrom(path, (const unsigned char*)out, p) == p ? 1 : 0;
 }
 
-int Backup_CreateLoaderSet(EosBackupSet* set, unsigned char* work, int workCap)
+#define EOS_BACKUP_DISK_MAGIC   0x31424F45u   /* "EOB1" */
+#define EOS_BACKUP_DISK_VERSION 1u
+#define EOS_BACKUP_SNAPSHOT_FILE "firmware.eosbak"
+
+typedef struct EosBackupDisk {
+    DWORD magic;
+    DWORD version;
+    DWORD setBytes;
+    DWORD setCrc;
+    EosBackupSet set;
+} EosBackupDisk;
+
+static int write_snapshot(const EosBackupSet* set, unsigned char* work, int workCap)
+{
+    EosBackupDisk disk;
+    char path[EOS_BACKUP_PATH_MAX];
+    DWORD fileCrc;
+    int got;
+
+    if (!set || !work || workCap < (int)sizeof(disk)) return 0;
+    ZeroMemory(&disk, sizeof(disk));
+    disk.magic = EOS_BACKUP_DISK_MAGIC;
+    disk.version = EOS_BACKUP_DISK_VERSION;
+    disk.setBytes = (DWORD)sizeof(EosBackupSet);
+    disk.set = *set;
+    disk.setCrc = (DWORD)Crc_Buffer((const unsigned char*)&disk.set, (int)sizeof(disk.set));
+    fileCrc = (DWORD)Crc_Buffer((const unsigned char*)&disk, (int)sizeof(disk));
+
+    join(path, sizeof(path), set->folder, EOS_BACKUP_SNAPSHOT_FILE);
+    got = File_WriteFrom(path, (const unsigned char*)&disk, (int)sizeof(disk));
+    if (got != (int)sizeof(disk)) return 0;
+    got = File_ReadInto(path, work, workCap);
+    if (got != (int)sizeof(disk)) return 0;
+    return ((DWORD)Crc_Buffer(work, got) == fileCrc) ? 1 : 0;
+}
+
+static void rebase_snapshot_file(char* out, int cap, const char* folder, const char* oldPath)
+{
+    char leaf[128];
+    int n, at;
+    n = slen(oldPath);
+    at = n;
+    while (at > 0 && oldPath[at - 1] != '\\') --at;
+    scopy(leaf, sizeof(leaf), oldPath + at);
+    join(out, cap, folder, leaf);
+}
+
+static int backup_create_set(EosBackupSet* set, unsigned char* work, int workCap,
+    const char* prefix)
 {
     EosLayout lay;
     int i, count = 0, len;
@@ -361,7 +439,7 @@ int Backup_CreateLoaderSet(EosBackupSet* set, unsigned char* work, int workCap)
     s_lastError[0] = 0;
     if (!set || !work || workCap < 1024 * 1024) return 0;
     ZeroMemory(set, sizeof(*set));
-    if (!create_numbered_folder(set->folder, sizeof(set->folder))) return 0;
+    if (!create_numbered_folder(set->folder, sizeof(set->folder), prefix)) return 0;
     scopy(s_lastFolder, sizeof(s_lastFolder), set->folder);
 
     if (Flash_ReadPage(EOS_BANK_DESCRIPTOR, 0, set->descriptorPage) != EOS_FLASH_OK) return 0;
@@ -414,6 +492,12 @@ int Backup_CreateLoaderSet(EosBackupSet* set, unsigned char* work, int workCap)
     join(path, sizeof(path), set->folder, "banktable.bin");
     if (!write_small_verified(path, set->configPage, 256)) return 0;
 
+    /* Settings are a separate EOS flash block (0xC). Save the raw page too so
+       fan/autoboot/music/custom-theme source survive a full firmware restore. */
+    if (Flash_ReadPage(EOS_SETTINGS_BANK, 0, work) != EOS_FLASH_OK) return 0;
+    join(path, sizeof(path), set->folder, "settings.bin");
+    if (!write_small_verified(path, work, 256)) return 0;
+
     for (i = 0; i < EOS_BACKUP_USER_BANKS; ++i) {
         EosBackupBank* b = &set->bank[i];
         if (!logical_info(i, &lay, b)) continue;
@@ -430,7 +514,7 @@ int Backup_CreateLoaderSet(EosBackupSet* set, unsigned char* work, int workCap)
         len = File_ReadInto(b->file, work, workCap);
         if (len != b->bytes || Crc_Buffer(work, len) != b->crc32) return 0;
         ++count;
-        if (s_progress) s_progress("Saving BIOS + Recovery", count, EOS_BACKUP_USER_BANKS + 1);
+        if (s_progress) s_progress("Saving BIOS + Recovery", count, EOS_BACKUP_USER_BANKS + 2);
     }
 
     /* Recovery is part of every Loader-update safety set even though the current
@@ -448,11 +532,148 @@ int Backup_CreateLoaderSet(EosBackupSet* set, unsigned char* work, int workCap)
     if (len != set->recovery.bytes || Crc_Buffer(work, len) != set->recovery.crc32)
         return backup_fail("Recovery backup verify failed");
     ++count;
-    if (s_progress) s_progress("Saving BIOS + Recovery", count, EOS_BACKUP_USER_BANKS + 1);
+    if (s_progress) s_progress("Saving BIOS + Recovery", count, EOS_BACKUP_USER_BANKS + 2);
+
+    /* XbDiag is stored outside the Loader image, but a persistent firmware
+       snapshot also restores the config page that records its state. Save the
+       bank when installed so a later manual restore cannot produce metadata
+       that says XbDiag exists while its bytes are missing or different. */
+    xbdiag_info(&set->xbdiag);
+    if (set->xbdiag.present) {
+        if (!read_logical(&set->xbdiag, work, workCap))
+            return backup_fail("XbDiag bank could not be read");
+        set->xbdiag.crc32 = Crc_Buffer(work, set->xbdiag.bytes);
+        join(set->xbdiag.file, sizeof(set->xbdiag.file), set->folder, "xbdiag.bin");
+        len = File_WriteFrom(set->xbdiag.file, work, set->xbdiag.bytes);
+        if (len != set->xbdiag.bytes) return backup_fail("XbDiag backup file write failed");
+        len = File_ReadInto(set->xbdiag.file, work, workCap);
+        if (len != set->xbdiag.bytes || Crc_Buffer(work, len) != set->xbdiag.crc32)
+            return backup_fail("XbDiag backup verify failed");
+        ++count;
+        if (s_progress) s_progress("Saving BIOS + Recovery + XbDiag", count, EOS_BACKUP_USER_BANKS + 2);
+    }
 
     set->bankCount = count;
-    if (!write_manifest(set)) return 0;
     set->valid = 1;
+    if (!write_snapshot(set, work, workCap)) { set->valid = 0; return backup_fail("Snapshot metadata write failed"); }
+    /* Manifest is written last and remains the human-readable completion marker. */
+    if (!write_manifest(set)) { set->valid = 0; return backup_fail("Backup manifest write failed"); }
+    if (s_progress) s_progress("Firmware snapshot complete", 1, 1);
+    return 1;
+}
+
+int Backup_CreateLoaderSet(EosBackupSet* set, unsigned char* work, int workCap)
+{
+    return backup_create_set(set, work, workCap, "loader_update_");
+}
+
+int Backup_CreateFirmwareSet(EosBackupSet* set, unsigned char* work, int workCap)
+{
+    return backup_create_set(set, work, workCap, "firmware_backup_");
+}
+
+int Backup_LoadFirmwareSet(const char* snapshotPath, EosBackupSet* set)
+{
+    EosBackupDisk disk;
+    char folder[EOS_BACKUP_PATH_MAX];
+    int got, i, n;
+    DWORD crc;
+
+    s_lastError[0] = 0;
+    if (!snapshotPath || !set) return backup_fail("Invalid firmware snapshot path");
+    got = File_ReadInto(snapshotPath, (unsigned char*)&disk, (int)sizeof(disk));
+    if (got != (int)sizeof(disk)) return backup_fail("Firmware snapshot metadata could not be read");
+    if (disk.magic != EOS_BACKUP_DISK_MAGIC || disk.version != EOS_BACKUP_DISK_VERSION ||
+        disk.setBytes != (DWORD)sizeof(EosBackupSet))
+        return backup_fail("Unsupported firmware snapshot format");
+    crc = (DWORD)Crc_Buffer((const unsigned char*)&disk.set, (int)sizeof(disk.set));
+    if (crc != disk.setCrc) return backup_fail("Firmware snapshot metadata CRC mismatch");
+    if (!disk.set.valid) return backup_fail("Firmware snapshot is incomplete");
+
+    *set = disk.set;
+    scopy(folder, sizeof(folder), snapshotPath);
+    n = slen(folder);
+    while (n > 0 && folder[n - 1] != '\\') --n;
+    if (n <= 0) return backup_fail("Firmware snapshot folder is invalid");
+    folder[n - 1] = 0;
+    scopy(set->folder, sizeof(set->folder), folder);
+
+    /* Rebase payload paths to the selected snapshot's folder. This keeps the
+       backup portable if its complete directory was moved or copied. */
+    for (i = 0; i < EOS_BACKUP_USER_BANKS; ++i) {
+        if (set->bank[i].present)
+            rebase_snapshot_file(set->bank[i].file, sizeof(set->bank[i].file), folder, disk.set.bank[i].file);
+    }
+    if (set->recovery.present)
+        rebase_snapshot_file(set->recovery.file, sizeof(set->recovery.file), folder, disk.set.recovery.file);
+    if (set->xbdiag.present)
+        rebase_snapshot_file(set->xbdiag.file, sizeof(set->xbdiag.file), folder, disk.set.xbdiag.file);
+    scopy(s_lastFolder, sizeof(s_lastFolder), folder);
+    return 1;
+}
+
+static int load_saved_settings(const EosBackupSet* set, unsigned char* out)
+{
+    char path[EOS_BACKUP_PATH_MAX];
+    int got, i, allff = 1, all00 = 1;
+    unsigned sum = 0, stored;
+    if (!set || !out) return -1;
+    join(path, sizeof(path), set->folder, "settings.bin");
+    if (GetFileAttributesA(path) == 0xFFFFFFFF) return 0; /* old snapshot: no settings payload */
+    got = File_ReadInto(path, out, 256);
+    if (got != 256) return -1;
+    for (i = 0; i < 256; ++i) { if (out[i] != 0xFF) allff = 0; if (out[i] != 0x00) all00 = 0; }
+    if (allff || all00) return 1;
+    if (!(out[0] == 'E' && out[1] == 'O' && out[2] == 'S' && out[3] == 'S')) return -1;
+    for (i = 0; i < 254; ++i) sum += out[i];
+    stored = (unsigned)out[254] | ((unsigned)out[255] << 8);
+    return ((sum & 0xFFFF) == stored) ? 1 : -1;
+}
+
+static int validate_restore_set(const EosBackupSet* set, unsigned char* work, int workCap)
+{
+    int i, got;
+    const EosBackupBank* b;
+    const EosBackupBank* r;
+
+    /* Preflight every payload before the first destructive write. This makes a
+       later missing/corrupt file fail closed instead of producing a partial
+       restore. The files are read again during programming so each write still
+       uses freshly CRC-checked bytes. */
+    for (i = 0; i < EOS_BACKUP_USER_BANKS; ++i) {
+        b = &set->bank[i];
+        if (!b->present) continue;
+        if (b->bytes <= 0 || b->bytes > workCap)
+            return backup_fail("Backup BIOS has invalid size");
+        if (b->state == EOS_SLOT_ANCHOR) {
+            if (b->physBase < EOS_NEWRGN_BASE || b->physBase >= EOS_NEWRGN_BASE + 0x100000)
+                return backup_fail("Oversized BIOS has invalid physical placement");
+        }
+        else if (native_start_page(b->slot) < 0)
+            return backup_fail("Native BIOS has invalid slot");
+        got = File_ReadInto(b->file, work, workCap);
+        if (got != b->bytes) return backup_fail("Backup BIOS file could not be read");
+        if (Crc_Buffer(work, got) != b->crc32) return backup_fail("Backup BIOS CRC mismatch");
+    }
+
+    r = &set->recovery;
+    if (!r->present || r->ef != EOS_BACKUP_RECOVERY_EF ||
+        r->bytes != EOS_BACKUP_RECOVERY_BYTES)
+        return backup_fail("Recovery backup is missing or invalid");
+    got = File_ReadInto(r->file, work, workCap);
+    if (got != r->bytes) return backup_fail("Recovery backup file could not be read");
+    if (Crc_Buffer(work, got) != r->crc32) return backup_fail("Recovery backup CRC mismatch");
+
+    if (set->xbdiag.present) {
+        b = &set->xbdiag;
+        if (b->ef != EOS_BACKUP_XBDIAG_EF || b->bytes != EOS_BACKUP_XBDIAG_BYTES)
+            return backup_fail("XbDiag backup is invalid");
+        got = File_ReadInto(b->file, work, workCap);
+        if (got != b->bytes) return backup_fail("XbDiag backup file could not be read");
+        if (Crc_Buffer(work, got) != b->crc32) return backup_fail("XbDiag backup CRC mismatch");
+    }
+    got = load_saved_settings(set, work);
+    if (got < 0) return backup_fail("Settings backup is missing data or corrupt");
     return 1;
 }
 
@@ -462,10 +683,12 @@ int Backup_RestoreLoaderSet(const EosBackupSet* set, unsigned char* work, int wo
     int nativeTouched = 0;
     int newRegionTouched = 0;
     int recoveryTouched = 0;
+    int xbdiagTouched = 0;
 
     s_lastError[0] = 0;
     if (!set || !set->valid || !work || workCap < 1024 * 1024)
         return backup_fail("Invalid backup set or work buffer");
+    if (!validate_restore_set(set, work, workCap)) return 0;
 
     /* DATA FIRST, MAPPING LAST.
        The previous implementation activated the saved descriptor before writing
@@ -532,19 +755,47 @@ int Backup_RestoreLoaderSet(const EosBackupSet* set, unsigned char* work, int wo
             set->bankCount > 0 ? set->bankCount : 1);
     }
 
-    /* Refresh SDRAM only after all writes, avoiding four full bank-E reloads. */
+    /* Restore XbDiag when it was part of the snapshot. It is a fixed system
+       bank and is restored before config metadata for the same reason as Recovery. */
+    if (set->xbdiag.present) {
+        const EosBackupBank* x = &set->xbdiag;
+        int got, rc;
+        got = File_ReadInto(x->file, work, workCap);
+        if (got != x->bytes) return backup_fail("XbDiag backup file could not be read");
+        if (Crc_Buffer(work, got) != x->crc32) return backup_fail("XbDiag backup CRC mismatch");
+        if (!current_matches(x)) {
+            rc = Flash_WriteImageAtNoSync(x->ef, 0, work, got);
+            if (rc != EOS_FLASH_OK) return backup_fail("XbDiag bank flash write failed");
+            if (!verify_at(x->ef, 0, work, got)) return backup_fail("XbDiag bank verify failed");
+            xbdiagTouched = 1;
+        }
+        ++restored;
+        if (s_progress) s_progress("Restoring BIOS + Recovery + XbDiag", restored,
+            set->bankCount > 0 ? set->bankCount : 1);
+    }
+
+    /* Refresh SDRAM only after all writes, avoiding repeated full-bank reloads. */
     if (nativeTouched && Flash_Sync(NATIVE_PHYS_BANK) != EOS_FLASH_OK)
         return backup_fail("Native BIOS SDRAM sync failed");
     if (newRegionTouched && Flash_SyncNewRegion() != EOS_FLASH_OK)
         return backup_fail("Oversized BIOS SDRAM sync failed");
     if (recoveryTouched && Flash_Sync(EOS_BACKUP_RECOVERY_EF) != EOS_FLASH_OK)
         return backup_fail("Recovery bank SDRAM sync failed");
+    if (xbdiagTouched && Flash_Sync(EOS_BACKUP_XBDIAG_EF) != EOS_FLASH_OK)
+        return backup_fail("XbDiag bank SDRAM sync failed");
 
     /* Restore the bank table before the descriptor. If metadata write fails, the
        descriptor is still untouched and the user can retry from the preserved set. */
     if (set->configValid) {
         if (!write_raw_page(EOS_CONFIG_BANK, set->configPage))
             return backup_fail("Bank-table metadata restore failed");
+    }
+
+    {
+        int sr = load_saved_settings(set, work);
+        if (sr < 0) return backup_fail("Settings backup is corrupt");
+        if (sr > 0 && !write_raw_page(EOS_SETTINGS_BANK, work))
+            return backup_fail("Settings metadata restore failed");
     }
 
     /* Descriptor is the final commit point. set->descriptorPage is the reconciled
@@ -651,18 +902,22 @@ int Backup_SaveBankManual(int bankIndex, unsigned char* work, int workCap,
 
 int Backup_HasAny(void)
 {
-    int i;
+    int i, kind;
     char leaf[40], folder[EOS_BACKUP_PATH_MAX], manifest[EOS_BACKUP_PATH_MAX];
+    const char* prefix;
     DWORD a;
 
-    // Count only completed automatic backup sets (manifest written last).
-    for (i = 1; i <= 99; ++i) {
-        scopy(leaf, sizeof(leaf), "loader_update_");
-        if (i < 10) scat(leaf, sizeof(leaf), "0");
-        append_dec(leaf, sizeof(leaf), i);
-        join(folder, sizeof(folder), "D:\\backups", leaf);
-        join(manifest, sizeof(manifest), folder, "manifest.txt");
-        if (File_Exists(manifest)) return 1;
+    // Count only completed full backup sets (manifest written last).
+    for (kind = 0; kind < 2; ++kind) {
+        prefix = (kind == 0) ? "loader_update_" : "firmware_backup_";
+        for (i = 1; i <= 99; ++i) {
+            scopy(leaf, sizeof(leaf), prefix);
+            if (i < 10) scat(leaf, sizeof(leaf), "0");
+            append_dec(leaf, sizeof(leaf), i);
+            join(folder, sizeof(folder), "D:\\backups", leaf);
+            join(manifest, sizeof(manifest), folder, "manifest.txt");
+            if (File_Exists(manifest)) return 1;
+        }
     }
 
     // Manual backups use collision-safe .bin files in this folder. We cannot
@@ -671,3 +926,136 @@ int Backup_HasAny(void)
     a = GetFileAttributesA("D:\\backups\\manual");
     return (a != 0xFFFFFFFF && (a & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0;
 }
+
+// ---- backup management ----------------------------------------------------
+// Keep this intentionally scoped to artifacts EOS itself creates under
+// D:\\backups. Unknown user files/folders are never surfaced or deleted.
+static int backup_starts(const char* s, const char* p)
+{
+    int i = 0;
+    if (!s || !p) return 0;
+    while (p[i]) { if (s[i] != p[i]) return 0; ++i; }
+    return 1;
+}
+
+static int backup_is_dot(const char* s)
+{
+    return s && s[0] == '.' && (s[1] == 0 || (s[1] == '.' && s[2] == 0));
+}
+
+static int backup_delete_tree(const char* path)
+{
+    WIN32_FIND_DATA fd;
+    HANDLE h;
+    char pat[EOS_BACKUP_PATH_MAX + 4];
+    char child[EOS_BACKUP_PATH_MAX];
+    DWORD a;
+    int ok = 1;
+
+    if (!path || !path[0]) return 0;
+    a = GetFileAttributesA(path);
+    if (a == 0xFFFFFFFF) return 1;
+    if (!(a & FILE_ATTRIBUTE_DIRECTORY)) return DeleteFileA(path) ? 1 : 0;
+
+    scopy(pat, sizeof(pat), path);
+    scat(pat, sizeof(pat), "\\*");
+    h = FindFirstFileA(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (backup_is_dot(fd.cFileName)) continue;
+            join(child, sizeof(child), path, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (!backup_delete_tree(child)) ok = 0;
+            }
+            else if (!DeleteFileA(child)) ok = 0;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    if (!RemoveDirectoryA(path)) ok = 0;
+    return ok;
+}
+
+static void backup_swap_entry(EosBackupEntry* a, EosBackupEntry* b)
+{
+    EosBackupEntry t = *a; *a = *b; *b = t;
+}
+
+static int backup_cmp_desc(const char* a, const char* b)
+{
+    int i = 0;
+    while (a[i] && b[i] && a[i] == b[i]) ++i;
+    if (a[i] == b[i]) return 0;
+    return ((unsigned char)a[i] > (unsigned char)b[i]) ? -1 : 1;
+}
+
+int Backup_ListEntries(EosBackupEntry* out, int maxEntries)
+{
+    WIN32_FIND_DATA fd, md;
+    HANDLE h, mh;
+    char path[EOS_BACKUP_PATH_MAX], pat[EOS_BACKUP_PATH_MAX + 4];
+    int n = 0, i, j;
+
+    if (!out || maxEntries <= 0) return 0;
+    scopy(pat, sizeof(pat), "D:\\backups\\*");
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    do {
+        if (backup_is_dot(fd.cFileName)) continue;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+
+        if (backup_starts(fd.cFileName, "loader_update_") ||
+            backup_starts(fd.cFileName, "firmware_backup_")) {
+            if (n >= maxEntries) continue;
+            join(out[n].path, sizeof(out[n].path), "D:\\backups", fd.cFileName);
+            out[n].isFolder = 1;
+            if (backup_starts(fd.cFileName, "loader_update_")) scopy(out[n].label, sizeof(out[n].label), "Loader  ");
+            else scopy(out[n].label, sizeof(out[n].label), "Firmware  ");
+            scat(out[n].label, sizeof(out[n].label), fd.cFileName);
+            ++n;
+        }
+        else if (fd.cFileName[0] == 'm' && fd.cFileName[1] == 'a' &&
+            fd.cFileName[2] == 'n' && fd.cFileName[3] == 'u' &&
+            fd.cFileName[4] == 'a' && fd.cFileName[5] == 'l' && fd.cFileName[6] == 0) {
+            join(path, sizeof(path), "D:\\backups", "manual");
+            scopy(pat, sizeof(pat), path); scat(pat, sizeof(pat), "\\*");
+            mh = FindFirstFileA(pat, &md);
+            if (mh != INVALID_HANDLE_VALUE) {
+                do {
+                    if (backup_is_dot(md.cFileName) || (md.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                    if (n >= maxEntries) continue;
+                    join(out[n].path, sizeof(out[n].path), path, md.cFileName);
+                    out[n].isFolder = 0;
+                    scopy(out[n].label, sizeof(out[n].label), "Bank  ");
+                    scat(out[n].label, sizeof(out[n].label), md.cFileName);
+                    ++n;
+                } while (FindNextFileA(mh, &md));
+                FindClose(mh);
+            }
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+
+    for (i = 0; i < n - 1; ++i)
+        for (j = i + 1; j < n; ++j)
+            if (backup_cmp_desc(out[i].label, out[j].label) > 0) backup_swap_entry(&out[i], &out[j]);
+    return n;
+}
+
+int Backup_DeleteEntry(const EosBackupEntry* entry)
+{
+    if (!entry || !entry->path[0]) return 0;
+    return backup_delete_tree(entry->path);
+}
+
+int Backup_DeleteAll(void)
+{
+    static EosBackupEntry e[EOS_BACKUP_LIST_MAX];
+    int n, i, ok = 1;
+    n = Backup_ListEntries(e, EOS_BACKUP_LIST_MAX);
+    for (i = 0; i < n; ++i) if (!Backup_DeleteEntry(&e[i])) ok = 0;
+    RemoveDirectoryA("D:\\backups\\manual");
+    RemoveDirectoryA("D:\\backups");
+    return ok;
+}
+

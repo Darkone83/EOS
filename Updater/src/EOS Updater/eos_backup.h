@@ -8,6 +8,17 @@
 #define EOS_BACKUP_PATH_MAX   300
 #define EOS_BACKUP_RECOVERY_EF 0x0A
 #define EOS_BACKUP_RECOVERY_BYTES (256 * 1024)
+#define EOS_BACKUP_XBDIAG_EF   0x0D
+#define EOS_BACKUP_XBDIAG_BYTES (256 * 1024)
+
+#define EOS_BACKUP_LIST_MAX    64
+#define EOS_BACKUP_LABEL_MAX   96
+
+typedef struct EosBackupEntry {
+    char label[EOS_BACKUP_LABEL_MAX];
+    char path[EOS_BACKUP_PATH_MAX];
+    int  isFolder;
+} EosBackupEntry;
 
 typedef struct EosBackupBank {
     int present;
@@ -34,14 +45,24 @@ typedef struct EosBackupSet {
     unsigned char configPage[256];
     EosBackupBank bank[EOS_BACKUP_USER_BANKS];
     EosBackupBank recovery;          // mandatory raw Recovery-bank safety image
+    EosBackupBank xbdiag;            // optional XbDiag system bank, if installed
 } EosBackupSet;
 
 typedef void (*BackupProgressCb)(const char* stage, int done, int total);
 void Backup_SetProgressCb(BackupProgressCb cb);
 
 // Create a complete pre-Loader backup set. Returns 1 only when the descriptor,
-// bank table, every occupied logical BIOS bank, and Recovery were saved successfully.
+// bank table, settings page, every occupied logical BIOS bank, Recovery, and installed XbDiag were saved successfully.
 int Backup_CreateLoaderSet(EosBackupSet* set, unsigned char* work, int workCap);
+
+// Create a persistent maintenance snapshot using the same complete transaction
+// as a Loader update. The snapshot metadata is saved beside the bank images as
+// firmware.eosbak so it can be selected and restored in a later updater run.
+int Backup_CreateFirmwareSet(EosBackupSet* set, unsigned char* work, int workCap);
+
+// Load/validate a firmware.eosbak snapshot. Paths are rebased to the selected
+// snapshot folder so an intact backup folder can be moved as a unit.
+int Backup_LoadFirmwareSet(const char* snapshotPath, EosBackupSet* set);
 
 // Restore logical BIOS banks from a set using physical flash paths first, then
 // restore Recovery, bank-table metadata and commit the descriptor last. Oversized banks are
@@ -58,5 +79,11 @@ int Backup_SaveBankManual(int bankIndex, unsigned char* work, int workCap,
     char* outPath, int outCap);
 
 int Backup_HasAny(void);
+
+// Backup-management helpers. Full firmware/loader snapshots are represented as
+// one folder entry; manual single-bank .bin files are represented individually.
+int Backup_ListEntries(EosBackupEntry* out, int maxEntries);
+int Backup_DeleteEntry(const EosBackupEntry* entry);
+int Backup_DeleteAll(void);
 const char* Backup_LastFolder(void);
 const char* Backup_LastError(void);

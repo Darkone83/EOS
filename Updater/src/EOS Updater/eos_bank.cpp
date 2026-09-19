@@ -259,6 +259,23 @@ void Bank_SetResting(void)
     io_out8(0x00EF, 0x01);   // boot bank = safe resting selection
 }
 
+void Eos_ColdReboot(void)
+{
+    volatile int s;
+
+    // Put the bank mux on the Loader before asking the SMC for a real power
+    // cycle. The 0x40 command removes/reapplies power, so the FPGA returns
+    // through its cold-reset/configuration path instead of preserving warm
+    // reset state like the normal bank-launch flow.
+    io_out8(0x00EF, 0x01);
+    for (s = 0; s < 200000; ++s) {}
+    smbus_write_byte(0x10, 0x02, 0x40);
+
+    // The SMC drops power shortly after accepting the command. Never allow the
+    // updater to continue executing against a just-replaced Loader image.
+    for (;;) {}
+}
+
 void Bank_Launch(int idx)
 {
     unsigned char ef;
@@ -304,25 +321,17 @@ void Eos_TsopBoot(void)
     for (;;) {}
 }
 
-// Bank_XbDiagPresent -- 1 if XbDiag Lite is installed in bank 0xD. Probes page 0
-// of the slot ONCE (cached): an all-0xFF page means blank / not installed. Gates
-// whether the launch menu shows XbDiag at all. If the FPGA bitstream lacks 0xD
-// support the read is refused and this returns 0 (XbDiag stays hidden).
-static int s_diagChecked = 0;
-static int s_diagPresent = 0;
+// Bank_XbDiagPresent -- 1 if XbDiag Lite is installed in bank 0xD. Probe page 0
+// live rather than caching it: the updater can install/restore/clear XbDiag in the
+// same session, so a boot-time cache can become stale after maintenance.
 int Bank_XbDiagPresent(void)
 {
     unsigned char pg[256];
     int i, rc;
-    if (s_diagChecked) return s_diagPresent;
-    s_diagChecked = 1;
     rc = Flash_ReadPage(0xD, 0, pg);
-    if (rc == EOS_FLASH_OK) {
-        for (i = 0; i < 256; ++i) {
-            if (pg[i] != 0xFF) { s_diagPresent = 1; break; }
-        }
-    }
-    return s_diagPresent;
+    if (rc != EOS_FLASH_OK) return 0;
+    for (i = 0; i < 256; ++i) if (pg[i] != 0xFF) return 1;
+    return 0;
 }
 
 // Eos_LaunchXbDiag -- page XbDiag Lite (bank 0xD) into the served SDRAM copy, then

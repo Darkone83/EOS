@@ -104,7 +104,8 @@ int LedPick_Frame(unsigned short b, unsigned short prev)
 
         // selection glow behind the highlighted pill
         if (i == s_sel)
-            Gfx_GlowRounded(cx - 5, cy - 5, cellW + 10, cellH + 10, radius + 4, EOS_GLOW);
+            Gfx_GlowSoft(cx + cellW / 2, cy + cellH / 2,
+                cellW + 26, cellH + 24, EOS_GLOW, 38);
 
         Gfx_FillRounded(cx, cy, cellW, cellH, radius, fill);
 
@@ -117,24 +118,16 @@ int LedPick_Frame(unsigned short b, unsigned short prev)
             Gfx_Fill((float)(cx + cellW - 3), (float)cy, 3, (float)cellH, acc);
         }
 
-        // uniform charcoal label, scaled to fit the pill and centered.
-        {
-            const char* nm = Eos_LedPaletteName[i];
-            float k = 0.8f;                                   // slightly smaller for fit
-            int tw = Font_TextWidthScaled(nm, k);
-            int tx = cx + (cellW - tw) / 2;
-            int ty = cy + cellH / 2 - 8;
-            Font_DrawScaled(tx, ty, nm, LED_TEXT_CHARCOAL, k);
-        }
+        // Uniform charcoal label; shared fit logic guarantees every palette
+        // name stays inside its cell without hard-coded per-name scaling.
+        Ui_TextCenteredFit(cx, cellW, cy + (cellH - FONT_CH) / 2,
+            Eos_LedPaletteName[i], LED_TEXT_CHARCOAL);
     }
 
     if (s_errorUntil && GetTickCount() < s_errorUntil)
-        Font_DrawCentered(0, g_scrW, g_scrH - 88,
-            "LED color save failed - retry or go back", EOS_PURPLE);
+        Ui_StatusToast("LED color save failed - retry or go back");
 
-    // helper line (real functions only)
-    Font_DrawCentered(0, g_scrW, g_scrH - 60,
-        "D-PAD MOVE    A SET    B BACK", EOS_DIM);
+    Ui_Footer("D-PAD MOVE    A SET    B BACK");
 
     Gfx_End();
     return -1;   // stay in the picker

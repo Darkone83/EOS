@@ -106,59 +106,171 @@ void Ui_Backdrop(void)
     }
 }
 
-// Soft accent halo behind a selected pill.
+// Draw text centered within a region, scaling only when necessary. A small
+// internal safe margin prevents full-screen strings from touching overscan edges.
+void Ui_TextCenteredFit(int x0, int width, int y, const char* text, DWORD color)
+{
+    int tw, maxW, sw, sx;
+    float k;
+    if (!text || !text[0] || width <= 0) return;
+    maxW = width - 24;
+    if (maxW < 8) maxW = width;
+    tw = Font_TextWidth(text);
+    if (tw <= maxW) {
+        Font_DrawCentered(x0, width, y, text, color);
+        return;
+    }
+    k = (float)maxW / (float)tw;
+    sw = Font_TextWidthScaled(text, k);
+    sx = x0 + (width - sw) / 2;
+    Font_DrawScaled(sx, y, text, color, k);
+}
+
+void Ui_TextLeftFit(int x, int y, int maxW, const char* text, DWORD color)
+{
+    int tw;
+    float k;
+    if (!text || !text[0] || maxW <= 0) return;
+    tw = Font_TextWidth(text);
+    if (tw <= maxW) {
+        Font_Draw(x, y, text, color);
+        return;
+    }
+    k = (float)maxW / (float)tw;
+    Font_DrawScaled(x, y, text, color, k);
+}
+
+// Smooth sprite-based halo: no nested geometric outlines, so selected pills
+// keep a soft bloom even over the high-contrast Darkone83 backdrop.
 static void selGlow(int x, int y, int w, int h, int r)
 {
-    Gfx_GlowRounded(x, y, w, h, r, EOS_GLOW);   // soft additive bloom halo
+    Gfx_GlowSoft(x + w / 2, y + h / 2, w + 48, h + 30, EOS_GLOW, 32);
+    Gfx_GlowSoft(x + w / 2, y + h / 2, w + 18, h + 10 + r / 4, EOS_PURPLE, 18);
 }
 
 void Ui_TitleBar(const char* title)
 {
-    int tw = Font_TextWidth(title);
-    int pw = tw + 64;
-    int ph = 44;
-    int px = (g_scrW - pw) / 2;
-    int py = 22;
-    selGlow(px, py, pw, ph, ph / 2);
-    Gfx_FillRounded(px, py, pw, ph, ph / 2, EOS_PURPLE);
-    Font_DrawCentered(0, g_scrW, py + (ph - FONT_CH) / 2, title, EOS_WHITE);
+    int tw, pw, ph, px, py;
+    if (!title) title = "";
+    tw = Font_TextWidth(title);
+    pw = tw + 64;
+    if (pw > g_scrW - 60) pw = g_scrW - 60;
+    ph = 44;
+    px = (g_scrW - pw) / 2;
+    py = 22;
+
+    Gfx_GlowSoft(px + pw / 2, py + ph / 2, pw + 58, ph + 34, EOS_GLOW, 30);
+    Gfx_GlowSoft(px + pw / 2, py + ph / 2, pw + 24, ph + 14, EOS_PURPLE, 18);
+    // One draw for the entire header face: no cap/body boundary and no
+    // internal sheen/edge strokes for alpha/MSAA to expose as a seam.
+    Gfx_FillCapsule(px, py, pw, ph, EOS_PURPLE);
+    Ui_TextCenteredFit(px, pw, py + (ph - FONT_CH) / 2, title, EOS_WHITE);
 }
 
 void Ui_Footer(const char* hint)
 {
-    Font_DrawCentered(0, g_scrW, g_scrH - 66, hint, EOS_DIM);
+    int tw, pw, ph, px, py;
+    DWORD panel;
+    if (!hint || !hint[0]) return;
+    tw = Font_TextWidth(hint);
+    pw = tw + 42;
+    if (pw > g_scrW - 40) pw = g_scrW - 40;
+    ph = 30;
+    px = (g_scrW - pw) / 2;
+    py = g_scrH - 72;
+    panel = (EOS_PANEL & 0x00FFFFFF) | 0xB8000000;
+    Gfx_FillRounded(px, py, pw, ph, ph / 2, panel);
+    Ui_TextCenteredFit(px, pw, py + (ph - FONT_CH) / 2, hint, EOS_DIM);
+}
+
+void Ui_StatusToast(const char* text)
+{
+    int tw, pw, ph, px, py;
+    DWORD panel, edge;
+    if (!text || !text[0]) return;
+    tw = Font_TextWidth(text);
+    pw = tw + 44;
+    if (pw > g_scrW - 70) pw = g_scrW - 70;
+    ph = 28;
+    px = (g_scrW - pw) / 2;
+    py = g_scrH - 116;
+    panel = (EOS_PANEL & 0x00FFFFFF) | 0xE0000000;
+    edge = (EOS_GLOW & 0x00FFFFFF) | 0x90000000;
+    Gfx_GlowSoft(g_scrW / 2, py + ph / 2, pw + 28, ph + 22, EOS_GLOW, 36);
+    Gfx_FillRounded(px, py, pw, ph, ph / 2, panel);
+    Gfx_Fill((float)(px + 14), (float)(py + ph - 4), (float)(pw - 28), 1.0f, edge);
+    Ui_TextCenteredFit(px, pw, py + (ph - FONT_CH) / 2, text, EOS_WHITE);
+}
+
+void Ui_ScrollBar(int x, int y, int h, int first, int visible, int total)
+{
+    int thumbH, travel, thumbY, maxFirst;
+    DWORD track, thumb;
+    if (total <= visible || visible <= 0 || h < 12) return;
+    if (first < 0) first = 0;
+    maxFirst = total - visible;
+    if (first > maxFirst) first = maxFirst;
+    thumbH = h * visible / total;
+    if (thumbH < 18) thumbH = 18;
+    if (thumbH > h) thumbH = h;
+    travel = h - thumbH;
+    thumbY = y + ((maxFirst > 0) ? (travel * first / maxFirst) : 0);
+    track = (EOS_PANEL & 0x00FFFFFF) | 0x70000000;
+    thumb = (EOS_GLOW & 0x00FFFFFF) | 0xD8000000;
+    Gfx_FillRounded(x, y, 4, h, 2, track);
+    Gfx_FillRounded(x, thumbY, 4, thumbH, 2, thumb);
 }
 
 void Ui_PillCentered(int x, int y, int w, int h, int r, int selected, const char* label)
 {
     if (selected) selGlow(x, y, w, h, r);
     Gfx_FillRounded(x, y, w, h, r, selected ? EOS_PURPLE : UI_PILL_BG);
-    Font_DrawCentered(x, w, y + (h - FONT_CH) / 2, label, selected ? EOS_WHITE : EOS_DIM);
+    Ui_TextCenteredFit(x, w, y + (h - FONT_CH) / 2, label, selected ? EOS_WHITE : EOS_DIM);
 }
 
 void Ui_PillLeft(int x, int y, int w, int h, int r, int selected, const char* label)
 {
     if (selected) selGlow(x, y, w, h, r);
     Gfx_FillRounded(x, y, w, h, r, selected ? EOS_PURPLE : UI_PILL_BG);
-    Font_Draw(x + 18, y + (h - FONT_CH) / 2, label, selected ? EOS_WHITE : EOS_DIM);
+    Ui_TextLeftFit(x + 18, y + (h - FONT_CH) / 2, w - 36, label,
+        selected ? EOS_WHITE : EOS_DIM);
 }
 
 void Ui_PillRow(int x, int y, int w, int h, int r, int selected, int dim,
     const char* label, const char* value)
 {
-    DWORD lcol = selected ? EOS_WHITE : (dim ? EOS_DIM : EOS_WHITE);
-    int   ty = y + (h - FONT_CH) / 2;
+    DWORD lcol, vcol;
+    int ty, lw, vw, inner, gap, svw, vx;
+    float k;
+    lcol = selected ? EOS_WHITE : (dim ? EOS_DIM : EOS_WHITE);
+    vcol = selected ? EOS_WHITE : EOS_DIM;
+    ty = y + (h - FONT_CH) / 2;
     if (selected) selGlow(x, y, w, h, r);
     Gfx_FillRounded(x, y, w, h, r, selected ? EOS_PURPLE : UI_PILL_BG);
-    Font_Draw(x + 20, ty, label, lcol);
-    if (value) {
-        int vx = x + w - 20 - Font_TextWidth(value);
-        Font_Draw(vx, ty, value, selected ? EOS_WHITE : EOS_DIM);
+
+    if (!value || !value[0]) {
+        Ui_TextLeftFit(x + 20, ty, w - 40, label, lcol);
+        return;
     }
+
+    lw = Font_TextWidth(label);
+    vw = Font_TextWidth(value);
+    inner = w - 40;
+    gap = 18;
+    if (lw + vw + gap <= inner) {
+        Font_Draw(x + 20, ty, label, lcol);
+        Font_Draw(x + w - 20 - vw, ty, value, vcol);
+        return;
+    }
+
+    k = (float)(inner - gap) / (float)(lw + vw);
+    Font_DrawScaled(x + 20, ty, label, lcol, k);
+    svw = Font_TextWidthScaled(value, k);
+    vx = x + w - 20 - svw;
+    Font_DrawScaled(vx, ty, value, vcol, k);
 }
 
 // ---- Shared 3D menu (perspective) --------------------------------------
-// Per-channel ARGB blend (kept for receding-panel color fades).
 static DWORD perspLerp(DWORD a, DWORD b, int num, int den)
 {
     int aa, ar, ag, ab, ba, br, bg2, bb;
@@ -173,94 +285,167 @@ static DWORD perspLerp(DWORD a, DWORD b, int num, int den)
     return ((DWORD)aa << 24) | ((DWORD)ar << 16) | ((DWORD)ag << 8) | (DWORD)ab;
 }
 
-// Tuning knobs (world units / radians). Camera at the origin looking +Z.
-#define M3_R      1.85f     // wheel radius -- smaller = tighter vertical spread
-#define M3_ZC     3.95f     // wheel-axis depth (front pill sits at ZC - R = 2.10)
-#define M3_STEP   0.20f     // angular spacing per item (~11.5 deg tilt/step)
-#define M3_K      0.0052f   // world units per atlas pixel (label ~22px at front)
-#define M3_HH     0.11f     // pill half-height (trimmed)
-#define M3_PAD    0.18f     // horizontal padding around the label (trimmed)
-#define M3_FAN    4         // items considered each side of the selection
-#define M3_AMAX   1.20f     // past this angle (~69 deg) an item has rotated away
-#define M3_SWAY   0.05f     // idle sway amplitude (rad) -- keeps it alive
-#define M3_EASE   10.0f     // selection-snap speed (higher = snappier)
+#define M3_R        1.85f
+#define M3_ZC       3.95f
+#define M3_STEP     0.20f
+#define M3_K        0.0052f
+#define M3_HH       0.11f
+#define M3_PAD      0.18f
+#define M3_MAX_HW   1.42f
+#define M3_FAN      4
+#define M3_AMAX     1.20f
+#define M3_SWAY     0.05f
+#define M3_EASE     10.0f
+#define M3_SEL_GLOW 120
+#define M3_SAFE_TOP_DEFAULT  92
+#define M3_SAFE_BOTTOM_DEFAULT (g_scrH - 82)
+#define M3_SAFE_FADE 20
 
-// Animation state. selAnim is the fractional, eased selection the wheel rotates
-// to; the integer sel is the target. Reset when the list (count) changes.
 static float s_selAnim = 0.0f;
 static int   s_animCount = -1;
 static DWORD s_animTick = 0;
 
-// One pill on the wheel at integer index i. The item's angle around the wheel
-// drives BOTH its position (y/z on the cylinder) and its tilt, so its face
-// turns toward/away from the camera -- genuine rotation. Closer to the front
-// (smaller |angle|) = brighter + more opaque; far items fade out.
-static void wheelItem(const char* label, int i, int sel, float aSway)
+// Project a world-space menu Y/Z point back into the 640x480 design space.
+// This exactly mirrors Gfx_Begin3D's 60-degree vertical projection (_22=1.73205).
+// Keep it local so the updater does not need a new public GFX API.
+static float wheelProjectY(float y, float z)
 {
-    float a = (s_selAnim - (float)i) * M3_STEP + aSway;   // +index drops BELOW center
-    float aa = (a < 0.0f) ? -a : a;
-    float ca, sa, yc, zc, twh, hw, f;
-    int   ia;
+    if (z <= 0.001f) return 240.0f;
+    return 240.0f - (y * 1.73205f / z) * 240.0f;
+}
+
+static DWORD wheelScaleAlpha(DWORD c, float k)
+{
+    DWORD a;
+    if (k <= 0.0f) return c & 0x00FFFFFF;
+    if (k >= 1.0f) return c;
+    a = (c >> 24) & 0xFF;
+    a = (DWORD)((float)a * k);
+    return (c & 0x00FFFFFF) | (a << 24);
+}
+
+// Receding pills fade before they enter the title/header or footer helper zones.
+// The selected pill is intentionally exempt so its placement never shifts.
+static float wheelSafeFade(float yc, float zc, float ca, float sa, int topY, int bottomY)
+{
+    float y1, z1, y2, z2, p1, p2, top, bottom, kt, kb, k;
+    y1 = yc + M3_HH * ca; z1 = zc + M3_HH * sa;
+    y2 = yc - M3_HH * ca; z2 = zc - M3_HH * sa;
+    p1 = wheelProjectY(y1, z1);
+    p2 = wheelProjectY(y2, z2);
+    top = (p1 < p2) ? p1 : p2;
+    bottom = (p1 > p2) ? p1 : p2;
+
+    kt = (top - (float)topY) / (float)M3_SAFE_FADE;
+    kb = ((float)bottomY - bottom) / (float)M3_SAFE_FADE;
+    k = (kt < kb) ? kt : kb;
+    if (k < 0.0f) k = 0.0f;
+    if (k > 1.0f) k = 1.0f;
+    return k;
+}
+
+static void wheelItem(const char* label, int i, int sel, float aSway, float selPulse,
+    int topY, int bottomY)
+{
+    float a, aa, ca, sa, yc, zc, twh, hw, f, textK, safeFade;
+    int ia, tw;
     DWORD pill, txt;
 
-    if (aa > M3_AMAX) return;                          // rotated away -- skip
+    a = (s_selAnim - (float)i) * M3_STEP + aSway;
+    aa = (a < 0.0f) ? -a : a;
+    if (aa > M3_AMAX) return;
 
     Gfx_SinCos(a, &sa, &ca);
-    yc = M3_R * sa;                                    // up/down on the cylinder
-    zc = M3_ZC - M3_R * ca;                            // front-most at a==0
-    twh = (float)Font_TextWidth(label) * M3_K * 0.5f;
+    yc = M3_R * sa;
+    zc = M3_ZC - M3_R * ca;
+    tw = Font_TextWidth(label);
+    textK = M3_K;
+    twh = (float)tw * textK * 0.5f;
+    if (twh + M3_PAD > M3_MAX_HW && tw > 0) {
+        textK = ((M3_MAX_HW - M3_PAD) * 2.0f) / (float)tw;
+        twh = (float)tw * textK * 0.5f;
+    }
     hw = twh + M3_PAD;
-    if (hw < M3_HH * 1.6f) hw = M3_HH * 1.6f;          // keep tiny labels pill-shaped
+    if (hw < M3_HH * 1.6f) hw = M3_HH * 1.6f;
 
-    f = 1.0f - aa / M3_AMAX;                           // 1 at front -> 0 at the edge
+    f = 1.0f - aa / M3_AMAX;
     if (f < 0.0f) f = 0.0f;
-    ia = (int)(f * 100.0f);                            // 0..100 for the integer lerps
+    ia = (int)(f * 100.0f);
 
     if (i == sel) {
-        pill = (EOS_PURPLE & 0x00FFFFFF) | 0x80000000; // accent, clearly translucent
+        zc -= 0.075f + selPulse * 0.025f;
+        hw += M3_HH * (0.10f + selPulse * 0.06f);
+        if (hw > M3_MAX_HW + 0.06f) hw = M3_MAX_HW + 0.06f;
+        pill = (EOS_PURPLE & 0x00FFFFFF) | 0x78000000;
         txt = EOS_WHITE | 0xFF000000;
     }
     else {
-        int pa = 0x22 + ia * 0x66 / 100;               // nearer rows denser, far airier
+        int pa;
+        pa = 0x22 + ia * 0x66 / 100;
         pill = (perspLerp(EOS_PANEL, EOS_BG, 100 - ia, 100) & 0x00FFFFFF) | ((DWORD)pa << 24);
         txt = (perspLerp(EOS_DIM, EOS_BG, 100 - ia, 100) & 0x00FFFFFF)
-            | ((DWORD)(0x40 + ia * 0xBF / 100) << 24);  // label fades with depth too
+            | ((DWORD)(0x40 + ia * 0xBF / 100) << 24);
+
+        safeFade = wheelSafeFade(yc, zc, ca, sa, topY, bottomY);
+        if (safeFade <= 0.0f) return;
+        pill = wheelScaleAlpha(pill, safeFade);
+        txt = wheelScaleAlpha(txt, safeFade);
+    }
+
+    if (i == sel) {
+        int glowPeak;
+        glowPeak = M3_SEL_GLOW + (int)(selPulse * 38.0f);
+        Gfx_GlowX3D(0.0f, yc, zc + 0.018f, ca, sa,
+            hw + 0.19f, M3_HH + 0.11f, EOS_GLOW, glowPeak);
     }
 
     Gfx_PillX3D(0.0f, yc, zc, ca, sa, hw, M3_HH, pill);
-    Font_Draw3D(0.0f, yc, zc, ca, sa, M3_K, label, txt);
+    Font_Draw3D(0.0f, yc, zc, ca, sa, textK, label, txt);
 }
 
 void Ui_Menu3D(const char** items, int count, int sel)
 {
-    DWORD now = GetTickCount();
-    float dt, d, aSway;
-    int   ad, side, j;
+    DWORD now;
+    float dt, d, aSway, pulseSin, selPulse;
+    int ad, side, j;
+    int topY, bottomY;
 
     if (count <= 0) return;
     if (sel < 0) sel = 0; else if (sel >= count) sel = count - 1;
 
-    // Advance the easing toward the selected index (snap on list change / wrap).
+    topY = M3_SAFE_TOP_DEFAULT;
+    bottomY = M3_SAFE_BOTTOM_DEFAULT;
+    now = GetTickCount();
     if (s_animCount != count) { s_selAnim = (float)sel; s_animCount = count; s_animTick = now; }
     dt = (float)(now - s_animTick) / 1000.0f;
     if (dt < 0.0f) dt = 0.0f;
     if (dt > 0.10f) dt = 0.10f;
     s_animTick = now;
     d = (float)sel - s_selAnim;
-    if (d > 2.5f || d < -2.5f) s_selAnim = (float)sel;      // wrapped -- don't spin around
-    else { float t = M3_EASE * dt; if (t > 1.0f) t = 1.0f; s_selAnim += d * t; }
+    if (d > 2.5f || d < -2.5f) s_selAnim = (float)sel;
+    else {
+        float t;
+        t = M3_EASE * dt;
+        if (t > 1.0f) t = 1.0f;
+        s_selAnim += d * t;
+    }
 
-    { float sv; Gfx_SinCos((float)now * 0.0011f, &sv, 0); aSway = M3_SWAY * sv; }   // slow idle rock
+    {
+        float sv;
+        Gfx_SinCos((float)now * 0.0011f, &sv, 0);
+        aSway = M3_SWAY * sv;
+    }
+    Gfx_SinCos((float)now * 0.0024f, &pulseSin, 0);
+    selPulse = (pulseSin + 1.0f) * 0.5f;
 
     Gfx_Begin3D();
-    // Farthest (most rotated) first so nearer pills overlap on top.
     for (ad = M3_FAN; ad >= 1; --ad) {
         for (side = -1; side <= 1; side += 2) {
             j = sel + side * ad;
             if (j < 0 || j >= count) continue;
-            wheelItem(items[j], j, sel, aSway);
+            wheelItem(items[j], j, sel, aSway, selPulse, topY, bottomY);
         }
     }
-    wheelItem(items[sel], sel, sel, aSway);                  // selected last, on top
+    wheelItem(items[sel], sel, sel, aSway, selPulse, topY, bottomY);
     Gfx_End3D();
 }

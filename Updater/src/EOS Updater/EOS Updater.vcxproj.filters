@@ -33,9 +33,6 @@
     <ClCompile Include="eos_crc.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="eos_stage.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="eos_update.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -102,6 +99,9 @@
     <ClCompile Include="eos_plasma.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="eos_stage.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Text Include="Media\Copy Assets Here.txt">
@@ -125,9 +125,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="eos_crc.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="eos_stage.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="eos_update.h">
@@ -203,6 +200,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="eos_plasma.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="eos_stage.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

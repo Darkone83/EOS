@@ -70,11 +70,13 @@ int File_IsDir(const char* path)
 
 int File_ListDrives(EosFileEntry* out, int maxEntries)
 {
-    static const char k_letters[7] = { 'C', 'E', 'F', 'G', 'X', 'Y', 'Z' };
+    // D: is the updater's own mounted folder (Mount_SelfToD). Include it so
+    // snapshots written to D:\backups can be selected again for restore.
+    static const char k_letters[8] = { 'C', 'D', 'E', 'F', 'G', 'X', 'Y', 'Z' };
     char root[4];
     int  i, n = 0;
 
-    for (i = 0; i < 7 && n < maxEntries; ++i) {
+    for (i = 0; i < 8 && n < maxEntries; ++i) {
         root[0] = k_letters[i]; root[1] = ':'; root[2] = '\\'; root[3] = 0;
         if (GetFileAttributesA(root) != 0xFFFFFFFF) {
             out[n].name[0] = k_letters[i]; out[n].name[1] = ':'; out[n].name[2] = 0;

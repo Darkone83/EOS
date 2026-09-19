@@ -1,4 +1,4 @@
-// eos_gfx.h -- Minimal D3D8 2D layer for the EOS Loader.
+// eos_gfx.h -- Minimal D3D8 2D/3D layer for the EOS Updater.
 // Pre-transformed textured quads, locked linear (LIN_A8R8G8B8) textures.
 // 640x480 32bpp backbuffer. Alpha-blended; diffuse modulates texture so a
 // white-on-transparent glyph/atlas can be tinted any color at draw time.
@@ -51,11 +51,11 @@ void Gfx_Fill(float x, float y, float w, float h, DWORD color);
 
 // Solid filled rounded rectangle / pill. Integer coords (no float->int, so no
 // __ftol2_sse). radius is clamped to min(w,h)/2; radius>=h/2 gives a capsule.
-// Corners use a generated mask drawn with LINEAR filtering for a smooth edge;
-// the filter is restored to POINT afterward so following text stays crisp.
+// Corners use dense triangle-fan geometry, so capsule ends meet their center
+// rectangles exactly without filtered texture seams.
 void Gfx_FillRounded(int x, int y, int w, int h, int radius, DWORD color);
-void Gfx_FillVGradient(int x, int y, int w, int h, DWORD top, DWORD bottom);
-void Gfx_GlowRounded(int x, int y, int w, int h, int r, DWORD color);
+// Seam-free capsule rendered as one convex fan.
+void Gfx_FillCapsule(int x, int y, int w, int h, DWORD color);
 void Gfx_GlowSoft(int cx, int cy, int w, int h, DWORD color, int peak);
 
 void Gfx_SetFilter(BOOL linear);   // TRUE=LINEAR (logo), FALSE=POINT (text/menu)
@@ -69,14 +69,11 @@ void Gfx_Begin3D(void);
 void Gfx_End3D(void);
 
 // Camera-facing quad at world (cx,cy,cz), half extents (hw,hh), tinted by the
-// vertex diffuse color (alpha honored). Fill = solid white tex; Add = additive
-// (glow/highlight). Orb3D billboards the soft glow sprite additively.
-void Gfx_Quad3D(float cx, float cy, float cz, float hw, float hh, DWORD c,
-    IDirect3DTexture8* tex, float u0, float v0, float u1, float v1);
-void Gfx_Quad3DFill(float cx, float cy, float cz, float hw, float hh, DWORD c);
-void Gfx_Quad3DAdd(float cx, float cy, float cz, float hw, float hh, DWORD c,
-    IDirect3DTexture8* tex);
+// vertex diffuse color (alpha honored). Orb3D is the lit backdrop sphere;
+// GlowX3D uses the soft radial sprite additively for selection bloom.
 void Gfx_Orb3D(float cx, float cy, float cz, float size, DWORD color, int peak);
+void Gfx_GlowX3D(float cx, float cy, float cz, float ca, float sa,
+    float hw, float hh, DWORD color, int peak);
 
 // CRT-free sine/cosine (range-reduced; ~0.1% error). For wheel rotation.
 void Gfx_SinCos(float a, float* s, float* c);
@@ -88,7 +85,7 @@ void Gfx_Quad3DP(float cx, float cy, float cz, float ca, float sa,
     float lcx, float lcy, float hw, float hh, DWORD c,
     IDirect3DTexture8* tex, float u0, float v0, float u1, float v1);
 
-// Rounded, translucent 3D pill (3-slice: flat middle + disc end-caps), tilted
-// by (ca,sa). 'c' carries tint + alpha so pills are properly see-through.
+// Rounded translucent 3D pill: flat center + geometric semicircle caps in the
+// same tilted plane, eliminating filtered cap/body seams.
 void Gfx_PillX3D(float cx, float cy, float cz, float ca, float sa,
     float hw, float hh, DWORD c);

@@ -32,6 +32,7 @@ EosTheme g_theme = { "Eos Purple",
                      THEME_ARGB(0xFF,245,243,255), THEME_ARGB(0xFF,139,127,168) };
 
 static int s_idx = 0;
+static int s_customThemeActive = 0;  // loader custom theme selected in EOS settings flash
 
 static void apply(int idx)
 {
@@ -43,7 +44,10 @@ static void apply(int idx)
 
 void Theme_Init(void)
 {
-    apply(Config_GetThemeIdx());   // config default is 0 if never saved
+    // The loader owns custom-theme selection in EOS settings flash. Storage is
+    // only an asset source, so the updater never probes HDD or SD to gate the model.
+    s_customThemeActive = (Config_GetCustomThemeSource() != EOS_THEME_SOURCE_BUILTIN);
+    apply(Config_GetThemeIdx());   // saved built-in index remains the fallback palette
 }
 
 int Theme_Count(void) { return THEME_COUNT; }
@@ -57,7 +61,7 @@ const char* Theme_Name(int idx)
 int Theme_Index(void) { return s_idx; }
 
 // Darkone 83 is the final built-in theme, matching the loader theme index.
-int Theme_BgIsModel(void) { return s_idx == THEME_COUNT - 1; }
+int Theme_BgIsModel(void) { return !s_customThemeActive && s_idx == THEME_COUNT - 1; }
 
 void Theme_Set(int idx)
 {

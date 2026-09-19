@@ -141,10 +141,16 @@ class I2cStudioDialog(QDialog):
         bf.addWidget(QLabel("Device")); bf.addWidget(self.ed_dev); bf.addWidget(QLabel("7-bit addr")); bf.addWidget(self.sp_addr)
         root.addWidget(bus)
 
+        # Create the status widget before the tabs are populated.  The doorbell
+        # builder seeds its default registers/commands during construction, and
+        # add_reg()/add_cmd() call refresh_all().  refresh_all() updates
+        # lbl_status, so the widget must already exist at that point.
+        self.lbl_status = QLabel()
+
         self.tabs = QTabWidget(); root.addWidget(self.tabs, 1)
         self._build_quick_tab(); self._build_doorbell_tab()
 
-        bottom = QHBoxLayout(); self.lbl_status = QLabel(); bottom.addWidget(self.lbl_status); bottom.addStretch(1)
+        bottom = QHBoxLayout(); bottom.addWidget(self.lbl_status); bottom.addStretch(1)
         bcopy = QPushButton("Copy Script"); bcopy.clicked.connect(self.copy_code)
         bopen = QPushButton("Open as New Tab"); bopen.clicked.connect(self.open_new)
         bclose = QPushButton("Close"); bclose.clicked.connect(self.reject)
