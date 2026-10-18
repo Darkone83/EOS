@@ -1,11 +1,12 @@
 # Eos — Tools
 
-Host-side tooling for building, flashing, and maintaining an Eos modchip. Three tools:
+Host-side tooling for building, flashing, and maintaining an Eos modchip. Four tools:
 
 | Tool | What it's for | Who uses it |
 |---|---|---|
 | **`Recovery/`** | Reflash / un-brick a board over USB — bitstream, BIOS, loader, XbDiag | **End users** |
-| **`eos_pack.py`** | Build the flashable BIOS image from your loader XBE | Chip prep / dev |
+| **`eos_pack.py`** | Legacy PrometheOS 1.5.x / LZ4 image packer | Chip prep / dev |
+| **`eos_pack_v2.py`** | PrometheOS 1.6+ / LZX image packer | Chip prep / dev |
 | **`gen_hud.py`** | Regenerate the HDMI serve-HUD gateware | Firmware dev |
 
 ---
@@ -79,19 +80,18 @@ banner.
 
 ---
 
-## eos_pack.py  — BIOS image packer
+## eos_pack.py — legacy PrometheOS 1.5 / LZ4 BIOS image packer
 
-Builds the flashable Eos BIOS image. It takes a **known-good template image** (borrowed
-Cerbios kernel plus all the bank geometry) and swaps in **only your launcher XBE**,
+Builds a **legacy PrometheOS 1.5.x / LZ4** flashable Eos BIOS image. It takes a **known-good matching 1.5.x template image** (including its kernel and bank geometry) and swaps in **only your launcher XBE**,
 LZ4-compressed, into the XeniumOS bank at `0x100000`. Everything else in the image stays
 byte-for-byte identical, so the kernel always finds the XBE where it expects it. The one
 variable is your XBE.
 
-The XBE region runs `0x100000`–`0x180000`, so the descriptor plus the compressed XBE has to
+For the legacy 1.5.x format, the XBE region runs `0x100000`–`0x180000`, so the descriptor plus the compressed XBE has to
 fit in **512 KB**. The kernel sits at `0x180000`. The output is the full image you flash to the
 BIOS offset.
 
-**Requirements:** `pip install lz4`
+**Requirements:** `pip install lz4` (legacy packer only).
 
 **Usage**
 
@@ -118,6 +118,68 @@ doesn't compare anything, and it doesn't return a failure code. If you want a pa
 
 > `pack` zero-fills the rest of the XBE bank before writing the payload. That's fine for a
 > whole-image flash, since the programmer erases first.
+
+**Do not use this LZ4 packer with PrometheOS 1.6+ LZX templates.** Use `eos_pack_v2.py` below.
+
+---
+
+## eos_pack_v2.py — PrometheOS 1.6+ / LZX BIOS image packer
+
+Use this tool with a **known-good PrometheOS 1.6 or newer, 2 MiB Xenium-format template**.
+PrometheOS 1.6+ stores the embedded XBE as a framed **LZX** stream instead of the older
+LZ4 stream. The tool replaces only the two XBE payload ranges; it does not rebuild or
+replace the template's bootloader, recovery content, or settings/spare region.
+
+### Image layout
+
+| Offset range | Content | Packer behavior |
+|---|---|---|
+| `0x100000–0x17FFFF` | Embedded XBE, first 512 KiB | Replaced |
+| `0x180000–0x1BFFFF` | Bootloader, 256 KiB | **Preserved** |
+| `0x1C0000–0x1DFFFF` | Recovery / other template data, 128 KiB | **Preserved** |
+| `0x1E0000–0x1F7FFF` | Embedded XBE continuation, final 96 KiB | Replaced |
+| `0x1F8000–0x1FFFFF` | Settings / spare, 32 KiB | **Preserved** |
+
+The logical XBE bank totals **608 KiB** (512 + 96 KiB). Its first eight bytes contain
+little-endian uncompressed and compressed sizes, followed by LZX frames (each with a
+compressed-size and uncompressed-size pair). The remaining logical bank space is zero-padded.
+This differs from the legacy **512 KiB LZ4** region and must not be packed as one continuous
+physical range across the bootloader.
+
+### Requirements
+
+- **Windows** and **Python 3**.
+- Windows' built-in `makecab.exe` and `expand.exe` on the system path.
+- No Python `lz4` dependency or third-party compression DLL for the V2 path.
+
+The compressor uses a **128 KiB LZX window** (`CompressionMemory=17`) and 32 KiB uncompressed
+frame chunks, following the format expected by the PrometheOS 1.6+ bootloader.
+
+### Usage
+
+```bash
+# Insert a loader XBE into a matching PrometheOS 1.6+ template
+python eos_pack_v2.py pack <template.bin> <loader.xbe> <out.bin>
+
+# Extract the embedded loader XBE
+python eos_pack_v2.py unpack <image.bin> <out.xbe>
+
+# Inspect and decode the LZX-packed image
+python eos_pack_v2.py verify <image.bin>
+```
+
+`pack` checks the 2 MiB template size and the 608 KiB XBE capacity, performs a
+compression/decompression round-trip, and verifies that the recovered XBE matches the
+input. The original bootloader and other protected template ranges are left untouched.
+
+`verify` parses the LZX descriptor and frames and decodes the embedded XBE. It is a format/
+decode check; to confirm an image contains your intended XBE, `unpack` it and compare the
+extracted file against the intended input.
+
+> **Important:** Keep a known-good copy of the input template and verify the packed image
+> before flashing. The packer outputs a complete 2 MiB firmware image, so writing it to
+> the BIOS flash region can replace whatever user BIOS data was present in that image.
+> The packer's template preservation does not make a whole-image flash nondestructive.
 
 ---
 
@@ -160,7 +222,8 @@ overwrites them in the same scan pass. Anything else is a layout bug. A cell out
 | | Needs |
 |---|---|
 | `Recovery/eos_recovery.py` | `pip install pyside6` (programmer + DLLs bundled). Internet for the Loader / XbDiag cards. |
-| `eos_pack.py` | `pip install lz4` |
+| `eos_pack.py` (legacy 1.5.x/LZ4) | `pip install lz4` |
+| `eos_pack_v2.py` (1.6+/LZX) | Windows + Python 3; built-in `makecab.exe` and `expand.exe` |
 | `gen_hud.py` | Python 3 standard library only |
 
 ---
