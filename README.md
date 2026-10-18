@@ -793,7 +793,7 @@ Eos's bank system is a clean-room implementation of it and is **not** derived fr
 
 Thanks to **Ander-Zero** for the X-RTC project
 
-- **X-RTC** - by **Adner-Zero** - <https://github.com/Andr-Zero/X-RTC>
+- **X-RTC** - by **Adnr-Zero** - <https://github.com/Andr-Zero/X-RTC>
 
 The **1.6 LFRAME# transaction-abort + LPC-rebuild approach** follows two community references,
 credited with thanks:
