@@ -106,12 +106,31 @@ void Ui_Backdrop(void)
     }
 }
 
-// Draw text centered within a region, scaling only when necessary. A small
-// internal safe margin prevents full-screen strings from touching overscan edges.
+// Keep text legible at 480i: reduce modestly, then ellipsize instead of
+// compressing a long path/status into a nearly invisible row of pixels.
+static void uiFitEllipsis(const char* src, char* dst, int cap, int maxW, float scale)
+{
+    int n = 0, ellW;
+    if (cap < 4) return;
+    dst[0] = 0;
+    if (!src) return;
+    while (src[n] && n < cap - 1) { dst[n] = src[n]; ++n; }
+    dst[n] = 0;
+    if (Font_TextWidthScaled(dst, scale) <= maxW) return;
+    ellW = Font_TextWidthScaled("...", scale);
+    while (n > 0 && Font_TextWidthScaled(dst, scale) + ellW > maxW) {
+        dst[--n] = 0;
+    }
+    if (n + 3 < cap) {
+        dst[n++] = '.'; dst[n++] = '.'; dst[n++] = '.'; dst[n] = 0;
+    }
+}
+
 void Ui_TextCenteredFit(int x0, int width, int y, const char* text, DWORD color)
 {
     int tw, maxW, sw, sx;
     float k;
+    char tmp[512];
     if (!text || !text[0] || width <= 0) return;
     maxW = width - 24;
     if (maxW < 8) maxW = width;
@@ -121,15 +140,19 @@ void Ui_TextCenteredFit(int x0, int width, int y, const char* text, DWORD color)
         return;
     }
     k = (float)maxW / (float)tw;
-    sw = Font_TextWidthScaled(text, k);
+    if (k < 0.80f) k = 0.80f;
+    if (k > 1.0f) k = 1.0f;
+    uiFitEllipsis(text, tmp, sizeof(tmp), maxW, k);
+    sw = Font_TextWidthScaled(tmp, k);
     sx = x0 + (width - sw) / 2;
-    Font_DrawScaled(sx, y, text, color, k);
+    Font_DrawScaled(sx, y, tmp, color, k);
 }
 
 void Ui_TextLeftFit(int x, int y, int maxW, const char* text, DWORD color)
 {
     int tw;
     float k;
+    char tmp[512];
     if (!text || !text[0] || maxW <= 0) return;
     tw = Font_TextWidth(text);
     if (tw <= maxW) {
@@ -137,7 +160,90 @@ void Ui_TextLeftFit(int x, int y, int maxW, const char* text, DWORD color)
         return;
     }
     k = (float)maxW / (float)tw;
-    Font_DrawScaled(x, y, text, color, k);
+    if (k < 0.80f) k = 0.80f;
+    uiFitEllipsis(text, tmp, sizeof(tmp), maxW, k);
+    Font_DrawScaled(x, y, tmp, color, k);
+}
+
+// For folders and paths keep the *end* visible (file/folder of interest).
+void Ui_TextPathTail(int x, int y, int maxW, const char* text, DWORD color)
+{
+    int n, first, i, ellW;
+    char tmp[300];
+    if (!text || !text[0] || maxW <= 0) return;
+    if (Font_TextWidth(text) <= maxW) { Font_Draw(x, y, text, color); return; }
+    n = 0;
+    while (text[n] && n < 298) ++n;
+    ellW = Font_TextWidth("...");
+    first = n;
+    while (first > 0 && Font_TextWidth(text + first - 1) + ellW <= maxW)
+        --first;
+    tmp[0] = '.'; tmp[1] = '.'; tmp[2] = '.';
+    i = 3;
+    while (text[first] && i < (int)sizeof(tmp) - 1) tmp[i++] = text[first++];
+    tmp[i] = 0;
+    Ui_TextLeftFit(x, y, maxW, tmp, color);
+}
+
+// File labels retain both a recognizable prefix and the extension/suffix.
+// File labels retain both a recognizable prefix and the extension/suffix.
+static void uiTextMiddleFit(int x, int y, int maxW, const char* text, DWORD color)
+{
+    char tmp[300];
+    int n = 0, head = 0, tail = 0, i, pos = 0, used, headW = 0, tailW = 0, avail;
+    if (!text || !text[0] || maxW <= 0) return;
+    if (Font_TextWidth(text) <= maxW) { Font_Draw(x, y, text, color); return; }
+    while (text[n] && n < 295) ++n;
+    avail = maxW - Font_TextWidth("...");
+    if (avail < 18) { Ui_TextLeftFit(x, y, maxW, "...", color); return; }
+    // Reserve 45% for the beginning and 55% for the suffix, including .bin/.eos.
+    while (head < n) {
+        char c[2]; c[0] = text[head]; c[1] = 0;
+        used = Font_TextWidth(c);
+        if (headW + used > avail * 45 / 100) break;
+        headW += used; ++head;
+    }
+    while (n - tail > head) {
+        char c[2]; c[0] = text[n - tail - 1]; c[1] = 0;
+        used = Font_TextWidth(c);
+        if (tailW + used > avail - headW) break;
+        tailW += used; ++tail;
+    }
+    for (i = 0; i < head && pos < (int)sizeof(tmp) - 4; ++i) tmp[pos++] = text[i];
+    tmp[pos++] = '.'; tmp[pos++] = '.'; tmp[pos++] = '.';
+    for (i = n - tail; i < n && pos < (int)sizeof(tmp) - 1; ++i) tmp[pos++] = text[i];
+    tmp[pos] = 0;
+    Ui_TextLeftFit(x, y, maxW, tmp, color);
+}
+
+// Wrap an important result across two readable lines rather than shrinking
+// the whole message to fit a single 640-wide line.
+void Ui_ResultMessage(int x0, int width, int y, const char* text, DWORD color)
+{
+    int n, split, i, lastSpace, safeW;
+    char first[256];
+    const char* rest;
+    if (!text || !text[0]) return;
+    safeW = width - 24;
+    if (Font_TextWidth(text) <= safeW) {
+        Ui_TextCenteredFit(x0, width, y + 13, text, color);
+        return;
+    }
+    n = 0; lastSpace = 0;
+    while (text[n] && n < 250) {
+        first[n] = text[n]; first[n + 1] = 0;
+        if (text[n] == ' ') lastSpace = n;
+        if (Font_TextWidth(first) > safeW) break;
+        ++n;
+    }
+    split = (lastSpace > 0) ? lastSpace : n;
+    if (split < 1) split = 1;
+    for (i = 0; i < split && i < 254; ++i) first[i] = text[i];
+    first[i] = 0;
+    rest = text + split;
+    while (*rest == ' ') ++rest;
+    Ui_TextCenteredFit(x0, width, y, first, color);
+    Ui_TextCenteredFit(x0, width, y + 30, rest, color);
 }
 
 // Smooth sprite-based halo: no nested geometric outlines, so selected pills
@@ -167,26 +273,156 @@ void Ui_TitleBar(const char* title)
     Ui_TextCenteredFit(px, pw, py + (ph - FONT_CH) / 2, title, EOS_WHITE);
 }
 
-void Ui_Footer(const char* hint)
+// Inline controller-button hints shared by footers, script actions and OSK.
+// Source strings remain plain ASCII. Separate actions with two spaces:
+//   "A Select   X Rename   B Back"
+// Each input is parsed once per frame without allocations or platform fonts.
+#define UI_HINT_MAX 8
+#define UI_HINT_TEXT 112
+typedef struct UiHint { int key; char action[UI_HINT_TEXT]; } UiHint;
+// 0=plain text, 1=A, 2=B, 3=X, 4=Y, 5=Black, 6=Start, 7=Back, 8=L3, 9=D-pad
+static int uiPrefix(const char* p, const char* token)
 {
-    int tw, pw, ph, px, py;
+    int i = 0;
+    while (token[i]) { if (p[i] != token[i]) return 0; ++i; }
+    return 1;
+}
+static int uiHintKey(const char* p, int* used)
+{
+    if (uiPrefix(p, "Black ")) { *used = 6; return 5; }
+    if (uiPrefix(p, "Start ")) { *used = 6; return 6; }
+    if (uiPrefix(p, "Back ")) { *used = 5; return 7; }
+    if (uiPrefix(p, "L3 ")) { *used = 3; return 8; }
+    if (uiPrefix(p, "D-PAD ")) { *used = 6; return 9; }
+    if (p[1] == ' ') {
+        *used = 2;
+        if (p[0] == 'A') return 1;
+        if (p[0] == 'B') return 2;
+        if (p[0] == 'X') return 3;
+        if (p[0] == 'Y') return 4;
+    }
+    *used = 0;
+    return 0;
+}
+static int uiParseHints(const char* source, UiHint* hints)
+{
+    int count = 0, i, n, used;
+    const char* p = source;
+    const char* begin;
+    while (p && *p && count < UI_HINT_MAX) {
+        while (*p == ' ') ++p;
+        if (!*p) break;
+        begin = p;
+        while (*p && !(p[0] == ' ' && p[1] == ' ')) ++p;
+        n = (int)(p - begin);
+        while (n > 0 && begin[n - 1] == ' ') --n;
+        if (!n) continue;
+        hints[count].key = uiHintKey(begin, &used);
+        if (used >= n) used = 0;
+        if (used == 0) hints[count].key = 0;
+        n -= used;
+        if (n >= UI_HINT_TEXT) n = UI_HINT_TEXT - 1;
+        for (i = 0; i < n; ++i) hints[count].action[i] = begin[used + i];
+        hints[count].action[n] = 0;
+        ++count;
+    }
+    return count;
+}
+static int uiBadgeWidth(int key)
+{
+    if (key == 5) return 39;               // original Xbox Black button
+    if (key == 6) return 49;               // Start
+    if (key == 7) return 46;               // Back
+    if (key == 8) return 27;               // left thumb click
+    if (key == 9) return 44;               // directional pad
+    return key ? 22 : 0;
+}
+static DWORD uiBadgeColor(int key)
+{
+    if (key == 1) return EOS_ARGB(0xFF, 42, 157, 74);
+    if (key == 2) return EOS_ARGB(0xFF, 199, 55, 65);
+    if (key == 3) return EOS_ARGB(0xFF, 49, 112, 212);
+    if (key == 4) return EOS_ARGB(0xFF, 211, 163, 35);
+    if (key == 5) return EOS_ARGB(0xFF, 49, 52, 61);
+    return (EOS_GLOW & 0x00FFFFFF) | 0xE0000000;
+}
+static const char* uiBadgeLabel(int key)
+{
+    if (key == 1) return "A";
+    if (key == 2) return "B";
+    if (key == 3) return "X";
+    if (key == 4) return "Y";
+    if (key == 5) return "BLK";
+    if (key == 6) return "START";
+    if (key == 7) return "BACK";
+    if (key == 8) return "L3";
+    if (key == 9) return "D-PAD";
+    return "";
+}
+static void uiRenderHints(int y, const char* hint, int withPanel, int disabled)
+{
+    UiHint seg[UI_HINT_MAX];
+    int n, i, w = 0, available, panelW, panelX, x, badgeW, badgeH, textW, fontY;
+    float k;
+    DWORD labelColor = disabled ? EOS_DIM : EOS_WHITE;
     DWORD panel;
     if (!hint || !hint[0]) return;
-    tw = Font_TextWidth(hint);
-    pw = tw + 42;
-    if (pw > g_scrW - 40) pw = g_scrW - 40;
-    ph = 30;
-    px = (g_scrW - pw) / 2;
-    py = g_scrH - 72;
-    panel = (EOS_PANEL & 0x00FFFFFF) | 0xB8000000;
-    Gfx_FillRounded(px, py, pw, ph, ph / 2, panel);
-    Ui_TextCenteredFit(px, pw, py + (ph - FONT_CH) / 2, hint, EOS_DIM);
+    n = uiParseHints(hint, seg);
+    if (!n) return;
+    for (i = 0; i < n; ++i) {
+        if (i) w += 16;
+        if (seg[i].key) w += uiBadgeWidth(seg[i].key) + 7;
+        w += Font_TextWidth(seg[i].action);
+    }
+    available = g_scrW - 74;
+    k = (w > available) ? (float)available / (float)w : 1.0f;
+    // The supported hint phrases are intentionally short, keeping button
+    // discs and labels comfortably readable even on 480i.
+    if (k < 0.68f) k = 0.68f;
+    if (withPanel) {
+        panelW = (int)((float)w * k + 38.0f);
+        if (panelW > g_scrW - 40) panelW = g_scrW - 40;
+        panelX = (g_scrW - panelW) / 2;
+        panel = (EOS_PANEL & 0x00FFFFFF) | 0xC8000000;
+        Gfx_FillCapsule(panelX, y, panelW, 32, panel);
+    }
+    x = (g_scrW - (int)((float)w * k)) / 2;
+    for (i = 0; i < n; ++i) {
+        if (i) x += (int)(16.0f * k);
+        badgeW = (int)((float)uiBadgeWidth(seg[i].key) * k);
+        badgeH = (int)(22.0f * k);
+        if (seg[i].key) {
+            int badgeY = y + (32 - badgeH) / 2;
+            const char* badgeText = uiBadgeLabel(seg[i].key);
+            DWORD badgeColor = uiBadgeColor(seg[i].key);
+            if (disabled) badgeColor = (badgeColor & 0x00FFFFFF) | 0x75000000;
+            Gfx_FillCapsule(x, badgeY, badgeW, badgeH, badgeColor);
+            textW = Font_TextWidthScaled(badgeText, k * ((seg[i].key >= 5) ? 0.70f : 0.90f));
+            fontY = badgeY + (int)((float)badgeH - (float)FONT_CH * k * ((seg[i].key >= 5) ? 0.70f : 0.90f)) / 2;
+            Font_DrawScaled(x + (badgeW - textW) / 2, fontY,
+                badgeText, EOS_ARGB(0xFF, 255, 255, 255), k * ((seg[i].key >= 5) ? 0.70f : 0.90f));
+            x += badgeW + (int)(7.0f * k);
+        }
+        fontY = y + (int)((32.0f - (float)FONT_CH * k) / 2.0f);
+        Font_DrawScaled(x, fontY, seg[i].action, labelColor, k);
+        x += Font_TextWidthScaled(seg[i].action, k);
+    }
+}
+
+void Ui_Footer(const char* hint)
+{
+    uiRenderHints(g_scrH - 72, hint, 1, 0);
+}
+
+void Ui_ActionHintCenter(int y, const char* hint, int disabled)
+{
+    uiRenderHints(y, hint, 0, disabled);
 }
 
 void Ui_StatusToast(const char* text)
 {
     int tw, pw, ph, px, py;
-    DWORD panel, edge;
+    DWORD panel;
     if (!text || !text[0]) return;
     tw = Font_TextWidth(text);
     pw = tw + 44;
@@ -195,10 +431,8 @@ void Ui_StatusToast(const char* text)
     px = (g_scrW - pw) / 2;
     py = g_scrH - 116;
     panel = (EOS_PANEL & 0x00FFFFFF) | 0xE0000000;
-    edge = (EOS_GLOW & 0x00FFFFFF) | 0x90000000;
     Gfx_GlowSoft(g_scrW / 2, py + ph / 2, pw + 28, ph + 22, EOS_GLOW, 36);
-    Gfx_FillRounded(px, py, pw, ph, ph / 2, panel);
-    Gfx_Fill((float)(px + 14), (float)(py + ph - 4), (float)(pw - 28), 1.0f, edge);
+    Gfx_FillCapsule(px, py, pw, ph, panel);
     Ui_TextCenteredFit(px, pw, py + (ph - FONT_CH) / 2, text, EOS_WHITE);
 }
 
@@ -233,6 +467,14 @@ void Ui_PillLeft(int x, int y, int w, int h, int r, int selected, const char* la
     if (selected) selGlow(x, y, w, h, r);
     Gfx_FillRounded(x, y, w, h, r, selected ? EOS_PURPLE : UI_PILL_BG);
     Ui_TextLeftFit(x + 18, y + (h - FONT_CH) / 2, w - 36, label,
+        selected ? EOS_WHITE : EOS_DIM);
+}
+
+void Ui_PillFile(int x, int y, int w, int h, int r, int selected, const char* label)
+{
+    if (selected) selGlow(x, y, w, h, r);
+    Gfx_FillRounded(x, y, w, h, r, selected ? EOS_PURPLE : UI_PILL_BG);
+    uiTextMiddleFit(x + 18, y + (h - FONT_CH) / 2, w - 36, label,
         selected ? EOS_WHITE : EOS_DIM);
 }
 

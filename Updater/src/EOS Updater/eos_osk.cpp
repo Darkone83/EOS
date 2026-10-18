@@ -3,6 +3,7 @@
 #include "eos_osk.h"
 #include "eos_gfx.h"
 #include "eos_font.h"
+#include "eos_ui.h"
 #include "input.h"
 
 typedef struct { char sets[3]; int wide; } Key;
@@ -198,14 +199,6 @@ int Osk_Update(WORD pressed)
 }
 
 // ---- draw ------------------------------------------------------------------
-static void Outline(int x, int y, int w, int h, DWORD c)
-{
-    Gfx_Fill((float)x, (float)y, (float)w, 1.0f, c);
-    Gfx_Fill((float)x, (float)(y + h - 1), (float)w, 1.0f, c);
-    Gfx_Fill((float)x, (float)y, 1.0f, (float)h, c);
-    Gfx_Fill((float)(x + w - 1), (float)y, 1.0f, (float)h, c);
-}
-
 static void KeyRect(int row, int col, int* ox, int* ow)
 {
     const Key* keys = Rows()[row];
@@ -220,9 +213,8 @@ void Osk_Draw(void)
 {
     DWORD accent = EOS_PURPLE;
     DWORD text = EOS_WHITE;
-    DWORD dim = EOS_DIM;
-    DWORD panelBg = EOS_ARGB(0xFF, 24, 28, 31);
-    DWORD fieldBg = EOS_ARGB(0xFF, 16, 20, 24);
+    DWORD panelBg = EOS_PANEL;
+    DWORD fieldBg = (EOS_BG2 & 0x00FFFFFF) | 0xEE000000;
     int   row, col, n, kx, ky, kw, tx, tw;
 
     if (!s_open) return;
@@ -233,15 +225,17 @@ void Osk_Draw(void)
     // text field
     tx = s_panelX;
     tw = s_panelW;
-    Gfx_Fill((float)tx, (float)KB_TEXT_Y, (float)tw, (float)KB_TEXT_H, fieldBg);
-    Outline(tx, KB_TEXT_Y, tw, KB_TEXT_H, dim);
+    // One inset glass field: preserves theme colors without hard 1px borders.
+    Gfx_FillCapsule(tx, KB_TEXT_Y, tw, KB_TEXT_H, fieldBg);
     {
         char disp[OSK_MAX_LEN + 2];
         int  p;
         kCopy(disp, sizeof(disp), s_text);
         p = kLen(disp);
         if ((s_blink / 20) % 2 == 0 && p < OSK_MAX_LEN + 1) { disp[p] = '_'; disp[p + 1] = 0; }
-        Font_Draw(tx + 10, KB_TEXT_Y + (KB_TEXT_H - FONT_CH) / 2, disp, text);
+        // Keep the newest characters and caret visible as the entry grows.
+        Ui_TextPathTail(tx + 14, KB_TEXT_Y + (KB_TEXT_H - FONT_CH) / 2,
+            tw - 28, disp, text);
     }
 
     // keys
@@ -252,20 +246,17 @@ void Osk_Draw(void)
             const Key* k = &Rows()[row][col];
             char  ch = k->sets[s_keyset];
             int   sel = (row == s_row && col == s_col);
-            DWORD bg, fg, bd;
+            DWORD bg, fg;
             char  label[4];
 
             KeyRect(row, col, &kx, &kw);
 
-            if (sel) { bg = accent; fg = fieldBg; bd = accent; }
-            else {
-                bd = dim;
-                if (ch == SK_DONE) { bg = EOS_ARGB(0xFF, 20, 54, 26); fg = accent; }
-                else if (ch == SK_CANCEL) { bg = EOS_ARGB(0xFF, 54, 20, 20); fg = EOS_ARGB(0xFF, 224, 80, 80); }
-                else { bg = panelBg; fg = text; }
-            }
-            Gfx_Fill((float)kx, (float)ky, (float)kw, (float)KB_KEY_H, bg);
-            Outline(kx, ky, kw, KB_KEY_H, bd);
+            if (sel) { bg = accent; fg = EOS_WHITE; }
+            else if (ch == SK_DONE) { bg = (EOS_GLOW & 0x00FFFFFF) | 0x8A000000; fg = text; }
+            else if (ch == SK_CANCEL) { bg = (EOS_PURPLE & 0x00FFFFFF) | 0x7A000000; fg = text; }
+            else { bg = panelBg; fg = text; }
+            if (sel) Gfx_GlowSoft(kx + kw / 2, ky + KB_KEY_H / 2, kw + 9, KB_KEY_H + 8, EOS_GLOW, 23);
+            Gfx_FillCapsule(kx, ky, kw, KB_KEY_H, bg);
 
             switch (ch) {
             case SK_SPACE:  label[0] = 'S'; label[1] = 'P'; label[2] = 0; break;
@@ -274,13 +265,11 @@ void Osk_Draw(void)
             case SK_CANCEL: label[0] = 'X'; label[1] = 0;              break;
             default:        label[0] = ch;  label[1] = 0;              break;
             }
-            Font_DrawCentered(kx, kw, ky + (KB_KEY_H - FONT_CH) / 2, label, fg);
+            Ui_TextCenteredFit(kx, kw, ky + (KB_KEY_H - FONT_CH) / 2, label, fg);
         }
     }
 
-    Font_DrawCentered(0, g_scrW, KB_PANEL_Y + ROWS * (KB_KEY_H + KB_ROW_GAP) + 8,
-        (s_mode == OSK_NUMERIC)
+    Ui_Footer((s_mode == OSK_NUMERIC)
         ? "A Type   B Del   Start OK   Back Cancel"
-        : "A Type  B Del  X Case  L3 Caps  Y Space  Start OK  Back Cancel",
-        dim);
+        : "A Type   B Del   X Case   L3 Caps   Y Space   Start OK   Back Cancel");
 }

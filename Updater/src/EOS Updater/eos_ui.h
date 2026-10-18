@@ -18,12 +18,16 @@ void Ui_ScrollBar(int x, int y, int h, int first, int visible, int total);
 // string would escape its region. Useful for long update/error/file text.
 void Ui_TextCenteredFit(int x0, int width, int y, const char* text, DWORD color);
 void Ui_TextLeftFit(int x, int y, int maxW, const char* text, DWORD color);
+void Ui_TextPathTail(int x, int y, int maxW, const char* text, DWORD color);
+void Ui_ResultMessage(int x0, int width, int y, const char* text, DWORD color);
+void Ui_ActionHintCenter(int y, const char* hint, int disabled);
 
 // Selectable pills. selected -> accent fill + white text; otherwise a raised
 // dark surface + dim text. dim=1 forces muted label even when not selected
 // (read-only rows).
 void Ui_PillCentered(int x, int y, int w, int h, int r, int selected, const char* label);
 void Ui_PillLeft(int x, int y, int w, int h, int r, int selected, const char* label);
+void Ui_PillFile(int x, int y, int w, int h, int r, int selected, const char* label);
 void Ui_PillRow(int x, int y, int w, int h, int r, int selected, int dim,
     const char* label, const char* value);
 

@@ -1548,6 +1548,11 @@ static void DrawPhase(void)
         else title = "BIOS - Pick File";
         for (i = 0; i < n && i < EOS_FILE_MAX_ENTRIES; ++i) names[i] = s_entries[i].name;
         Ui_TitleBar(title);
+        Ui_TextPathTail(82, 76, g_scrW - 164,
+            s_cwd[0] ? s_cwd : "AVAILABLE DRIVES", EOS_DIM);
+        if (n <= 0)
+            Ui_TextCenteredFit(70, g_scrW - 140, 213,
+                s_cwd[0] ? "No files or folders found." : "No available drives.", EOS_DIM);
         {
             const int visible = 8;
             int y = 104, rowH = 30, gap = 5, x = 70, w = g_scrW - 140;
@@ -1557,7 +1562,7 @@ static void DrawPhase(void)
             if (top < 0) top = 0;
             if (top > maxTop) top = maxTop;
             for (i = top; i < n && i < top + visible; ++i) {
-                Ui_PillLeft(x, y, w, rowH, 8, (i == s_browseSel), names[i]);
+                Ui_PillFile(x, y, w, rowH, 8, (i == s_browseSel), names[i]);
                 y += rowH + gap;
             }
             Ui_ScrollBar(x + w + 10, 104, visible * rowH + (visible - 1) * gap,
@@ -1579,7 +1584,7 @@ static void DrawPhase(void)
         break;
     }
     case PH_RENAME:
-        Ui_TitleBar("RENAME BANK"); Osk_Draw(); Ui_Footer("Start Confirm   Back Cancel"); break;
+        Osk_Draw(); Ui_TitleBar("RENAME BANK"); break;
 
     case PH_MGMT_CONFIRM:
         if (s_pendAct == ACT_MGMT_FLASH) DrawFlashPreflight();
@@ -1603,8 +1608,8 @@ static void DrawPhase(void)
             Ui_TextLeftFit(96, 212, 136, "Target", EOS_DIM);
             Ui_TextLeftFit(250, 212, g_scrW - 346, s_scriptInfo.targetHd ? "HD Expansion" : "Standard / NOHD", EOS_WHITE);
         }
-        Ui_TextCenteredFit(0, g_scrW, 312, s_scriptInfo.present ? "A Replace Script" : "A Install Script", EOS_WHITE);
-        Ui_TextCenteredFit(0, g_scrW, 344, s_scriptInfo.present ? "X Remove Script" : "X Remove Script (not installed)", EOS_DIM);
+        Ui_ActionHintCenter(298, s_scriptInfo.present ? "A Replace Script" : "A Install Script", 0);
+        Ui_ActionHintCenter(333, "X Remove Script", !s_scriptInfo.present);
         if (s_statusMsg[0] && GetTickCount() < s_statusUntil)
             Ui_StatusToast(s_statusMsg);
         Ui_Footer("A Install/Replace   X Remove   Y Refresh   B Back");
@@ -1696,8 +1701,8 @@ static void DrawPhase(void)
 
     case PH_RESULT:
         Ui_TitleBar("Result");
-        Ui_TextCenteredFit(40, g_scrW - 80, 230, s_resultMsg, EOS_WHITE);
-        Ui_Footer(s_resultReboot ? "A Cold Reboot   B Main Menu" : "A / B  Back to menu");
+        Ui_ResultMessage(48, g_scrW - 96, 215, s_resultMsg, EOS_WHITE);
+        Ui_Footer(s_resultReboot ? "A Cold Reboot   B Main Menu" : "A Back to menu   B Back to menu");
         break;
     case PH_UTILITIES: {
         static const char* k_util[UTIL_COUNT] = {
@@ -1712,11 +1717,12 @@ static void DrawPhase(void)
         break;
     }
     case PH_BACKUP_MGMT: {
-        const int visible = 8;
+        const int visible = s_utilStatus[0] ? 7 : 8;  // reserve toast clearance
         int top, maxTop, i, y, x, w;
         Ui_TitleBar("BACKUP MANAGEMENT");
         if (s_backupCount <= 0) {
-            Ui_TextCenteredFit(0, g_scrW, 226, "No EOS backups found.", EOS_DIM);
+            Ui_TextCenteredFit(0, g_scrW, 217, "No EOS backups found.", EOS_WHITE);
+            Ui_TextCenteredFit(0, g_scrW, 253, "Create a firmware or bank backup from Utilities.", EOS_DIM);
         }
         else {
             top = s_backupSel - visible / 2;

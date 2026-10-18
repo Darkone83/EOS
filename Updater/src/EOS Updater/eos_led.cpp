@@ -23,7 +23,7 @@ static DWORD s_errorUntil = 0;
 
 // charcoal text on all pills (uniform; no per-pill light/dark switching)
 #define LED_TEXT_CHARCOAL EOS_ARGB(0xFF,0x1A,0x1A,0x1A)
-#define LED_OFF_BG        EOS_ARGB(0xFF,0x3A,0x3A,0x3A)   // grey for the Off cell
+#define LED_OFF_BG        EOS_ARGB(0xFF,0xAD,0xAD,0xAD)   // grey for the Off cell
 
 // grid geometry
 #define LED_COLS 6
@@ -107,16 +107,11 @@ int LedPick_Frame(unsigned short b, unsigned short prev)
             Gfx_GlowSoft(cx + cellW / 2, cy + cellH / 2,
                 cellW + 26, cellH + 24, EOS_GLOW, 38);
 
+        // Rounded 3px selection surround follows the swatch corners; the
+        // previous rectangular rails cut across the rounded cells.
+        if (i == s_sel)
+            Gfx_FillRounded(cx - 3, cy - 3, cellW + 6, cellH + 6, radius + 3, EOS_GLOW);
         Gfx_FillRounded(cx, cy, cellW, cellH, radius, fill);
-
-        // selection border (accent) around the highlighted pill
-        if (i == s_sel) {
-            DWORD acc = EOS_PURPLE;
-            Gfx_Fill((float)cx, (float)cy, (float)cellW, 3, acc);
-            Gfx_Fill((float)cx, (float)(cy + cellH - 3), (float)cellW, 3, acc);
-            Gfx_Fill((float)cx, (float)cy, 3, (float)cellH, acc);
-            Gfx_Fill((float)(cx + cellW - 3), (float)cy, 3, (float)cellH, acc);
-        }
 
         // Uniform charcoal label; shared fit logic guarantees every palette
         // name stays inside its cell without hard-coded per-name scaling.
